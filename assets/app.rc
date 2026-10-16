@@ -1,0 +1,41 @@
+#include <windows.h>
+#pragma code_page(65001)
+1 RT_MANIFEST "app.manifest"
+1 ICON "app.ico"
+2 RCDATA "../third_party/md4c/LICENSE.md"
+3 RCDATA "../third_party/nanosvg/LICENSE.txt"
+4 RCDATA "../LICENSE"
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904b0"
+  BEGIN
+   VALUE "FileDescription", "Voltura Markdown"
+   VALUE "CompanyName", "Voltura AB"
+   VALUE "ProductName", "Voltura Markdown"
+   VALUE "FileVersion", "1.0.0"
+   VALUE "ProductVersion", "1.0.0"
+   VALUE "InternalName", "vmd"
+   VALUE "OriginalFilename", "vmd.exe"
+   VALUE "LegalCopyright", "Copyright (c) Voltura AB"
+   VALUE "Author", "Joakim Skoglund"
+   VALUE "Authors", "Joakim Skoglund"
+   VALUE "DeveloperName", "Joakim Skoglund"
+   VALUE "Producer", "Voltura AB"
+   VALUE "Website", "https://voltura.se/"
+   VALUE "PostalAddress", "Voltura AB; Hästholmsvägen 33; SE-131 71 Nacka; Sweden"
+   VALUE "Comments", "Read-only Markdown reader. Developed by Joakim Skoglund, Voltura AB."
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x409, 1200
+ END
+END

@@ -1,0 +1,138 @@
+param(
+    [string]$NotesPath,
+    [ValidatePattern('^[A-Fa-f0-9]{40}$')]
+    [string]$CertificateThumbprint,
+    [uri]$TimestampUrl,
+    [switch]$Publish,
+    [ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')]
+    [string]$Repository,
+    [switch]$Stable
+)
+
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path -Parent $PSScriptRoot
+$project = Get-Content -LiteralPath (Join-Path $repo 'CMakeLists.txt') -Raw
+if ($project -notmatch 'project\(VolturaMarkdown VERSION (\d+\.\d+\.\d+)') { throw 'Project version missing.' }
+$releaseVersion = $Matches[1]
+$tag = if ($Stable) { "v$releaseVersion" } else { "v$releaseVersion-preview.1" }
+$title = "Voltura Markdown $releaseVersion" + $(if (!$Stable) { ' Preview' })
+$directory = Join-Path $repo "build\releases\$releaseVersion"
+if (Test-Path -LiteralPath $directory) { throw "Release directory already exists; inspect and archive it before preparing again: $directory" }
+if (!$NotesPath) { $NotesPath = Join-Path $repo "docs\releases\$releaseVersion.md" }
+$notes = Get-Content -LiteralPath $NotesPath -Raw -Encoding utf8
+if ($notes -notmatch "(?m)^# Voltura Markdown $([regex]::Escape($releaseVersion))(?:\s|$)") { throw 'Notes title must match the project version.' }
+if ($notes -match '(?i)<(?:version|commit|hash|bytes|YYYY-MM-DD|Brief|State)[^>]*>|\{\{|\}\}|\b(?:TODO|TBD|REPLACE_ME)\b') { throw 'Replace release-note placeholders before preparing a release.' }
+if ($Stable -and $notes -match '(?im)^#.*\bpreview\b') { throw 'Stable publication needs reviewed stable release notes; provide -NotesPath after completing acceptance gates.' }
+if ([bool]$CertificateThumbprint -ne [bool]$TimestampUrl) { throw 'Signing requires both -CertificateThumbprint and -TimestampUrl.' }
+if ($CertificateThumbprint) {
+    & (Join-Path $PSScriptRoot 'sign.ps1') -Path (Join-Path $repo 'dist\vmd.exe') -CertificateThumbprint $CertificateThumbprint -TimestampUrl $TimestampUrl -ValidateOnly
+}
+if ($Publish -and !$Repository) { throw 'Publishing requires -Repository owner/name.' }
+if ($Repository -and !$Publish) { throw '-Repository is used only with the explicit -Publish switch.' }
+$revision = 'Unversioned working directory'
+$sourceDirty = $null
+$git = Get-Command git.exe -ErrorAction SilentlyContinue
+if ($git -and (Test-Path -LiteralPath (Join-Path $repo '.git'))) {
+    try {
+        $head = & $git.Source -C $repo rev-parse --verify HEAD 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $revision = [string]$head
+            $changes = & $git.Source -C $repo status --porcelain
+            if ($LASTEXITCODE) { throw 'Could not inspect the Git working tree.' }
+            $sourceDirty = [bool]$changes
+        }
+    } catch {
+        if ($Publish) { throw }
+        $revision = 'Unversioned working directory'
+    }
+}
+$gh = $null
+if ($Publish) {
+    if ($revision -notmatch '^[a-fA-F0-9]{40}$') { throw 'Publishing requires a committed Git checkout.' }
+    $changes = & $git.Source -C $repo status --porcelain
+    if ($LASTEXITCODE -or $changes) { throw 'Publishing requires a clean Git working tree.' }
+    $gh = Get-Command gh.exe -ErrorAction Stop
+    & $gh.Source auth status
+    if ($LASTEXITCODE) { throw 'Sign in to GitHub CLI before publishing.' }
+    $existingTags = & $gh.Source api "repos/$Repository/git/matching-refs/tags/$tag" --jq '.[].ref'
+    if ($LASTEXITCODE) { throw 'Cannot inspect tags in the selected existing repository.' }
+    if ($existingTags -contains "refs/tags/$tag") { throw "Tag $tag already exists; inspect it and choose a new release version." }
+}
+New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null
+& (Join-Path $PSScriptRoot 'build.ps1') -Configuration Release
+& python (Join-Path $PSScriptRoot 'commonmark.py')
+if ($LASTEXITCODE) { throw 'CommonMark verification failed.' }
+$portable = Join-Path $repo 'dist\vmd.exe'
+if ($CertificateThumbprint) {
+    & (Join-Path $PSScriptRoot 'sign.ps1') -Path $portable -CertificateThumbprint $CertificateThumbprint -TimestampUrl $TimestampUrl
+}
+& python (Join-Path $PSScriptRoot 'verify-package.py') $portable
+if ($LASTEXITCODE) { throw 'Portable package verification failed.' }
+& (Join-Path $PSScriptRoot 'build-installer.ps1') -SkipBuild
+$installer = Join-Path $repo "dist\VolturaMarkdown-Setup-$releaseVersion-win-x64.exe"
+if ($CertificateThumbprint) {
+    & (Join-Path $PSScriptRoot 'sign.ps1') -Path $installer -CertificateThumbprint $CertificateThumbprint -TimestampUrl $TimestampUrl
+}
+foreach ($asset in @($portable, $installer)) {
+    $metadata = [Diagnostics.FileVersionInfo]::GetVersionInfo($asset)
+    if ($metadata.ProductVersion -ne $releaseVersion -or $metadata.CompanyName -ne 'Voltura AB') {
+        throw "Version or company metadata differs from the release: $asset"
+    }
+}
+$assets = @($portable, $installer)
+$identity = foreach ($asset in $assets) {
+    Copy-Item -LiteralPath $asset -Destination $directory
+    $copy = Join-Path $directory ([IO.Path]::GetFileName($asset))
+    $signature = Get-AuthenticodeSignature -LiteralPath $copy
+    if ($CertificateThumbprint -and ($signature.Status -ne 'Valid' -or !$signature.TimeStamperCertificate -or $signature.SignerCertificate.Thumbprint -ine $CertificateThumbprint)) {
+        throw "Signed release verification failed: $asset"
+    }
+    if (!$CertificateThumbprint -and $signature.Status -ne 'NotSigned') {
+        throw "Unsigned preparation expected an unsigned executable, found $($signature.Status): $asset"
+    }
+    [ordered]@{
+        name = [IO.Path]::GetFileName($copy)
+        bytes = (Get-Item -LiteralPath $copy).Length
+        sha256 = (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash.ToLowerInvariant()
+        signature = [string]$signature.Status
+        signer = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { $null }
+        timestamped = [bool]$signature.TimeStamperCertificate
+    }
+}
+$checksumPath = Join-Path $directory 'SHA256SUMS.txt'
+$identity | ForEach-Object { "$($_.sha256)  $($_.name)" } | Set-Content -LiteralPath $checksumPath -Encoding ascii
+$manifest = [ordered]@{
+    version = $releaseVersion
+    tag = $tag
+    prerelease = !$Stable
+    preparedAtUtc = [DateTime]::UtcNow.ToString('o')
+    sourceRevision = $revision
+    sourceDirty = $sourceDirty
+    checks = @('Release build', 'CTest', 'CommonMark examples', 'Portable PE/metadata/imports/icons/licenses')
+    assets = @($identity)
+}
+$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $directory 'release-manifest.json') -Encoding utf8
+$details = @('', '## Download verification', '', '| Download | Bytes | SHA-256 | Publisher signature |', '| --- | ---: | --- | --- |')
+foreach ($asset in $identity) {
+    $status = if ($asset.signature -eq 'NotSigned') { 'Unsigned' } else { "Valid; $($asset.signer); timestamped" }
+    $details += "| ``$($asset.name)`` | $($asset.bytes) | ``$($asset.sha256)`` | $status |"
+}
+$details += @('', 'SHA-256 identifies the exact download. Signing status is listed above.')
+$preparedNotes = Join-Path $directory 'RELEASE-NOTES.md'
+($notes.TrimEnd() + "`n" + ($details -join "`n") + "`n") | Set-Content -LiteralPath $preparedNotes -Encoding utf8
+Write-Host "Prepared $tag in $directory"
+Write-Host $(if ($CertificateThumbprint) { 'Both executables are signed and timestamped.' } else { 'Both executables are UNSIGNED.' })
+if ($Publish) {
+    $currentHead = & $git.Source -C $repo rev-parse --verify HEAD
+    $changes = & $git.Source -C $repo status --porcelain
+    if ($LASTEXITCODE -or $currentHead -ne $revision -or $changes) {
+        throw 'Source changed during preparation. Inspect the artifacts and prepare again from a clean checkout.'
+    }
+    $arguments = @('release', 'create', $tag, '--repo', $Repository, '--target', $revision, '--title', $title, '--notes-file', $preparedNotes)
+    if (!$Stable) { $arguments += @('--prerelease', '--latest=false') }
+    $arguments += @((Join-Path $directory 'vmd.exe'), (Join-Path $directory ([IO.Path]::GetFileName($installer))), $checksumPath)
+    & $gh.Source @arguments
+    if ($LASTEXITCODE) { throw 'GitHub release creation failed. Prepared artifacts remain available for inspection.' }
+} else {
+    Write-Host 'Preparation only: no Git tag, push, repository, or GitHub release was created.'
+}

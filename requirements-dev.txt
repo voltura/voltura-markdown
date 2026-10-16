@@ -1,0 +1,2 @@
+# Formatting only; the executable has no Python dependency.
+black==26.10.1

@@ -1,0 +1,43 @@
+# Product site and GitHub Pages
+
+The end-user page lives in [site/](../site/), separate from developer documentation. It uses local artwork and static HTML/CSS, with no external fonts, scripts, or tracking.
+
+## Build and preview
+
+Use the intended repository and release tag. These commands only generate local output; they do not create a repository, release, or website:
+
+```powershell
+.\scripts\build-pages.ps1 -Repository voltura/voltura-markdown -ReleaseTag v1.0.0-preview.1
+python -m http.server 8080 --bind 127.0.0.1 --directory build/pages
+```
+
+Open `http://127.0.0.1:8080`; Ctrl+C stops the server. Output lives in ignored `build/pages`. Repository/release links become usable once those destinations are actually published.
+
+`-ReleaseTag` points downloads directly at that tag, including a prerelease. Omit it to use GitHub's latest **stable** release. The installer filename uses the version from `CMakeLists.txt`; ensure the chosen release contains both matching assets. Update the first-release availability message in `site/index.html` only after downloads exist.
+
+## Publish explicitly
+
+The repository must already exist. Install Git/GitHub CLI and configure authentication, a Git commit identity, and repository push/Pages administration permissions.
+
+```powershell
+# Build only; no remote changes:
+.\scripts\publish-pages.ps1 -Repository voltura/voltura-markdown -ReleaseTag v1.0.0-preview.1
+
+# Publish only after reviewing the local output and real release downloads:
+.\scripts\publish-pages.ps1 -Repository voltura/voltura-markdown -ReleaseTag v1.0.0-preview.1 -Publish
+```
+
+`-Publish` uses an isolated checkout under `build/pages-publish`, preserves existing `gh-pages` history and `CNAME`, pushes without force, then configures [branch-based Pages](https://docs.github.com/en/rest/pages/pages) at `gh-pages:/`. It never switches the main checkout's branch. No project GitHub Actions workflow is required. A concurrent push is rejected normally; review and rerun rather than force-pushing.
+
+If Pages settings fail after the branch push, inspect the error and **Settings → Pages**. Verify the public URL and both downloads once deployment completes. Publication has not been performed during development.
+
+## Source map
+
+| File | Purpose |
+| --- | --- |
+| [index.html](../site/index.html) | Product copy, benefits, FAQ, download links |
+| [styles.css](../site/styles.css) | Responsive layout, light/dark themes, focus styles |
+| [build-pages.ps1](../scripts/build-pages.ps1) | Resolve repository/tag/version and copy static assets |
+| [publish-pages.ps1](../scripts/publish-pages.ps1) | Explicit local `gh-pages` publication and Pages settings |
+
+Before publishing, check narrow/desktop layouts, both themes, keyboard access, FAQ expansion, assets, and real download links. Keep build/architecture details in developer documentation.
