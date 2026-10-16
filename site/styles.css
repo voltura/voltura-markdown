@@ -28,7 +28,7 @@ a:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outli
 .brand { display: inline-flex; align-items: center; gap: 8px; color: var(--text); text-decoration: none; font-size: 17px; letter-spacing: -.4px; white-space: nowrap; }
 .brand strong { font-weight: 650; }
 .navigation nav { display: flex; align-items: center; gap: 30px; font-size: 14px; }
-.navigation nav a { color: var(--muted); text-decoration: none; }
+.navigation nav a { color: var(--muted); text-decoration: none; white-space: nowrap; }
 .navigation nav a:hover, .footer a:hover { color: var(--accent); }
 .hero { display: grid; grid-template-columns: 1.12fr 1fr; align-items: center; gap: 70px; min-height: 680px; padding-block: 65px 88px; }
 .eyebrow { display: flex; align-items: center; gap: 9px; margin: 0 0 22px; color: var(--accent); font-size: 12px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; }
