@@ -21,6 +21,9 @@ __pycache__/
 .env
 .env.*
 !.env.example
+*.pfx
+*.p12
+*.key
 Thumbs.db
 Desktop.ini
 .DS_Store

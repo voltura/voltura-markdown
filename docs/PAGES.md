@@ -7,7 +7,7 @@ The end-user page lives in [site/](../site/), separate from developer documentat
 Use the intended repository and release tag. These commands only generate local output; they do not create a repository, release, or website:
 
 ```powershell
-.\scripts\build-pages.ps1 -Repository voltura/voltura-markdown -ReleaseTag v1.0.0-preview.1
+.\scripts\build-pages.ps1 -Repository voltura/voltura-markdown -ReleaseTag v1.0.0-preview.2
 python -m http.server 8080 --bind 127.0.0.1 --directory build/pages
 ```
 
@@ -21,10 +21,10 @@ The repository must already exist. Install Git/GitHub CLI and configure authenti
 
 ```powershell
 # Build only; no remote changes:
-.\scripts\publish-pages.ps1 -Repository voltura/voltura-markdown -ReleaseTag v1.0.0-preview.1
+.\scripts\publish-pages.ps1 -Repository voltura/voltura-markdown -ReleaseTag v1.0.0-preview.2
 
 # Publish only after reviewing the local output and real release downloads:
-.\scripts\publish-pages.ps1 -Repository voltura/voltura-markdown -ReleaseTag v1.0.0-preview.1 -Publish
+.\scripts\publish-pages.ps1 -Repository voltura/voltura-markdown -ReleaseTag v1.0.0-preview.2 -Publish
 ```
 
 `-Publish` uses an isolated checkout under `build/pages-publish`, preserves existing `gh-pages` history and `CNAME`, pushes without force, then configures [branch-based Pages](https://docs.github.com/en/rest/pages/pages) at `gh-pages:/`. It never switches the main checkout's branch. No project GitHub Actions workflow is required. A concurrent push is rejected normally; review and rerun rather than force-pushing.

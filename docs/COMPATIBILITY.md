@@ -4,7 +4,7 @@
 
 Windows 10/11 x64. The app is Per-Monitor V2 DPI aware and uses Windows system graphics, shell, image, and networking libraries. No separate runtime is required.
 
-Current validation: Windows 11 at 225% scaling. Clean Windows 10/11, physical mixed-DPI movement, actual default-app selection in an isolated profile, certificate-backed signing, cold-cache startup, and display-frame delivery remain unverified. Installer lifecycle checks cover install, upgrade, relocation, removal, and retained documents/preferences. See [performance and verification](../PERFORMANCE.md).
+Current validation: Windows 11 at 225% scaling. Clean Windows 10/11, physical mixed-DPI movement, actual default-app selection in an isolated profile, publicly trusted signing, cold-cache startup, and display-frame delivery remain unverified. Local self-signed Authenticode signing and timestamping are verified. Installer lifecycle checks cover install, upgrade, relocation, removal, and retained documents/preferences. See [performance and verification](../PERFORMANCE.md).
 
 ## Markdown and HTML
 

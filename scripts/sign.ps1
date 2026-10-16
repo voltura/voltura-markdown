@@ -7,7 +7,8 @@ param(
     [string]$CertificateThumbprint,
     [Parameter(Mandatory)]
     [uri]$TimestampUrl,
-    [switch]$ValidateOnly
+    [switch]$ValidateOnly,
+    [switch]$AllowSelfSigned
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,7 +16,7 @@ if ($TimestampUrl.Scheme -notin @('https', 'http') -or !$TimestampUrl.Host -or $
     throw 'Provide an HTTP(S) RFC 3161 timestamp URL without credentials.'
 }
 $certificate = Get-Item -LiteralPath "Cert:\CurrentUser\My\$CertificateThumbprint" -ErrorAction Stop
-$codeSigning = @($certificate.EnhancedKeyUsageList | Where-Object { $_.ObjectId.Value -eq '1.3.6.1.5.5.7.3.3' })
+$codeSigning = @($certificate.EnhancedKeyUsageList | Where-Object { $_.ObjectId -eq '1.3.6.1.5.5.7.3.3' })
 if (!$certificate.HasPrivateKey -or !$codeSigning -or $certificate.NotBefore -gt (Get-Date) -or $certificate.NotAfter -le (Get-Date)) {
     throw 'The selected CurrentUser certificate needs an accessible private key, Code Signing usage, and valid dates.'
 }
@@ -47,10 +48,5 @@ if ($signature.Status -ne 'NotSigned') {
 }
 & $signTool sign /s My /sha1 $CertificateThumbprint /fd SHA256 /tr $TimestampUrl.AbsoluteUri /td SHA256 /d 'Voltura Markdown' /du 'https://voltura.se/' $file
 if ($LASTEXITCODE) { throw 'Authenticode signing or timestamping failed.' }
-& $signTool verify /pa /all /v $file
-if ($LASTEXITCODE) { throw 'SignTool verification failed.' }
-$signature = Get-AuthenticodeSignature -LiteralPath $file
-if ($signature.Status -ne 'Valid' -or !$signature.TimeStamperCertificate -or $signature.SignerCertificate.Thumbprint -ine $CertificateThumbprint) {
-    throw 'The resulting signature must be valid, timestamped, and signed by the selected certificate.'
-}
-Write-Host "Signed and verified: $file"
+$verified = & (Join-Path $PSScriptRoot 'verify-signature.ps1') -Path $file -CertificateThumbprint $CertificateThumbprint -AllowSelfSigned:$AllowSelfSigned
+Write-Host "Signed and verified ($($verified.trust)): $file"

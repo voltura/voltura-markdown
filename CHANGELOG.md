@@ -1,11 +1,16 @@
 # Changelog
 
+## 1.0.0 Preview 2 — 2026-10-17
+
+- Timestamped, self-signed portable reader and Windows installer.
+- Local certificate setup, automatic release signing, and signature verification.
+
 ## 1.0.0 Preview — 2026-10-16
 
 - Portable, single-file Windows Markdown reader and optional per-user Setup.
 - Formatted/source views, selection, copying, search, zoom, and smooth scrolling.
 - Floating lower-right themed zoom controls with percentage, reset, a brief fade, and scrollbar clearance.
-- Connected table borders and Left/Right horizontal scrolling.
+- Left/Right horizontal scrolling.
 - CommonMark parsing with tables, task lists, footnotes, alerts, and local/HTTPS images.
 - Common embedded HTML, themed keyboard keys, and readable local fallbacks within formatted view.
 - Light/dark themes for the reader, menus, tooltips, scrollbars, Help, and About.

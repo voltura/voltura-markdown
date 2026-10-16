@@ -3,6 +3,12 @@ param(
     [ValidatePattern('^[A-Fa-f0-9]{40}$')]
     [string]$CertificateThumbprint,
     [uri]$TimestampUrl,
+    [switch]$AllowSelfSigned,
+    [switch]$Unsigned,
+    [string]$SigningConfig = (Join-Path $env:LOCALAPPDATA 'Voltura\Markdown\Signing\signing.json'),
+    [string]$OutputDirectory,
+    [ValidateRange(1, 2147483647)]
+    [int]$PreviewNumber = 1,
     [switch]$Publish,
     [ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')]
     [string]$Repository,
@@ -14,16 +20,26 @@ $repo = Split-Path -Parent $PSScriptRoot
 $project = Get-Content -LiteralPath (Join-Path $repo 'CMakeLists.txt') -Raw
 if ($project -notmatch 'project\(VolturaMarkdown VERSION (\d+\.\d+\.\d+)') { throw 'Project version missing.' }
 $releaseVersion = $Matches[1]
-$tag = if ($Stable) { "v$releaseVersion" } else { "v$releaseVersion-preview.1" }
-$title = "Voltura Markdown $releaseVersion" + $(if (!$Stable) { ' Preview' })
-$directory = Join-Path $repo "build\releases\$releaseVersion"
+$tag = if ($Stable) { "v$releaseVersion" } else { "v$releaseVersion-preview.$PreviewNumber" }
+$title = "Voltura Markdown $releaseVersion" + $(if (!$Stable) { " Preview $PreviewNumber" })
+$directory = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirectory) } else { Join-Path $repo "build\releases\$releaseVersion" }
 if (Test-Path -LiteralPath $directory) { throw "Release directory already exists; inspect and archive it before preparing again: $directory" }
 if (!$NotesPath) { $NotesPath = Join-Path $repo "docs\releases\$releaseVersion.md" }
 $notes = Get-Content -LiteralPath $NotesPath -Raw -Encoding utf8
 if ($notes -notmatch "(?m)^# Voltura Markdown $([regex]::Escape($releaseVersion))(?:\s|$)") { throw 'Notes title must match the project version.' }
 if ($notes -match '(?i)<(?:version|commit|hash|bytes|YYYY-MM-DD|Brief|State)[^>]*>|\{\{|\}\}|\b(?:TODO|TBD|REPLACE_ME)\b') { throw 'Replace release-note placeholders before preparing a release.' }
 if ($Stable -and $notes -match '(?im)^#.*\bpreview\b') { throw 'Stable publication needs reviewed stable release notes; provide -NotesPath after completing acceptance gates.' }
+if ($Unsigned -and ($CertificateThumbprint -or $TimestampUrl -or $AllowSelfSigned)) { throw '-Unsigned cannot be combined with signing parameters.' }
+if (!$Unsigned -and !$CertificateThumbprint -and !$TimestampUrl -and (Test-Path -LiteralPath $SigningConfig)) {
+    $signing = Get-Content -LiteralPath $SigningConfig -Raw | ConvertFrom-Json
+    $CertificateThumbprint = $signing.certificateThumbprint
+    $TimestampUrl = [uri]$signing.timestampUrl
+    $AllowSelfSigned = [bool]$signing.allowSelfSigned
+    if (!$CertificateThumbprint -or !$TimestampUrl) { throw 'The local signing configuration is incomplete.' }
+}
 if ([bool]$CertificateThumbprint -ne [bool]$TimestampUrl) { throw 'Signing requires both -CertificateThumbprint and -TimestampUrl.' }
+if ($CertificateThumbprint -and $CertificateThumbprint -notmatch '^[A-Fa-f0-9]{40}$') { throw 'Invalid certificate thumbprint.' }
+if ($AllowSelfSigned -and !$CertificateThumbprint) { throw '-AllowSelfSigned requires a signing certificate.' }
 if ($CertificateThumbprint) {
     & (Join-Path $PSScriptRoot 'sign.ps1') -Path (Join-Path $repo 'dist\vmd.exe') -CertificateThumbprint $CertificateThumbprint -TimestampUrl $TimestampUrl -ValidateOnly
 }
@@ -64,14 +80,14 @@ New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null
 if ($LASTEXITCODE) { throw 'CommonMark verification failed.' }
 $portable = Join-Path $repo 'dist\vmd.exe'
 if ($CertificateThumbprint) {
-    & (Join-Path $PSScriptRoot 'sign.ps1') -Path $portable -CertificateThumbprint $CertificateThumbprint -TimestampUrl $TimestampUrl
+    & (Join-Path $PSScriptRoot 'sign.ps1') -Path $portable -CertificateThumbprint $CertificateThumbprint -TimestampUrl $TimestampUrl -AllowSelfSigned:$AllowSelfSigned
 }
 & python (Join-Path $PSScriptRoot 'verify-package.py') $portable
 if ($LASTEXITCODE) { throw 'Portable package verification failed.' }
 & (Join-Path $PSScriptRoot 'build-installer.ps1') -SkipBuild
 $installer = Join-Path $repo "dist\VolturaMarkdown-Setup-$releaseVersion-win-x64.exe"
 if ($CertificateThumbprint) {
-    & (Join-Path $PSScriptRoot 'sign.ps1') -Path $installer -CertificateThumbprint $CertificateThumbprint -TimestampUrl $TimestampUrl
+    & (Join-Path $PSScriptRoot 'sign.ps1') -Path $installer -CertificateThumbprint $CertificateThumbprint -TimestampUrl $TimestampUrl -AllowSelfSigned:$AllowSelfSigned
 }
 foreach ($asset in @($portable, $installer)) {
     $metadata = [Diagnostics.FileVersionInfo]::GetVersionInfo($asset)
@@ -84,8 +100,9 @@ $identity = foreach ($asset in $assets) {
     Copy-Item -LiteralPath $asset -Destination $directory
     $copy = Join-Path $directory ([IO.Path]::GetFileName($asset))
     $signature = Get-AuthenticodeSignature -LiteralPath $copy
-    if ($CertificateThumbprint -and ($signature.Status -ne 'Valid' -or !$signature.TimeStamperCertificate -or $signature.SignerCertificate.Thumbprint -ine $CertificateThumbprint)) {
-        throw "Signed release verification failed: $asset"
+    $verified = $null
+    if ($CertificateThumbprint) {
+        $verified = & (Join-Path $PSScriptRoot 'verify-signature.ps1') -Path $copy -CertificateThumbprint $CertificateThumbprint -AllowSelfSigned:$AllowSelfSigned
     }
     if (!$CertificateThumbprint -and $signature.Status -ne 'NotSigned') {
         throw "Unsigned preparation expected an unsigned executable, found $($signature.Status): $asset"
@@ -95,6 +112,8 @@ $identity = foreach ($asset in $assets) {
         bytes = (Get-Item -LiteralPath $copy).Length
         sha256 = (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash.ToLowerInvariant()
         signature = [string]$signature.Status
+        trust = if ($verified) { $verified.trust } else { 'Unsigned' }
+        digestVerified = [bool]$verified
         signer = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { $null }
         timestamped = [bool]$signature.TimeStamperCertificate
     }
@@ -114,7 +133,7 @@ $manifest = [ordered]@{
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $directory 'release-manifest.json') -Encoding utf8
 $details = @('', '## Download verification', '', '| Download | Bytes | SHA-256 | Publisher signature |', '| --- | ---: | --- | --- |')
 foreach ($asset in $identity) {
-    $status = if ($asset.signature -eq 'NotSigned') { 'Unsigned' } else { "Valid; $($asset.signer); timestamped" }
+    $status = if ($asset.trust -eq 'Unsigned') { 'Unsigned' } elseif ($asset.trust -eq 'SelfSigned') { 'Self-signed; timestamped' } else { "Valid; $($asset.signer); timestamped" }
     $details += "| ``$($asset.name)`` | $($asset.bytes) | ``$($asset.sha256)`` | $status |"
 }
 $details += @('', 'SHA-256 identifies the exact download. Signing status is listed above.')
