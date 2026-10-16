@@ -75,7 +75,18 @@ $repositoryInfo = Invoke-Gh -Arguments @('api', "repos/$Repository", '--jq', '.h
 if (($repositoryInfo | Out-String).Trim() -eq 'true') {
     Invoke-Gh -Arguments @('api', '--method', 'PUT', $pagesApi, '--input', $settingsFile)
 } else {
-    Invoke-Gh -Arguments @('api', '--method', 'POST', $pagesApi, '--input', $settingsFile)
+    try {
+        Invoke-Gh -Arguments @('api', '--method', 'POST', $pagesApi, '--input', $settingsFile)
+    } catch {
+        # Pushing the first gh-pages branch can enable Pages before has_pages catches up.
+        $creationError = $_
+        $existingPages = & gh api $pagesApi 2>$null
+        if ($LASTEXITCODE) { throw $creationError }
+        $pages = ($existingPages | Out-String) | ConvertFrom-Json
+        if ($pages.build_type -ne 'legacy' -or $pages.source.branch -ne 'gh-pages' -or $pages.source.path -ne '/') {
+            Invoke-Gh -Arguments @('api', '--method', 'PUT', $pagesApi, '--input', $settingsFile)
+        }
+    }
 }
 Write-Host 'gh-pages pushed and branch-based GitHub Pages configured.'
 Write-Host "Publication status: https://github.com/$Repository/settings/pages"
