@@ -160,6 +160,7 @@ struct Parser {
         Block b;
         b.kind = kind;
         b.start = (uint32_t)doc.text.size();
+        b.codeStart = b.start;
         b.indent = (unsigned)lists.size();
         b.quote = quote;
         b.level = heading;
@@ -205,6 +206,7 @@ struct Parser {
                 copy.quote = quote;
                 copy.level = heading;
                 copy.continuation = true;
+                copy.codeStart = doc.blocks[index].codeStart;
                 if (doc.blocks[index].language)
                     copy.language = std::make_unique<std::wstring>(*doc.blocks[index].language);
                 doc.blocks[index].length = (uint32_t)used;

@@ -192,6 +192,7 @@ int wmain(int argc, wchar_t **argv) {
         validate(longKey);
         require(longKey.blocks.size() >= 3, "long keyboard content retains bounded layout blocks");
         auto longCode = parse(L"```cpp\n" + std::wstring(20000, L'x') + L"\n```");
+        static_assert(sizeof(Block) == 104, "Code grouping must not enlarge every document block");
         validate(longCode);
         require(longCode.blocks.size() >= 3 && std::all_of(longCode.blocks.begin(), longCode.blocks.end(),
                                                            [](const Block &block) {
@@ -200,6 +201,12 @@ int wmain(int argc, wchar_t **argv) {
                                                                       *block.language == L"cpp";
                                                            }),
                 "segmented code preserves optional language metadata");
+        auto separateCode = parse(L"```\n" + std::wstring(20000, L'x') + L"\n```\n\n```\nshort\n```");
+        require(separateCode.blocks.size() == 4 &&
+                    separateCode.blocks[0].codeStart == separateCode.blocks[1].codeStart &&
+                    separateCode.blocks[1].codeStart == separateCode.blocks[2].codeStart &&
+                    separateCode.blocks[2].codeStart != separateCode.blocks[3].codeStart,
+                "bounded code pieces share identity without joining adjacent fences");
         std::wstring huge(200000, L'a');
         auto large = parse(huge);
         validate(large);

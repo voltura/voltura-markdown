@@ -2,6 +2,16 @@
 
 Local x64 MSVC Release measurements, 2026-10-17. Intel Core Ultra 9 185H, 22 logical processors, 63.5 GiB usable RAM; Windows 11 Pro build 26300, 3840×2160 at 225% scaling.
 
+## 1.1.6 layout regression checks
+
+Native geometry checks first reproduced nested-table border/background misalignment, ignored image indentation, unscaled placeholder offsets, and uneven/gapped backgrounds between bounded code sections. The corrected checks pass at 50%, 100%, 200%, and 300% document zoom. Wide-code padding and horizontal scrolling also pass. Actual native-window captures at 300% were inspected for quoted tables, loaded and missing images, and wide code in dark/light themes; these are local screenshots, not a new physical-monitor/DPI certification.
+
+Five launches per fixture with ordinary filesystem caching gave median process-to-first-content times of 104 → 107 ms for 1 KiB and 364 → 372 ms for 10 MiB before/after the additional layout fixes. Peak 10 MiB viewer memory stayed at 203.4 MiB. These small sample differences do not establish a statistically significant change. Results: `build/bench/layout-before.json` and `build/bench/layout-after.json`.
+
+The 10 MiB first search match painted in 3.9 ms; counting 72,818 matches took 46 ms. Separate ten-second hardware-renderer scroll samples measured CPU paint mean/p95 of 0.79/0.84 ms before and 0.83/0.95 ms after. These are CPU measurements, not displayed-frame timing. The implementation retains bounded layouts and measures only the visible viewport before painting; code-group metadata fits existing block padding without enlarging the per-block record.
+
+Both UI exit paths, simulated DPI transitions, native suites, 652 CommonMark examples, package isolation, formatting, and the isolated installer lifecycle passed.
+
 ## 1.1.5 regression checks
 
 Three launches per fixture with ordinary filesystem caching, after the reliability fixes:

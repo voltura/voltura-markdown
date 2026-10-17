@@ -26,6 +26,8 @@ struct Block {
     uint32_t start = 0, length = 0;
     unsigned level = 0, indent = 0, quote = 0;
     bool continuation = false, header = false;
+    // Shared identity for bounded pieces of one fenced/indented code block.
+    uint32_t codeStart = 0;
     std::vector<Run> runs;
     std::vector<Cell> cells;
     // Most blocks have no metadata; keep their hot record compact.

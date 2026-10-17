@@ -93,7 +93,7 @@ struct Part {
 struct Layout {
     std::vector<Part> parts;
     ComPtr<ID2D1Bitmap> bitmap;
-    float height = 0, width = 0, tableGap = 0;
+    float height = 0, width = 0, tableGap = 0, left = 0;
     bool imagePending = false, plain = false;
     uint64_t used = 0;
     size_t cost = 0;
@@ -200,6 +200,7 @@ struct App {
     std::deque<Block> rawBlocks;
     Heights heights;
     std::unordered_map<size_t, Layout> cache;
+    std::unordered_map<uint32_t, float> codeWidths;
     size_t cacheCost = 0;
     std::vector<Worker> workers;
     std::unique_ptr<Images> images;
@@ -644,6 +645,7 @@ struct App {
     }
     void clearLayouts() {
         cache.clear();
+        codeWidths.clear();
         cacheCost = 0;
         maxWidth = 0;
     }
@@ -778,6 +780,11 @@ struct App {
             return plainLayout(index);
         }
     }
+    bool codeContinues(size_t index) const {
+        return !source && index + 1 < doc->blocks.size() && doc->blocks[index + 1].kind == Kind::Code &&
+               doc->blocks[index + 1].continuation &&
+               doc->blocks[index + 1].codeStart == doc->blocks[index].codeStart;
+    }
     Layout &formattedLayout(size_t index) {
         auto found = cache.find(index);
         if (found != cache.end()) {
@@ -790,6 +797,9 @@ struct App {
         float indent = source ? 0 : (float)(b.indent ? b.indent - 1 : 0) * 22 * zoom + b.quote * 18 * zoom;
         float available = std::max(80.f, contentWidth() - indent),
               padding = (!source && b.kind == Kind::Code) ? 14 * zoom : 0;
+        out.left = indent;
+        float topPadding = b.continuation ? 0 : padding;
+        float bottomPadding = codeContinues(index) ? 0 : padding;
         float font = (b.kind == Kind::Heading ? (b.level == 1   ? 34.f
                                                  : b.level == 2 ? 27.f
                                                  : b.level == 3 ? 22.f
@@ -809,7 +819,7 @@ struct App {
                 if (SUCCEEDED(target->CreateBitmap(D2D1::SizeU(image->width, image->height),
                                                    image->pixels.data(), image->width * 4, props,
                                                    &out.bitmap))) {
-                    out.width = w;
+                    out.width = indent + w;
                     out.height = h + 18 * zoom;
                     out.cost += (size_t)image->width * image->height * 4;
                 }
@@ -817,7 +827,7 @@ struct App {
             if (!out.bitmap) {
                 out.imagePending = !image;
                 out.height = 64 * zoom;
-                out.width = available;
+                out.width = indent + available;
             }
         } else {
             auto make = [&](uint32_t start, uint32_t count, float x, float w, int align) {
@@ -825,7 +835,7 @@ struct App {
                 p.start = start;
                 p.length = count;
                 p.x = x;
-                p.y = padding;
+                p.y = topPadding;
                 p.width = w;
                 ComPtr<IDWriteTextFormat> format;
                 bool mono = source || b.kind == Kind::Code;
@@ -904,7 +914,7 @@ struct App {
                 out.cost += p.keycaps.size() * sizeof(D2D1_RECT_F);
                 p.height = m.height;
                 out.width = std::max(out.width, x + m.widthIncludingTrailingWhitespace);
-                out.height = std::max(out.height, p.y + m.height + padding);
+                out.height = std::max(out.height, p.y + m.height + bottomPadding);
                 out.cost += (size_t)count * 64 + 1024;
                 out.parts.push_back(std::move(p));
             };
@@ -920,13 +930,22 @@ struct App {
                     p.y += 8 * zoom;
             } else
                 make(b.start, b.length, indent + padding, available - 2 * padding, 0);
+            if (!source && b.kind == Kind::Code) {
+                out.width = std::max(contentWidth(), out.width + padding);
+                if (b.continuation || codeContinues(index)) {
+                    auto &groupWidth = codeWidths[b.codeStart];
+                    groupWidth = std::max(groupWidth, out.width);
+                }
+            }
             if (!source) {
                 if (b.kind == Kind::Table) {
                     bool moreRows = index + 1 < blocks().size() && blocks()[index + 1].kind == Kind::Table &&
                                     !blocks()[index + 1].header;
                     out.tableGap = moreRows ? 0 : 14 * zoom;
                     out.height += out.tableGap;
-                } else
+                } else if (b.kind == Kind::Code)
+                    out.height += codeContinues(index) ? 0 : (informationView ? 20 : 14) * zoom;
+                else
                     out.height += b.continuation ? 0 : (informationView ? 20 : 14) * zoom;
             }
         }
@@ -1040,6 +1059,23 @@ struct App {
             for (auto &h : hits)
                 fill(D2D1::RectF(h.left, h.top, h.left + h.width, h.top + h.height), c, 2);
     }
+    D2D1_RECT_F blockBounds(size_t index, const Layout &l, float y) {
+        auto kind = blocks()[index].kind;
+        float gap = kind == Kind::Table ? l.tableGap : (kind == Kind::Image ? 18 : 14) * zoom;
+        float right = l.width;
+        if (kind == Kind::Code) {
+            gap = codeContinues(index) ? 0 : (informationView ? 20 : 14) * zoom;
+            auto found = codeWidths.find(blocks()[index].codeStart);
+            if (found != codeWidths.end())
+                right = std::max(right, found->second);
+        }
+        return D2D1::RectF(documentLeft() + l.left, y, documentLeft() + right, y + l.height - gap);
+    }
+    D2D1_RECT_F imageLabelBounds(const D2D1_RECT_F &bounds) {
+        float inset = std::min(14 * zoom, (bounds.right - bounds.left) / 4);
+        return D2D1::RectF(bounds.left + inset, bounds.top + 12 * zoom, bounds.right - inset,
+                           bounds.top + 46 * zoom);
+    }
     void paint() {
 #ifdef VMD_TESTING
         auto paintStarted = std::chrono::steady_clock::now();
@@ -1066,6 +1102,11 @@ struct App {
             try {
                 size_t i = heights.find(scroll);
                 double y = top + heights.before(i) - scroll;
+                // Measure only this viewport before drawing, so visible pieces of the same
+                // code block use one right edge even when a later piece is wider.
+                double measuredY = y;
+                for (size_t n = i; n < blocks().size() && measuredY < height - bottom; ++n)
+                    measuredY += layout(n).height;
                 // Layout only visible content. Timer fills a small amount of look-ahead work.
                 for (; i < blocks().size() && y < height - bottom; ++i) {
                     auto &b = blocks()[i];
@@ -1074,9 +1115,8 @@ struct App {
                     if (y + l.height >= top) {
                         paintedDocument = true;
                         if (!source && !l.plain && b.kind == Kind::Code)
-                            fill(
-                                D2D1::RectF(x, (float)y, x + contentWidth(), (float)y + l.height - 14 * zoom),
-                                colors.code, 8);
+                            fill(blockBounds(i, l, (float)y), colors.code,
+                                 b.continuation || codeContinues(i) ? 0.f : 8.f);
                         if (b.quote && !source && !l.plain)
                             line(x + b.quote * 18 * zoom - 10 * zoom, (float)y,
                                  x + b.quote * 18 * zoom - 10 * zoom, (float)y + l.height - 12 * zoom,
@@ -1085,30 +1125,30 @@ struct App {
                             line(x, (float)y + 8 * zoom, x + contentWidth(), (float)y + 8 * zoom,
                                  colors.border);
                         if (!l.plain && b.kind == Kind::Table) {
+                            auto bounds = blockBounds(i, l, (float)y);
                             float rowBottom = (float)y + l.height - l.tableGap;
                             if (b.header)
-                                fill(D2D1::RectF(x, (float)y, x + l.width, rowBottom), colors.code);
+                                fill(bounds, colors.code);
                             if (b.header || i == 0 || blocks()[i - 1].kind != Kind::Table)
-                                line(x, (float)y, x + l.width, (float)y, colors.border);
-                            line(x, rowBottom, x + l.width, rowBottom, colors.border);
+                                line(bounds.left, (float)y, bounds.right, (float)y, colors.border);
+                            line(bounds.left, rowBottom, bounds.right, rowBottom, colors.border);
                             for (auto &p : l.parts)
                                 line(x + p.x - 10 * zoom, (float)y, x + p.x - 10 * zoom, rowBottom,
                                      colors.border);
                             line(x + l.width, (float)y, x + l.width, rowBottom, colors.border);
                         }
                         if (!l.plain && b.kind == Kind::Image) {
+                            auto bounds = blockBounds(i, l, (float)y);
                             if (l.bitmap)
-                                target->DrawBitmap(
-                                    l.bitmap.Get(),
-                                    D2D1::RectF(x, (float)y, x + l.width, (float)y + l.height - 18 * zoom));
+                                target->DrawBitmap(l.bitmap.Get(), bounds);
                             else {
-                                fill(D2D1::RectF(x, (float)y, x + contentWidth(), (float)y + 48 * zoom),
-                                     colors.code, 6);
+                                bounds.bottom = bounds.top + 48 * zoom;
+                                fill(bounds, colors.code, 6);
+                                target->PushAxisAlignedClip(bounds, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
                                 label(b.length ? std::wstring_view(text()).substr(b.start, b.length)
                                                : L"Image",
-                                      D2D1::RectF(x + 14, (float)y + 12, x + contentWidth() - 14,
-                                                  (float)y + 46),
-                                      colors.muted);
+                                      imageLabelBounds(bounds), colors.muted, 14 * zoom);
+                                target->PopAxisAlignedClip();
                             }
                         }
                         for (auto &p : l.parts) {
@@ -3232,7 +3272,71 @@ In the **three-dot menu**:
                     bars();
                     check(right > width - left() && right < width && maxWidth <= width,
                           "code_fitting_in_centering_margin_needs_no_horizontal_scrollbar");
+                    for (float factor : {1.f, 2.f, 3.f}) {
+                        width = 900;
+                        zoom = factor;
+                        resetLayout(false);
+                        auto &code = layout(0);
+                        DWRITE_TEXT_METRICS metrics{};
+                        code.parts.front().layout->GetMetrics(&metrics);
+                        float textRight = code.parts.front().x + metrics.widthIncludingTrailingWhitespace;
+                        check(code.width >= contentWidth() && code.width >= textRight + 14 * zoom,
+                              "code_background_contains_unwrapped_text_and_zoomed_padding");
+                        horizontal = maxWidth;
+                        bars();
+                        check(documentLeft() + code.width <= width + .01f,
+                              "code_right_padding_is_reachable_by_horizontal_scrolling");
+                    }
                     width = savedWidth;
+                    zoom = savedZoom;
+                    doc = original;
+                    resetLayout(false);
+                }
+                {
+                    float savedZoom = zoom;
+                    for (float factor : {.5f, 1.f, 2.f, 3.f}) {
+                        zoom = factor;
+                        doc = std::make_shared<Document>(
+                            parse(L"> | A | B |\n> | --- | --- |\n> | first | second |\n\n"
+                                  L"> ![Missing image](missing-layout-test.png)\n"));
+                        resetLayout(false);
+                        auto &table = layout(0);
+                        auto tableBounds = blockBounds(0, table, 0);
+                        check(std::abs(tableBounds.left - (documentLeft() + table.parts[0].x - 10 * zoom)) <
+                                  .01f,
+                              "nested_table_background_aligns_with_column_borders");
+                        size_t imageIndex = 0;
+                        while (imageIndex < blocks().size() && blocks()[imageIndex].kind != Kind::Image)
+                            ++imageIndex;
+                        check(imageIndex < blocks().size(), "quoted_image_fixture_contains_image");
+                        if (imageIndex == blocks().size())
+                            throw std::runtime_error("Image fixture missing");
+                        auto &image = layout(imageIndex);
+                        auto imageBounds = blockBounds(imageIndex, image, 0);
+                        check(std::abs(imageBounds.left - documentLeft() - 18 * zoom) < .01f,
+                              "quoted_image_respects_text_indentation");
+                        auto labelBounds = imageLabelBounds(imageBounds);
+                        check(std::abs(labelBounds.left - imageBounds.left - 14 * zoom) < .01f &&
+                                  std::abs(labelBounds.top - imageBounds.top - 12 * zoom) < .01f,
+                              "image_placeholder_label_scales_with_document_zoom");
+                        auto narrowLabel = imageLabelBounds(D2D1::RectF(0, 0, 80, 48 * zoom));
+                        check(narrowLabel.right > narrowLabel.left,
+                              "narrow_image_placeholder_retains_positive_label_width");
+                        std::wstring code = L"```\n";
+                        for (int line = 0; line < 130; ++line)
+                            code += std::wstring(63, L'x') + L"\n";
+                        code += std::wstring(120, L'y') + L"\n```\n";
+                        doc = std::make_shared<Document>(parse(std::move(code)));
+                        resetLayout(false);
+                        for (size_t n = 0; n < blocks().size(); ++n)
+                            layout(n);
+                        auto first = blockBounds(0, layout(0), 0);
+                        auto second = blockBounds(1, layout(1), layout(0).height);
+                        check(std::abs(first.right - second.right) < .01f,
+                              "segmented_code_background_has_consistent_right_edge");
+                        check(std::abs(first.bottom - second.top) < .01f,
+                              "segmented_code_background_has_no_internal_gap");
+                    }
                     zoom = savedZoom;
                     doc = original;
                     resetLayout(false);

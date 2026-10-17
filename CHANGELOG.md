@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.6 — 2026-10-17
+
+- Keeps wide code backgrounds aligned with text and right-hand padding at high zoom.
+- Aligns nested table backgrounds and borders, and images, with their indentation.
+- Scales missing-image labels with document zoom and clips them inside their placeholder.
+- Joins bounded sections of large code blocks with consistent measured widths and no internal background gaps.
+
 ## 1.1.5 — 2026-10-17
 
 - Prevents malformed SVG style recursion and bounds stroke-dash expansion to avoid crashes and hangs.
@@ -69,4 +76,4 @@
 - Background loading, bounded layout/image caches, Unicode boundary handling, and cancellable search.
 - MIT-licensed application, documentation, and current artwork.
 
-See [release notes](docs/releases/1.1.5.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
+See [release notes](docs/releases/1.1.6.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
