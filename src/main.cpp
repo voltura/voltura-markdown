@@ -109,7 +109,7 @@ struct App {
         HRESULT result = E_PENDING;
         double prepareMs = 0;
     };
-    bool stagedRenderer = false, rendererStarted = false, hardwareActive = false;
+    bool stagedRenderer = true, rendererStarted = false, hardwareActive = false;
     bool closeRequested = false, promotionPending = false;
     bool failRendererPreparation = false, failRendererFirstFrame = false, fallbackAwaitingFrame = false;
     std::shared_ptr<PreparedRenderer> preparedRenderer;
@@ -3351,6 +3351,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             app.metricsFile = args[++i];
         else if (a == L"--benchmark-animations")
             app.benchmarkAnimations = true;
+        else if (a == L"--hardware-renderer")
+            app.stagedRenderer = false;
         else if (a == L"--staged-renderer")
             app.stagedRenderer = true;
         else if (a == L"--test-renderer-fail-preparation")

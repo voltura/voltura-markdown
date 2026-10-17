@@ -272,7 +272,7 @@ bool openLink(const std::wstring &link, const std::wstring &base) {
     return false;
 }
 std::wstring licenses() {
-    std::wstring text = L"# Voltura Markdown\n\n**Version 1.0.0**\n\n"
+    std::wstring text = L"# Voltura Markdown\n\n**Version 1.1.0**\n\n"
                         L"A fast, read-only Markdown reader for Windows.\n\n"
                         L"## Created by\n\n- **Developer:** Joakim Skoglund\n"
                         L"- **Company:** Voltura AB\n- **Website:** [voltura.se](https://voltura.se/)\n\n"

@@ -152,6 +152,9 @@ if ($Publish) {
     $arguments += @((Join-Path $directory 'vmd.exe'), (Join-Path $directory ([IO.Path]::GetFileName($installer))), $checksumPath)
     & $gh.Source @arguments
     if ($LASTEXITCODE) { throw 'GitHub release creation failed. Prepared artifacts remain available for inspection.' }
+    if ($Stable) {
+        & (Join-Path $PSScriptRoot 'publish-pages.ps1') -Repository $Repository -Publish
+    }
 } else {
     Write-Host 'Preparation only: no Git tag, push, repository, or GitHub release was created.'
 }

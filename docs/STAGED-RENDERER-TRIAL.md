@@ -1,6 +1,6 @@
 # Staged renderer trial
 
-Experimental branch only. Hardware rendering remains the default. This trial is not version 1.1 and is not published.
+Software-first startup is the default in 1.1.0 for all document sizes. The measurements below describe validation before release.
 
 ## Try it
 
@@ -10,7 +10,7 @@ Build with `scripts/build.ps1`, then launch:
 .\dist\vmd.exe "C:\path\document.md" --staged-renderer
 ```
 
-Omit `--staged-renderer` for the existing hardware startup path.
+Use `--hardware-renderer` only for diagnostic comparisons with hardware-first startup.
 
 The first page uses software rendering. After that frame succeeds, a private background factory prepares the hardware target. The UI adopts it at the current window size and DPI. The document is not read or parsed again. Text layouts, selection and scroll state remain; image bitmaps are recreated for the new target.
 
@@ -39,7 +39,7 @@ Raw results: `build/renderer-ab-1792202151003682700/results.json`.
 - Resize/DPI change during preparation passed; the promoted target matched the current viewport and DPI.
 - Staged 10 MiB forced animated scrolling: 727 paint samples, 0.658 ms mean / 0.931 ms p95 CPU paint time.
 
-The user reported no visible flicker during manual review. That observation is separate from automated checks. Display tracing of the transition and cold starts remain unverified.
+The user reported no visible flicker during manual review. That observation is separate from automated checks. Display-level tracing of the renderer transition remains unverified. First-launch-after-reboot results are recorded below.
 
 ## Failure recovery
 
@@ -59,3 +59,7 @@ python scripts/test-renderer-failures.py
 ```
 
 The benchmark expects existing documents. Its JSONL records distinguish first content, background preparation and the first successful hardware paint. The trial scripts write only under `build/` and do not change associations or Windows display settings.
+
+## First launches after separate restarts
+
+Maintainer-run measurements on 2026-10-17: 1 KiB first content in 183 ms from process launch (131 ms from app entry); 10 MiB in 632 ms (580 ms from app entry). Both met the 500 ms / 2 s targets. Both hardware handoffs succeeded with matching viewport and DPI. These are single runs with Windows prefetching unchanged. The maintainer reported no visible flicker.

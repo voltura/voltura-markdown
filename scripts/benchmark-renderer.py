@@ -32,8 +32,7 @@ for document in args.documents:
                 "--exit-after",
                 "10000",
             ]
-            if staged:
-                command.append("--staged-renderer")
+            command.append("--staged-renderer" if staged else "--hardware-renderer")
             began = time.perf_counter()
             process = subprocess.Popen(command)
             try:

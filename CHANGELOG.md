@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0 — 2026-10-17
+
+- Faster first-page display using software rendering while hardware rendering prepares in the background.
+- Preserves reading position and selection when hardware rendering takes over.
+- Continues displaying the document in software if hardware setup fails.
+
 ## 1.0.0 — 2026-10-17
 
 - Reduced memory use and opening time for documents with many Markdown blocks.
@@ -26,4 +32,4 @@
 - Background loading, bounded layout/image caches, Unicode boundary handling, and cancellable search.
 - MIT-licensed application, documentation, and current artwork.
 
-See [release notes](docs/releases/1.0.0.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
+See [release notes](docs/releases/1.1.0.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.

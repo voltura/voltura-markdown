@@ -56,3 +56,9 @@ Startup profiling attributes roughly 130 ms to initial hardware render-target se
 - Maintainer reports clean Windows execution and default-app association checks completed. Automated installer lifecycle tests cover install, upgrade, relocation, removal and retained documents/preferences.
 
 First-launch-after-reboot targets pass. The maintainer accepted retaining hardware rendering for 1.0 despite the small-file warm-target miss. Physical mixed-DPI movement is additional unverified hardware coverage; simulated scale transitions pass. Display-frame delivery at 60 Hz is validated for the 10 MiB workload. The small-file warm-start miss is recorded above. See [Compatibility](docs/COMPATIBILITY.md#platform) and [Releasing](docs/RELEASING.md).
+
+## Version 1.1 startup
+
+Software-first rendering is now the default, without file-size routing. Seven alternating warm runs measured 173 ms hardware-first versus 106 ms software-first for 1 KiB; 427 ms versus 433 ms for 10 MiB. Separate first launches after reboot measured 183 ms for 1 KiB and 632 ms for 10 MiB, both within the startup targets. These single reboot runs do not establish a statistically controlled speed comparison. Hardware handoff succeeded in both.
+
+Injected hardware-creation and first-frame failures retained functional software rendering; UI and scrolling checks passed. The maintainer observed no visible flicker. See [startup validation](docs/STAGED-RENDERER-TRIAL.md) for methods and limits.
