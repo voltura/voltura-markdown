@@ -45,7 +45,7 @@ Install NSIS 3.x for packaging. The installer uses Modern UI 2 and solid LZMA co
 .\scripts\build-installer.ps1 -SkipBuild
 ```
 
-The output is `dist/VolturaMarkdown-Setup-1.1.2-win-x64.exe`. Building the installer does not install it. `-SkipBuild` is for an already built and verified `dist/vmd.exe`; do not use it with stale output. Installer source lives in `scripts/installer.nsi`, with its banner under `assets/installer-banner.bmp`.
+The output is `dist/VolturaMarkdown-Setup-1.1.3-win-x64.exe`. Building the installer does not install it. `-SkipBuild` is for an already built and verified `dist/vmd.exe`; do not use it with stale output. Installer source lives in `scripts/installer.nsi`, with its banner under `assets/installer-banner.bmp`.
 
 Setup is per-user, adds Start menu/Installed apps integration, and installs the reader plus application/third-party notices. The portable download remains one executable. The default-reader finish option is unchecked; selecting it registers the installed app and opens Windows Default apps for the final user choice.
 
@@ -59,8 +59,11 @@ See [Compatibility](COMPATIBILITY.md#platform) for outstanding environment check
 
 ## Display and startup validation
 
+The association test covers delayed detection, loading deferral, keyboard access, dismissal, action failure, and closing during a stalled probe. It uses test results instead of changing real defaults and verifies the user's registration stays unchanged. With Pillow installed, it also captures the notice in both themes under `build/`.
+
 ```powershell
 python scripts/test-startup.py
+python scripts/test-association.py
 .\scripts\test-display.ps1
 .\scripts\test-display.ps1 -CloseFullscreen
 .\scripts\test-display.ps1 -Scroll -Document .\build\bench\10485760.md

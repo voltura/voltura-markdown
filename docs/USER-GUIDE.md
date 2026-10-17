@@ -56,6 +56,8 @@ To use the reader for `.md` files, select Setup's optional **Choose as default M
 
 ## Troubleshooting
 
+If `.md` files point to Voltura Markdown at another location, a notice appears after the reader is ready. **Open Default apps** registers this copy's location and opens Windows Settings for you to confirm your choice. **Dismiss** hides the notice until the next launch. If moving the executable prevents files from opening, launch the app directly to see the notice.
+
 | Problem | Try |
 | --- | --- |
 | Files open in another app | Register the reader, then select it for `.md` in Windows Default apps. |

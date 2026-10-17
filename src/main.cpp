@@ -17,6 +17,7 @@
 #include <memory>
 #include <psapi.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -26,7 +27,7 @@
 using Microsoft::WRL::ComPtr;
 namespace {
 using namespace vm;
-constexpr UINT Loaded = WM_APP + 1, ImagesReady = WM_APP + 2;
+constexpr UINT Loaded = WM_APP + 1, ImagesReady = WM_APP + 2, ScheduleAssociation = WM_APP + 4;
 constexpr float bottom = 24;
 struct Palette {
     D2D1_COLOR_F bg, fg, muted, panel, border, accent, selection, code;
@@ -191,6 +192,18 @@ struct App {
     std::filesystem::path pendingPath;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now(), openStarted = started;
     bool firstPaint = false;
+    enum class AssociationPhase { WaitingForPaint, Posted, Delay, Running, Finished };
+    AssociationPhase associationPhase = AssociationPhase::WaitingForPaint;
+    uint64_t associationReadyGeneration = UINT64_MAX;
+    struct AssociationResult {
+        std::atomic_bool done = false;
+        MarkdownAssociation association = MarkdownAssociation::Unknown;
+        bool registration = false, succeeded = false;
+    };
+    std::shared_ptr<AssociationResult> associationResult;
+    HWND associationPanel = nullptr;
+    std::array<HWND, 2> associationButtons{};
+    std::wstring associationError, testAssociation;
     std::wstring metricsFile;
     std::vector<std::pair<const char *, double>> startupPhases;
     void startupPhase(const char *name) {
@@ -1080,6 +1093,14 @@ struct App {
             }
         }
         EndPaint(canvas, &ps);
+        // No shell work, worker, or notice controls exist on the path to first content.
+        if (SUCCEEDED(hr) && !loading && (firstPaint || !doc || blocks().empty())) {
+            associationReadyGeneration = generation;
+            if (associationPhase == AssociationPhase::WaitingForPaint) {
+                associationPhase = AssociationPhase::Posted;
+                PostMessageW(hwnd, ScheduleAssociation, (WPARAM)generation, 0);
+            }
+        }
         if (retryPaint)
             invalidate();
         if (SUCCEEDED(hr) && (firstPaint || (!doc && !loading)))
@@ -1120,6 +1141,202 @@ struct App {
             out << '\"' << name << "\":" << elapsed;
         }
         out << "}}\n";
+    }
+    void associationTrace(const char *event) {
+        if (metricsFile.empty())
+            return;
+        std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+        out << "{\"association\":\"" << event << "\",\"elapsed_ms\":"
+            << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count()
+            << ",\"generation\":" << generation << "}\n";
+    }
+    void startAssociationWork(bool registration = false) {
+        auto result = std::make_shared<AssociationResult>();
+        result->registration = registration;
+        auto test = testAssociation;
+        // The worker owns only its result, never App or an HWND. Closing never joins it.
+        try {
+            std::thread([result, test] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                try {
+                    if (result->registration) {
+                        if (test.empty()) {
+                            registerApplication(false, false, &result->succeeded);
+                            if (result->succeeded)
+                                SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSHNOWAIT, nullptr,
+                                               nullptr);
+                        }
+                    } else if (!test.empty()) {
+                        if (test == L"slow")
+                            Sleep(15000);
+                        result->association =
+                            test == L"unknown" ? MarkdownAssociation::Unknown : MarkdownAssociation::Mismatch;
+                    } else
+                        result->association = probeMarkdownAssociation();
+                } catch (...) {
+                    // Optional shell integration must not affect reading or terminate the process.
+                }
+                result->done.store(true);
+            }).detach();
+        } catch (const std::exception &) {
+            associationPhase = AssociationPhase::Finished;
+            if (registration)
+                associationFailed();
+            return;
+        }
+        associationResult = std::move(result);
+        associationPhase = AssociationPhase::Running;
+        SetTimer(hwnd, 17, 100, nullptr);
+        associationTrace(registration ? "registration_started" : "probe_started");
+    }
+    void associationFailed() {
+        associationError = L"Could not register this location. Try again.";
+        EnableWindow(associationButtons[0], TRUE);
+        positionAssociation();
+        InvalidateRect(associationPanel, nullptr, TRUE);
+        associationTrace("registration_failed");
+    }
+    void pollAssociation() {
+        if (!associationResult || !associationResult->done.load())
+            return;
+        // A later document also gets its first paint before any notice work.
+        if (loading || associationReadyGeneration != generation)
+            return;
+        KillTimer(hwnd, 17);
+        auto result = std::move(associationResult);
+        associationPhase = AssociationPhase::Finished;
+        if (result->registration) {
+            if (result->succeeded) {
+                if (openDefaultSettings()) {
+                    associationTrace("settings_opened");
+                    dismissAssociation();
+                } else {
+                    associationError = L"Could not open Default apps. Try Windows Settings.";
+                    EnableWindow(associationButtons[0], TRUE);
+                    positionAssociation();
+                }
+            } else
+                associationFailed();
+        } else {
+            associationTrace("probe_finished");
+            if (result->association == MarkdownAssociation::Mismatch)
+                showAssociation();
+        }
+    }
+    static constexpr auto associationTitle = L"Use this copy for .md files?";
+    static constexpr auto associationText =
+        L"Windows points to Voltura Markdown at another location. Choose this copy in Windows Default apps.";
+    int associationTextHeight(HDC dc, int panelWidth) {
+        RECT text{0, 0, panelWidth - (LONG)(32 * scale()), 0};
+        DrawTextW(dc, associationText, -1, &text, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        return text.bottom;
+    }
+    void positionAssociation() {
+        if (!associationPanel)
+            return;
+        auto s = scale();
+        int panelWidth = (int)(std::min(540.f, width - 40) * s);
+        auto dc = GetDC(associationPanel);
+        auto old = SelectObject(dc, uiFont);
+        int textHeight = associationTextHeight(dc, panelWidth);
+        SelectObject(dc, old);
+        ReleaseDC(associationPanel, dc);
+        int buttonY = (int)(54 * s) + textHeight + (associationError.empty() ? 0 : (int)(28 * s));
+        int panelHeight = buttonY + (int)(48 * s);
+        POINT origin{(LONG)(20 * s), std::max((LONG)(top * s), (LONG)((height - 80) * s) - panelHeight)};
+        ClientToScreen(hwnd, &origin);
+        SetWindowPos(associationPanel, nullptr, origin.x, origin.y, panelWidth, panelHeight,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        MoveWindow(associationButtons[0], (int)(16 * s), buttonY, (int)(170 * s), (int)(32 * s), TRUE);
+        MoveWindow(associationButtons[1], (int)(196 * s), buttonY, (int)(86 * s), (int)(32 * s), TRUE);
+        InvalidateRect(associationPanel, nullptr, FALSE);
+    }
+    static LRESULT CALLBACK associationProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
+        auto app = (App *)GetWindowLongPtrW(window, GWLP_USERDATA);
+        if (msg == WM_NCCREATE) {
+            app = (App *)((CREATESTRUCTW *)lp)->lpCreateParams;
+            SetWindowLongPtrW(window, GWLP_USERDATA, (LONG_PTR)app);
+        }
+        if (!app)
+            return DefWindowProcW(window, msg, wp, lp);
+        if (msg == WM_ERASEBKGND)
+            return 1;
+        if (msg == WM_MOUSEACTIVATE)
+            return MA_NOACTIVATE;
+        if (msg == WM_DRAWITEM) {
+            app->drawButton(*(DRAWITEMSTRUCT *)lp);
+            return TRUE;
+        }
+        if (msg == WM_COMMAND) {
+            app->command(LOWORD(wp));
+            return 0;
+        }
+        if (msg == WM_PAINT) {
+            PAINTSTRUCT ps;
+            auto screen = BeginPaint(window, &ps);
+            RECT bounds;
+            GetClientRect(window, &bounds);
+            auto dc = CreateCompatibleDC(screen);
+            auto bitmap = CreateCompatibleBitmap(screen, bounds.right, bounds.bottom);
+            auto oldBitmap = SelectObject(dc, bitmap);
+            auto background = CreateSolidBrush(app->dark ? RGB(28, 34, 45) : RGB(255, 255, 255));
+            FillRect(dc, &bounds, background);
+            DeleteObject(background);
+            auto border = CreateSolidBrush(app->dark ? RGB(48, 58, 73) : RGB(220, 226, 235));
+            FrameRect(dc, &bounds, border);
+            DeleteObject(border);
+            auto oldFont = SelectObject(dc, app->uiFont);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, app->dark ? RGB(229, 233, 240) : RGB(32, 41, 56));
+            auto s = app->scale();
+            RECT title{(LONG)(16 * s), (LONG)(14 * s), bounds.right - (LONG)(16 * s), (LONG)(38 * s)};
+            DrawTextW(dc, associationTitle, -1, &title, DT_SINGLELINE | DT_NOPREFIX);
+            RECT text{(LONG)(16 * s), (LONG)(44 * s), bounds.right - (LONG)(16 * s), bounds.bottom};
+            DrawTextW(dc, associationText, -1, &text, DT_WORDBREAK | DT_NOPREFIX);
+            if (!app->associationError.empty()) {
+                text.top += app->associationTextHeight(dc, bounds.right) + (LONG)(8 * s);
+                DrawTextW(dc, app->associationError.c_str(), -1, &text, DT_SINGLELINE | DT_NOPREFIX);
+            }
+            SelectObject(dc, oldFont);
+            BitBlt(screen, 0, 0, bounds.right, bounds.bottom, dc, 0, 0, SRCCOPY);
+            SelectObject(dc, oldBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            EndPaint(window, &ps);
+            return 0;
+        }
+        if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL)
+            return app->message(msg, wp, lp);
+        return DefWindowProcW(window, msg, wp, lp);
+    }
+    void showAssociation() {
+        WNDCLASSEXW c{sizeof(c)};
+        c.lpfnWndProc = associationProc;
+        c.hInstance = GetModuleHandleW(nullptr);
+        c.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        c.lpszClassName = L"VolturaMarkdownAssociation";
+        RegisterClassExW(&c);
+        associationPanel =
+            CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, c.lpszClassName, associationTitle,
+                            WS_POPUP | WS_CLIPCHILDREN, 0, 0, 1, 1, hwnd, nullptr, c.hInstance, this);
+        if (!associationPanel)
+            return;
+        const wchar_t *names[] = {L"Open Default apps", L"Dismiss"};
+        for (size_t i = 0; i < associationButtons.size(); ++i) {
+            associationButtons[i] =
+                CreateWindowExW(0, L"BUTTON", names[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0,
+                                0, 1, 1, associationPanel, (HMENU)(INT_PTR)(150 + i), nullptr, nullptr);
+            SetWindowSubclass(associationButtons[i], childProc, 1, (DWORD_PTR)this);
+        }
+        positionAssociation();
+        ShowWindow(associationPanel, SW_SHOWNOACTIVATE);
+        associationTrace("notice_shown");
+    }
+    void dismissAssociation() {
+        if (associationPanel && IsChild(associationPanel, GetFocus()))
+            SetFocus(hwnd);
+        ShowWindow(associationPanel, SW_HIDE);
+        associationTrace("notice_dismissed");
     }
     void zoomVisibility() {
         bool visible = showControls && zoomExpanded;
@@ -1185,6 +1402,28 @@ struct App {
     HWND nextTabControl(HWND current, bool reverse) {
         auto first = GetNextDlgTabItem(hwnd, nullptr, FALSE);
         auto last = GetNextDlgTabItem(hwnd, nullptr, TRUE);
+        if (IsWindowVisible(associationPanel)) {
+            std::vector<HWND> controls;
+            auto control = first;
+            if (control)
+                do {
+                    if (IsWindowVisible(control) && IsWindowEnabled(control))
+                        controls.push_back(control);
+                    control = GetNextDlgTabItem(hwnd, control, FALSE);
+                } while (control && control != first);
+            for (auto button : associationButtons)
+                if (IsWindowEnabled(button))
+                    controls.push_back(button);
+            if (IsWindowVisible(zoomPanel))
+                controls.insert(controls.end(), zoomButtons.begin(), zoomButtons.end());
+            auto found = std::find(controls.begin(), controls.end(), current);
+            if (found == controls.end())
+                return reverse ? controls.back() : controls.front();
+            auto index = (size_t)(found - controls.begin());
+            return controls[(index + controls.size() + (reverse ? -1 : 1)) % controls.size()];
+        }
+        if (!current && reverse && IsWindowVisible(zoomPanel))
+            return zoomButtons.back();
         auto zoomControl = std::find(zoomButtons.begin(), zoomButtons.end(), current);
         if (zoomControl != zoomButtons.end()) {
             auto index = (int)(zoomControl - zoomButtons.begin()) + (reverse ? -1 : 1);
@@ -1226,6 +1465,7 @@ struct App {
             MoveWindow(buttons[i], (int)((start + i * 38) * scale()), (int)(20 * scale()),
                        (int)(34 * scale()), (int)(34 * scale()), TRUE);
         positionZoomOverlay();
+        positionAssociation();
         if (canvas)
             MoveWindow(canvas, 0, (int)(top * scale()), r.right,
                        std::max<LONG>(1, r.bottom - (int)(top * scale())), FALSE);
@@ -1307,6 +1547,11 @@ struct App {
             InvalidateRect(backButton, nullptr, FALSE);
         if (search)
             InvalidateRect(search, nullptr, FALSE);
+        if (associationPanel) {
+            InvalidateRect(associationPanel, nullptr, FALSE);
+            for (auto button : associationButtons)
+                InvalidateRect(button, nullptr, FALSE);
+        }
         invalidateHeader();
         invalidate();
     }
@@ -1321,6 +1566,7 @@ struct App {
         uiFont = nextFont;
         themeTooltip();
         positionSearch();
+        positionAssociation();
         auto instance = GetModuleHandleW(nullptr);
         auto big = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(1), IMAGE_ICON,
                                      GetSystemMetricsForDpi(SM_CXICON, (UINT)dpi),
@@ -1446,6 +1692,16 @@ struct App {
             return DLGC_WANTALLKEYS;
         if (msg == WM_KEYDOWN) {
             bool ctrl = GetKeyState(VK_CONTROL) < 0;
+            if (a->associationPanel && IsChild(a->associationPanel, w)) {
+                if (wp == VK_RETURN) {
+                    a->command(GetDlgCtrlID(w));
+                    return 0;
+                }
+                if (wp == VK_ESCAPE) {
+                    a->dismissAssociation();
+                    return 0;
+                }
+            }
             if (w == a->search && wp == VK_RETURN) {
                 a->find(true, GetKeyState(VK_SHIFT) < 0);
                 return 0;
@@ -1758,6 +2014,16 @@ struct App {
     }
     void command(int id) {
         switch (id) {
+        case 150:
+            if (associationResult || !IsWindowVisible(associationPanel))
+                break;
+            associationError.clear();
+            EnableWindow(associationButtons[0], FALSE);
+            startAssociationWork(true);
+            break;
+        case 151:
+            dismissAssociation();
+            break;
         case 130:
         case 131:
         case 132:
@@ -2320,7 +2586,7 @@ In the **three-dot menu**:
         }
         if (key == VK_TAB) {
             visibility(true);
-            SetFocus(shift && IsWindowVisible(zoomPanel) ? zoomButtons.back() : buttons[shift ? 5 : 0]);
+            SetFocus(nextTabControl(nullptr, shift));
             return;
         }
         double delta = key == VK_NEXT || key == VK_SPACE ? height - top - bottom - 24
@@ -2360,13 +2626,18 @@ In the **three-dot menu**:
             bg = dark ? RGB(46, 59, 78) : RGB(230, 237, 250);
         if (item.itemState & ODS_SELECTED)
             bg = dark ? RGB(63, 82, 112) : RGB(209, 223, 248);
+        bool associationButton = item.CtlID == 150 || item.CtlID == 151;
         auto background = CreateSolidBrush(item.CtlID >= 140 && item.CtlID <= 142 ? RGB(255, 0, 255)
-                                           : dark                                 ? RGB(16, 19, 25)
-                                                                                  : RGB(250, 251, 253));
+                                           : associationButton ? (dark ? RGB(28, 34, 45) : RGB(255, 255, 255))
+                                           : dark              ? RGB(16, 19, 25)
+                                                               : RGB(250, 251, 253));
         FillRect(dc, &r, background);
         DeleteObject(background);
         auto b = CreateSolidBrush(bg);
-        auto pen = CreatePen(PS_SOLID, 1, focus ? (dark ? RGB(144, 185, 255) : RGB(39, 95, 199)) : bg);
+        auto pen = CreatePen(PS_SOLID, 1,
+                             focus               ? (dark ? RGB(144, 185, 255) : RGB(39, 95, 199))
+                             : associationButton ? (dark ? RGB(48, 58, 73) : RGB(220, 226, 235))
+                                                 : bg);
         auto ob = SelectObject(dc, b), op = SelectObject(dc, pen);
         RoundRect(dc, 1, 1, r.right - 1, r.bottom - 1, (int)(10 * scale()), (int)(10 * scale()));
         SelectObject(dc, ob);
@@ -2385,6 +2656,18 @@ In the **three-dot menu**:
         op = SelectObject(dc, pen);
         ob = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
         switch (item.CtlID) {
+        case 150:
+        case 151: {
+            wchar_t label[64]{};
+            GetWindowTextW(item.hwndItem, label, 64);
+            auto font = SelectObject(dc, uiFont);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(
+                dc, IsWindowEnabled(item.hwndItem) ? fg : (dark ? RGB(146, 158, 175) : RGB(102, 117, 138)));
+            DrawTextW(dc, label, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(dc, font);
+            break;
+        }
         case 140:
         case 142:
             path({{-6, 0}, {6, 0}});
@@ -2880,6 +3163,9 @@ In the **three-dot menu**:
     void close() {
         stopScrolling();
         closing = true;
+        KillTimer(hwnd, 16);
+        KillTimer(hwnd, 17);
+        associationResult.reset();
         finishRenderer();
         for (auto &w : workers)
             w.cancel->store(true);
@@ -2916,6 +3202,19 @@ In the **three-dot menu**:
         case WM_CREATE:
             initialise();
             return 0;
+        case ScheduleAssociation:
+            if (associationPhase == AssociationPhase::Posted && !closing) {
+                if (loading || wp != generation || associationReadyGeneration != generation) {
+                    associationPhase = AssociationPhase::WaitingForPaint;
+                    if (!loading)
+                        invalidate();
+                    return 0;
+                }
+                associationPhase = AssociationPhase::Delay;
+                SetTimer(hwnd, 16, 3000, nullptr);
+                associationTrace("delay_started");
+            }
+            return 0;
         case WM_PAINT:
             paintHeader();
             return 0;
@@ -2923,6 +3222,7 @@ In the **three-dot menu**:
             return 1;
         case WM_MOVE:
             positionZoomOverlay();
+            positionAssociation();
             return 0;
         case WM_SIZE:
             if (wp == SIZE_MINIMIZED)
@@ -3012,6 +3312,23 @@ In the **three-dot menu**:
             return 0;
         }
         case WM_TIMER:
+            if (wp == 16) {
+                KillTimer(hwnd, 16);
+                if (associationPhase == AssociationPhase::Delay) {
+                    if (testAssociation == L"defer" && generation == 1)
+                        open(pendingPath);
+                    if (loading || associationReadyGeneration != generation) {
+                        associationPhase = AssociationPhase::WaitingForPaint;
+                        associationTrace("deferred");
+                    } else
+                        startAssociationWork();
+                }
+                return 0;
+            }
+            if (wp == 17) {
+                pollAssociation();
+                return 0;
+            }
             if (wp == 15) {
                 promoteHardware();
                 return 0;
@@ -3345,7 +3662,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         std::wstring a = args[i];
         if (a == L"--configure-defaults")
             configureDefaults = true;
-        else if (a == L"--verify-close-fullscreen")
+        else if (a == L"--test-association" && i + 1 < argc) {
+            app.testAssociation = args[++i];
+            app.selfTest = true;
+        } else if (a == L"--verify-close-fullscreen")
             app.verifyCloseFullscreen = true;
         else if (a == L"--metrics" && i + 1 < argc)
             app.metricsFile = args[++i];

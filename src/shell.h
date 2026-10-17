@@ -14,8 +14,12 @@ struct Preferences {
 Preferences readPreferences();
 void savePreferences(const Preferences &p);
 bool systemDark();
+enum class MarkdownAssociation { Matching, Mismatch, Other, Unknown };
+MarkdownAssociation classifyMarkdownAssociation(std::wstring_view progId, std::wstring_view command,
+                                                const std::filesystem::path &currentExecutable);
+MarkdownAssociation probeMarkdownAssociation();
 std::wstring registerApplication(bool remove, bool integrateWithShell = true, bool *registered = nullptr);
-void openDefaultSettings();
+bool openDefaultSettings();
 std::filesystem::path markdownLinkPath(std::wstring_view link, const std::filesystem::path &base);
 bool openLink(const std::wstring &link, const std::wstring &base);
 std::wstring licenses();

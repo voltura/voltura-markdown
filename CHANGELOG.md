@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.3 — 2026-10-17
+
+- Detects when .md files point to Voltura Markdown at another location and offers to register the current copy and open Windows Default apps. Windows still confirms the final default choice.
+- Defers association checks until after the first content is painted and runs shell work in the background, preserving fast software-first startup and responsive reading.
+- Keeps uncertain associations quiet and supports dismissal, keyboard access, retry after registration failure, and closing while a check is stalled.
+
 ## 1.1.2 — 2026-10-17
 
 - Uses markdown.voltura.se for the About link, executable metadata, installer website, and signing website URL.
@@ -43,4 +49,4 @@
 - Background loading, bounded layout/image caches, Unicode boundary handling, and cancellable search.
 - MIT-licensed application, documentation, and current artwork.
 
-See [release notes](docs/releases/1.1.2.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
+See [release notes](docs/releases/1.1.3.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
