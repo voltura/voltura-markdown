@@ -6,14 +6,14 @@ A fast, compact, read-only Markdown reader for Windows 10/11 x64. One portable e
 
 ## Download
 
-Visit the [product website](https://voltura.github.io/voltura-markdown/) or open [Releases](https://github.com/voltura/voltura-markdown/releases) and choose an asset:
+Visit the [product website](https://markdown.voltura.se/) or open [Releases](https://github.com/voltura/voltura-markdown/releases) and choose an asset:
 
 | Download | Use |
 | --- | --- |
 | **`vmd.exe`** | Portable reader. Download, keep in a suitable folder, and run. |
 | **`VolturaMarkdown-Setup-<version>-win-x64.exe`** | Per-user installation with a Start menu shortcut and Windows uninstall entry. |
 
-**1.1.1** includes self-signed, timestamped executables. GitHub's source archives do not contain a built app; download one of the executable assets above.
+**1.1.2** includes self-signed, timestamped executables. GitHub's source archives do not contain a built app; download one of the executable assets above.
 
 Setup requires no administrator access. Its optional **Choose as default Markdown reader** checkbox opens Windows Default apps so you can make the final choice.
 
@@ -43,7 +43,7 @@ The portable reader needs no companion DLLs, browser engine, .NET, or Visual C++
 ## Documentation
 
 - [User guide](docs/USER-GUIDE.md) · [Supported formats and limits](docs/COMPATIBILITY.md)
-- [Release notes](docs/releases/1.1.1.md) · [Changelog](CHANGELOG.md)
+- [Release notes](docs/releases/1.1.2.md) · [Changelog](CHANGELOG.md)
 - [Folder and document map](docs/REPOSITORY.md) · [Architecture](docs/ARCHITECTURE.md)
 - [Build and verify](docs/BUILDING.md) · [Code style](docs/CODE-STYLE.md) · [Performance](PERFORMANCE.md)
 - [Local releases and signing](docs/RELEASING.md) · [Product website](docs/PAGES.md)

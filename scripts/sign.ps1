@@ -46,7 +46,7 @@ $signature = Get-AuthenticodeSignature -LiteralPath $file
 if ($signature.Status -ne 'NotSigned') {
     throw "Refusing to replace an existing or invalid signature ($($signature.Status)). Rebuild the executable first."
 }
-& $signTool sign /s My /sha1 $CertificateThumbprint /fd SHA256 /tr $TimestampUrl.AbsoluteUri /td SHA256 /d 'Voltura Markdown' /du 'https://voltura.se/' $file
+& $signTool sign /s My /sha1 $CertificateThumbprint /fd SHA256 /tr $TimestampUrl.AbsoluteUri /td SHA256 /d 'Voltura Markdown' /du 'https://markdown.voltura.se/' $file
 if ($LASTEXITCODE) { throw 'Authenticode signing or timestamping failed.' }
 $verified = & (Join-Path $PSScriptRoot 'verify-signature.ps1') -Path $file -CertificateThumbprint $CertificateThumbprint -AllowSelfSigned:$AllowSelfSigned
 Write-Host "Signed and verified ($($verified.trust)): $file"

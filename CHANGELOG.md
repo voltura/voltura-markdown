@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.2 — 2026-10-17
+
+- Uses markdown.voltura.se for the About link, executable metadata, installer website, and signing website URL.
+- Moves the product site to its HTTPS custom domain while retaining the published domain on future updates.
+
 ## 1.1.1 — 2026-10-17
 
 - Starts in a normal window when launched without a document.
@@ -38,4 +43,4 @@
 - Background loading, bounded layout/image caches, Unicode boundary handling, and cancellable search.
 - MIT-licensed application, documentation, and current artwork.
 
-See [release notes](docs/releases/1.1.1.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
+See [release notes](docs/releases/1.1.2.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.

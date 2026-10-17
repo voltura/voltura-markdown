@@ -277,17 +277,18 @@ bool openLink(const std::wstring &link, const std::wstring &base) {
     return false;
 }
 std::wstring licenses() {
-    std::wstring text = L"# Voltura Markdown\n\n**Version 1.1.1**\n\n"
-                        L"A fast, read-only Markdown reader for Windows.\n\n"
-                        L"## Created by\n\n- **Developer:** Joakim Skoglund\n"
-                        L"- **Company:** Voltura AB\n- **Website:** [voltura.se](https://voltura.se/)\n\n"
-                        L"## Help and navigation\n\n- <kbd>F1</kbd>: open Help for controls and shortcuts.\n"
-                        L"- **Back arrow** / <kbd>Escape</kbd>: return to your reading position.\n\n"
-                        L"## Open-source software\n\n"
-                        L"- **Voltura Markdown:** application and artwork · MIT license.\n"
-                        L"- **MD4C:** Markdown parser · MIT license.\n"
-                        L"- **NanoSVG:** static SVG renderer · zlib license.\n\n"
-                        L"The complete license notices follow.\n\n---\n\n";
+    std::wstring text =
+        L"# Voltura Markdown\n\n**Version 1.1.2**\n\n"
+        L"A fast, read-only Markdown reader for Windows.\n\n"
+        L"## Created by\n\n- **Developer:** Joakim Skoglund\n"
+        L"- **Company:** Voltura AB\n- **Website:** [markdown.voltura.se](https://markdown.voltura.se/)\n\n"
+        L"## Help and navigation\n\n- <kbd>F1</kbd>: open Help for controls and shortcuts.\n"
+        L"- **Back arrow** / <kbd>Escape</kbd>: return to your reading position.\n\n"
+        L"## Open-source software\n\n"
+        L"- **Voltura Markdown:** application and artwork · MIT license.\n"
+        L"- **MD4C:** Markdown parser · MIT license.\n"
+        L"- **NanoSVG:** static SVG renderer · zlib license.\n\n"
+        L"The complete license notices follow.\n\n---\n\n";
     for (int id : {4, 2, 3}) {
         auto r = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
         if (r) {
