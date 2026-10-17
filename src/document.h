@@ -1,7 +1,9 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -26,12 +28,13 @@ struct Block {
     bool continuation = false, header = false;
     std::vector<Run> runs;
     std::vector<Cell> cells;
-    std::wstring image, language, anchor;
+    // Most blocks have no metadata; keep their hot record compact.
+    std::unique_ptr<std::wstring> image, language, anchor;
 };
 struct Document {
     std::wstring text;
     std::wstring source;
-    std::vector<Block> blocks;
+    std::deque<Block> blocks;
     std::filesystem::path path;
     std::wstring encoding;
     bool plainSource = false;
@@ -43,7 +46,7 @@ std::wstring decode(std::string_view bytes, std::wstring *encoding = nullptr);
 Document parse(std::wstring source, const std::atomic_bool *cancel = nullptr, unsigned flags = 0xffffffff);
 Document loadSource(const std::filesystem::path &path, const std::atomic_bool *cancel = nullptr);
 Document load(const std::filesystem::path &path, const std::atomic_bool *cancel = nullptr);
-size_t blockAtPosition(const std::vector<Block> &blocks, uint32_t position);
-std::vector<Block> sourceBlocks(std::wstring_view source);
+size_t blockAtPosition(const std::deque<Block> &blocks, uint32_t position);
+std::deque<Block> sourceBlocks(std::wstring_view source);
 std::wstring entity(std::wstring_view text);
 } // namespace vm

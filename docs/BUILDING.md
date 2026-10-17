@@ -56,3 +56,24 @@ The installer lifecycle smoke test builds a separate test identity, installs and
 ```
 
 See [Compatibility](COMPATIBILITY.md#platform) for outstanding environment checks.
+
+## Display and startup validation
+
+```powershell
+.\scripts\test-display.ps1
+.\scripts\test-display.ps1 -CloseFullscreen
+.\scripts\test-display.ps1 -Scroll -Document .\build\bench\10485760.md
+python scripts/benchmark.py --output acceptance-results.json
+```
+
+The UI test simulates DPI changes without changing Windows display settings. It checks windowed/fullscreen geometry, the render target, selection, zoom clearance and the scroll-height index. Scroll mode runs ten seconds of continuous scrolling, reverses at each boundary, and records CPU paint cost, boundary reversals and the Windows animation preference. Documents without scrollable content fail the benchmark. Add `-Animate` to exercise smooth scrolling inside the test process even when Windows animations are disabled; system settings remain unchanged. Each run writes a unique folder under `build/` and closes only its own processes.
+
+For display-level tracing, download the standalone [PresentMon 2.6.0 console executable](https://github.com/GameTechDev/PresentMon/releases/tag/v2.6.0) into `build/tools/PresentMon.exe`. From an elevated PowerShell session, run:
+
+```powershell
+.\scripts\test-display.ps1 -Scroll -TraceDisplay -Document .\build\bench\10485760.md
+```
+
+The resulting CSV contains only the test process's frames. Trace collection is a developer tool and adds nothing to the distributed app. Successful collection alone does not establish a frame-rate target; inspect displayed frames and frame intervals.
+
+For a first launch after reboot, generate fixtures beforehand, restart Windows, and run `python scripts/benchmark.py --startup-only --runs 1 --sizes 1024 10485760 --output first-launch.json`. This avoids parsing the file before the GUI launch. Record the cache/environment conditions separately: the script does not purge Windows caches or certify a cold-cache run. The external process-to-metric timing includes process creation and a polling interval of approximately 5 ms.

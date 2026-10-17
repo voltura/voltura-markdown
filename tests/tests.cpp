@@ -63,9 +63,10 @@ int wmain(int argc, wchar_t **argv) {
         require(std::any_of(d.blocks.begin(), d.blocks.end(),
                             [](auto &b) { return b.kind == Kind::Table && b.cells.size() == 2 && b.header; }),
                 "table header");
-        require(std::any_of(d.blocks.begin(), d.blocks.end(),
-                            [](auto &b) { return b.kind == Kind::Image && b.image == L"photo.png"; }),
-                "image");
+        require(
+            std::any_of(d.blocks.begin(), d.blocks.end(),
+                        [](auto &b) { return b.kind == Kind::Image && b.image && *b.image == L"photo.png"; }),
+            "image");
         bool bold = false, italic = false, link = false;
         for (auto &b : d.blocks)
             for (auto &r : b.runs) {
@@ -140,17 +141,38 @@ int wmain(int argc, wchar_t **argv) {
                 "keyboard styling preserves source and copied text without synthetic padding");
         auto nestedKeys = parse(L"<strong><kbd>Shift</kbd></strong> plain <kbd><kbd>F1</kbd></kbd>");
         validate(nestedKeys);
-        bool nestedKey = false, plainRestored = false;
+        bool nestedKey = false;
+        auto plainAt = nestedKeys.text.find(L"plain");
+        bool plainRestored = plainAt != std::wstring::npos;
         for (auto &block : nestedKeys.blocks)
             for (auto &run : block.runs) {
                 auto label = nestedKeys.text.substr(run.start, run.length);
                 nestedKey |= label == L"Shift" && (run.style & (Keycap | Bold)) == (Keycap | Bold);
-                plainRestored |= label.find(L"plain") != label.npos && !(run.style & Keycap);
+                plainRestored &= !(run.start <= plainAt && plainAt < run.start + run.length &&
+                                   (run.style & (Keycap | Bold)));
             }
         require(nestedKey && plainRestored, "nested keyboard styling restores surrounding formatting");
+        auto ordinary = parse(L"A plain paragraph.\n\nAnother plain paragraph.");
+        require(ordinary.blocks.size() == 2 && ordinary.blocks[0].runs.empty() &&
+                    ordinary.blocks[1].runs.empty() && ordinary.text.find(L"Another") != ordinary.text.npos,
+                "plain text retains content without allocating formatting records");
+        auto separated = parse(L"**one** plain **two**");
+        require(separated.blocks[0].runs.size() == 2 &&
+                    separated.blocks[0].runs[0].start + separated.blocks[0].runs[0].length <
+                        separated.blocks[0].runs[1].start,
+                "implicit plain ranges do not merge separated formatting");
         auto longKey = parse(L"<kbd>" + std::wstring(20000, L'x') + L"</kbd>");
         validate(longKey);
         require(longKey.blocks.size() >= 3, "long keyboard content retains bounded layout blocks");
+        auto longCode = parse(L"```cpp\n" + std::wstring(20000, L'x') + L"\n```");
+        validate(longCode);
+        require(longCode.blocks.size() >= 3 && std::all_of(longCode.blocks.begin(), longCode.blocks.end(),
+                                                           [](const Block &block) {
+                                                               return block.kind == Kind::Code &&
+                                                                      block.language &&
+                                                                      *block.language == L"cpp";
+                                                           }),
+                "segmented code preserves optional language metadata");
         std::wstring huge(200000, L'a');
         auto large = parse(huge);
         validate(large);

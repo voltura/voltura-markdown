@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.0 — 2026-10-17
+
+- Reduced memory use and opening time for documents with many Markdown blocks.
+- Correct initial control scaling and added DPI-transition regression coverage.
+
 ## 1.0.0 Preview 2 — 2026-10-17
 
 - Timestamped, self-signed portable reader and Windows installer.
@@ -21,4 +26,4 @@
 - Background loading, bounded layout/image caches, Unicode boundary handling, and cancellable search.
 - MIT-licensed application, documentation, and current artwork.
 
-See [preview release notes](docs/releases/1.0.0.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
+See [release notes](docs/releases/1.0.0.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.

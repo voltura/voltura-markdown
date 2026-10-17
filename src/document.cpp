@@ -175,7 +175,7 @@ struct Parser {
                                     [](wchar_t c) { return iswpunct(c) && c != L'-' && c != L'_'; }),
                      id.end());
             std::replace(id.begin(), id.end(), L' ', L'-');
-            b.anchor = id;
+            b.anchor = std::make_unique<std::wstring>(std::move(id));
         }
         doc.text.push_back(L'\n');
         current = -1;
@@ -196,7 +196,8 @@ struct Parser {
                 copy.quote = quote;
                 copy.level = heading;
                 copy.continuation = true;
-                copy.language = doc.blocks[index].language;
+                if (doc.blocks[index].language)
+                    copy.language = std::make_unique<std::wstring>(*doc.blocks[index].language);
                 doc.blocks[index].length = (uint32_t)used;
                 current = -1;
                 copy.start = (uint32_t)doc.text.size();
@@ -216,7 +217,7 @@ struct Parser {
             if (!separateRun && !b.runs.empty() && b.runs.back().start + b.runs.back().length == at &&
                 b.runs.back().style == st && b.runs.back().link == link)
                 b.runs.back().length += (uint32_t)n;
-            else
+            else if (st || !link.empty())
                 b.runs.push_back({at, (uint32_t)n, st, link});
             separateRun = false;
             doc.text.append(s.substr(0, n));
@@ -252,12 +253,15 @@ struct Parser {
             heading = ((MD_BLOCK_H_DETAIL *)d)->level;
             start(Kind::Heading);
             break;
-        case MD_BLOCK_CODE:
+        case MD_BLOCK_CODE: {
             finish();
             inCode = true;
             start(Kind::Code);
-            block().language = attr(((MD_BLOCK_CODE_DETAIL *)d)->lang);
+            auto language = attr(((MD_BLOCK_CODE_DETAIL *)d)->lang);
+            if (!language.empty())
+                block().language = std::make_unique<std::wstring>(std::move(language));
             break;
+        }
         case MD_BLOCK_HR:
             finish();
             start(Kind::Rule);
@@ -293,7 +297,7 @@ struct Parser {
             auto def = (MD_BLOCK_FOOTNOTE_DEF_DETAIL *)d;
             prefix = std::to_wstring(def->id) + L". ";
             start();
-            block().anchor = L"fn-" + std::to_wstring(def->id);
+            block().anchor = std::make_unique<std::wstring>(L"fn-" + std::to_wstring(def->id));
             break;
         }
         case MD_BLOCK_ADMONITION:
@@ -382,7 +386,7 @@ struct Parser {
             finish();
             inImage = true;
             start(Kind::Image);
-            block().image = attr(((MD_SPAN_IMG_DETAIL *)d)->src);
+            block().image = std::make_unique<std::wstring>(attr(((MD_SPAN_IMG_DETAIL *)d)->src));
             break;
         case MD_SPAN_FOOTNOTE_REF: {
             auto ref = (MD_SPAN_FOOTNOTE_REF_DETAIL *)d;
@@ -613,7 +617,7 @@ struct Parser {
             } else if (tag == L"img" && !close) {
                 finish();
                 start(Kind::Image);
-                block().image = attribute(token, L"src");
+                block().image = std::make_unique<std::wstring>(attribute(token, L"src"));
                 append(attribute(token, L"alt"));
                 finish();
             } else if (tag == L"table" || tag == L"thead" || tag == L"tbody") {
@@ -727,8 +731,7 @@ Document parse(std::wstring source, const std::atomic_bool *cancel, unsigned fla
                std::any_of(b.cells.begin(), b.cells.end(), [](const Cell &c) { return c.length > 8192; });
     });
     if (needsSplit) {
-        std::vector<Block> bounded;
-        bounded.reserve(p.doc.blocks.size());
+        std::deque<Block> bounded;
         for (auto &b : p.doc.blocks) {
             if (b.cells.size() > 256) {
                 uint32_t position = b.start, limit = b.start + b.length;
@@ -866,7 +869,7 @@ Document load(const std::filesystem::path &path, const std::atomic_bool *cancel)
     doc.readMs = source.readMs;
     return doc;
 }
-size_t blockAtPosition(const std::vector<Block> &blocks, uint32_t position) {
+size_t blockAtPosition(const std::deque<Block> &blocks, uint32_t position) {
     auto after = std::upper_bound(blocks.begin(), blocks.end(), position,
                                   [](uint32_t at, const Block &block) { return at < block.start; });
     size_t candidate = after == blocks.begin() ? 0 : (size_t)(after - blocks.begin() - 1);
@@ -883,8 +886,8 @@ size_t blockAtPosition(const std::vector<Block> &blocks, uint32_t position) {
     }
     return candidate;
 }
-std::vector<Block> sourceBlocks(std::wstring_view s) {
-    std::vector<Block> blocks;
+std::deque<Block> sourceBlocks(std::wstring_view s) {
+    std::deque<Block> blocks;
     size_t at = 0;
     while (at < s.size()) {
         size_t end = std::min(s.size(), at + 8192);

@@ -15,6 +15,7 @@
 #include <fstream>
 #include <list>
 #include <memory>
+#include <psapi.h>
 #include <shellapi.h>
 #include <sstream>
 #include <thread>
@@ -128,7 +129,7 @@ struct App {
     uint32_t anchor = 0, caret = 0;
     uint64_t generation = 0, tick = 0;
     std::shared_ptr<Document> doc;
-    std::vector<Block> rawBlocks;
+    std::deque<Block> rawBlocks;
     Heights heights;
     std::unordered_map<size_t, Layout> cache;
     size_t cacheCost = 0;
@@ -146,10 +147,22 @@ struct App {
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now(), openStarted = started;
     bool firstPaint = false;
     std::wstring metricsFile;
-    bool exitOnContent = false;
+    std::vector<std::pair<const char *, double>> startupPhases;
+    void startupPhase(const char *name) {
+        if (!metricsFile.empty() && !firstPaint)
+            startupPhases.emplace_back(
+                name, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+                          .count());
+    }
+    bool exitOnContent = false, scrollBenchmark = false, benchmarkAnimations = false;
+    std::chrono::steady_clock::time_point heartbeatAt, scrollBenchmarkStarted;
+    double loadingHeartbeatMaxMs = 0;
+    unsigned loadingHeartbeatSamples = 0;
     bool verifyCloseFullscreen = false;
     std::wstring verifyFile;
     int verifyStage = 0, scrollFrames = 0;
+    int scrollBenchmarkDirection = 1;
+    unsigned scrollBenchmarkReversals = 0;
     std::array<uint64_t, 6> buttonPaints{};
     uint64_t toolbarBeforeScroll = 0, toolbarBeforeReload = 0;
     uint64_t spinnerPaints = 0, spinnerBeforeReload = 0;
@@ -164,7 +177,7 @@ struct App {
     std::vector<MenuRow> menuRows;
     struct SavedView {
         std::shared_ptr<Document> document;
-        std::vector<Block> raw;
+        std::deque<Block> raw;
         bool source;
         double scroll;
         float horizontal, zoom;
@@ -196,7 +209,7 @@ struct App {
         return point.x >= 0 && point.x < client.right && point.y >= 0 &&
                (point.y < top * scale() || PtInRect(&zoomBounds, point));
     }
-    std::vector<Block> &blocks() {
+    std::deque<Block> &blocks() {
         return source ? rawBlocks : doc->blocks;
     }
     const std::wstring &text() {
@@ -350,6 +363,7 @@ struct App {
             &target);
         if (FAILED(hr))
             return false;
+        startupPhase("render_target_ready");
         target->SetDpi(dpi, dpi);
         target->SetTransform(D2D1::Matrix3x2F::Translation(0, -top));
         return SUCCEEDED(target->CreateSolidColorBrush(rgb(0), &brush));
@@ -395,8 +409,14 @@ struct App {
         }
         auto &bs = blocks();
         heights.reset(bs.size());
-        for (size_t i = 0; i < bs.size(); ++i)
-            heights.set(i, estimate(bs[i]));
+        // Build the Fenwick index in linear time; later measured-height updates stay logarithmic.
+        for (size_t i = 0; i < bs.size(); ++i) {
+            heights.values[i] = estimate(bs[i]);
+            heights.tree[i + 1] += heights.values[i];
+            size_t parent = (i + 1) + ((i + 1) & (~(i + 1) + 1));
+            if (parent < heights.tree.size())
+                heights.tree[parent] += heights.tree[i + 1];
+        }
         if (keep)
             scroll = ratio * heights.total();
         else
@@ -506,7 +526,7 @@ struct App {
         if (b.kind == Kind::Rule) {
             out.height = 24 * zoom;
         } else if (b.kind == Kind::Image) {
-            auto image = images->get(b.image, doc->path.wstring());
+            auto image = images->get(b.image ? *b.image : L"", doc->path.wstring());
             if (image && image->ready) {
                 float f = std::min(1.f, available / image->width);
                 float w = image->width * f, h = image->height * f;
@@ -658,6 +678,8 @@ struct App {
         BOOL animations = TRUE;
         SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
         scrollTarget = std::clamp(destination, 0., std::max(0., heights.total() - (height - top - bottom)));
+        if (scrollBenchmark && benchmarkAnimations)
+            animations = TRUE;
         if (!animations) {
             scroll = scrollTarget;
             stopScrolling();
@@ -674,6 +696,8 @@ struct App {
         }
     }
     void animateScroll() {
+        if (!scrollAnimating)
+            return;
         auto now = std::chrono::steady_clock::now();
         double dt = std::chrono::duration<double>(now - scrollTick).count();
         scrollTick = now;
@@ -846,6 +870,13 @@ struct App {
     void recordMetric() {
         if (metricsFile.empty())
             return;
+        auto now = std::chrono::steady_clock::now();
+        if (loadingHeartbeatSamples)
+            loadingHeartbeatMaxMs = std::max(
+                loadingHeartbeatMaxMs, std::chrono::duration<double, std::milli>(now - heartbeatAt).count());
+        KillTimer(hwnd, 14);
+        PROCESS_MEMORY_COUNTERS_EX memory{};
+        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&memory, sizeof(memory));
         std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
         double ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -853,7 +884,18 @@ struct App {
             << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - openStarted)
                    .count()
             << ",\"read_ms\":" << doc->readMs << ",\"parse_ms\":" << doc->parseMs
-            << ",\"blocks\":" << doc->blocks.size() << ",\"characters\":" << doc->source.size() << "}\n";
+            << ",\"blocks\":" << doc->blocks.size() << ",\"characters\":" << doc->source.size()
+            << ",\"peak_working_set_bytes\":" << memory.PeakWorkingSetSize
+            << ",\"loading_heartbeat_samples\":" << loadingHeartbeatSamples
+            << ",\"loading_heartbeat_max_ms\":" << loadingHeartbeatMaxMs << ",\"startup_phases_ms\":{";
+        bool first = true;
+        for (auto [name, elapsed] : startupPhases) {
+            if (!first)
+                out << ',';
+            first = false;
+            out << '\"' << name << "\":" << elapsed;
+        }
+        out << "}}\n";
     }
     void zoomVisibility() {
         bool visible = showControls && zoomExpanded;
@@ -953,7 +995,6 @@ struct App {
     void positions() {
         RECT r;
         GetClientRect(hwnd, &r);
-        dpi = (float)GetDpiForWindow(hwnd);
         width = std::max(1.f, r.right / scale() - 12);
         height = std::max(1.f, r.bottom / scale() - 12);
         float start = width - (fullscreen ? 7 : 6) * 38 - 20;
@@ -1073,11 +1114,13 @@ struct App {
         smallIcon = smallHandle;
     }
     void initialise() {
+        dpi = (float)GetDpiForWindow(hwnd);
         D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d.GetAddressOf());
         DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                             (IUnknown **)write.GetAddressOf());
         if (!d2d || !write)
             throw std::runtime_error("Windows text rendering could not be initialized.");
+        startupPhase("graphics_factories_ready");
         prefs = selfTest ? Preferences{} : readPreferences();
         zoom = prefs.zoom;
         zoomExpanded = std::abs(zoom - 1.f) > .001f;
@@ -1136,6 +1179,7 @@ struct App {
             info.lpszText = const_cast<wchar_t *>(zoomTips[i]);
             SendMessageW(tooltip, TTM_ADDTOOLW, 0, (LPARAM)&info);
         }
+        startupPhase("buttons_ready");
         updateZoomControls();
         search = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                                  (HMENU)200, nullptr, nullptr);
@@ -1158,6 +1202,7 @@ struct App {
         positions();
         refreshDpiAssets();
         theme();
+        startupPhase("controls_ready");
         if (prefs.placed) {
             auto p = prefs.placement;
             if (p.showCmd == SW_SHOWMINIMIZED)
@@ -1288,9 +1333,10 @@ struct App {
             invalidate();
             return;
         }
+        startupPhase("document_delivered");
         doc = std::move(r->document);
         source = false;
-        rawBlocks = sourceBlocks(doc->source);
+        rawBlocks.clear();
         anchor = caret = 0;
         searchMatch = false;
         notice.clear();
@@ -1299,7 +1345,15 @@ struct App {
         invalidateHeader();
         if (searching)
             find(false);
-        if (!verifyFile.empty())
+        if (scrollBenchmark) {
+            paintTimes.clear();
+            scrollFrames = 0;
+            scrollBenchmarkDirection = 1;
+            scrollBenchmarkReversals = 0;
+            scrollTarget = scroll;
+            scrollBenchmarkStarted = std::chrono::steady_clock::now();
+            SetTimer(hwnd, 13, 10, nullptr);
+        } else if (!verifyFile.empty())
             SetTimer(hwnd, 10, 120, nullptr);
     }
     void toggleSource() {
@@ -1307,6 +1361,8 @@ struct App {
             return;
         cancelSearch();
         double ratio = heights.total() > 0 ? scroll / heights.total() : 0;
+        if (!source && rawBlocks.empty())
+            rawBlocks = sourceBlocks(doc->source);
         source = !source;
         anchor = caret = 0;
         searchMatch = false;
@@ -1660,7 +1716,7 @@ In the **three-dot menu**:
         ShowWindow(search, SW_HIDE);
         doc = std::move(information);
         source = false;
-        rawBlocks = sourceBlocks(doc->source);
+        rawBlocks.clear();
         anchor = caret = 0;
         searchMatch = false;
         notice.clear();
@@ -1899,7 +1955,7 @@ In the **three-dot menu**:
                         if (r.link.starts_with(L"#")) {
                             auto id = r.link.substr(1);
                             for (size_t i = 0; i < doc->blocks.size(); ++i)
-                                if (doc->blocks[i].anchor == id) {
+                                if (doc->blocks[i].anchor && *doc->blocks[i].anchor == id) {
                                     scroll = heights.before(i);
                                     bars();
                                     invalidate();
@@ -2240,6 +2296,58 @@ In the **three-dot menu**:
             check(!(GetWindowLongW(hwnd, GWL_STYLE) & (WS_VSCROLL | WS_HSCROLL)),
                   "no_native_scrollbar_resize_cycle");
             check(IsWindowVisible(buttons[0]) != FALSE, "toolbar_visible");
+            {
+                RECT originalBounds;
+                GetWindowRect(hwnd, &originalBounds);
+                auto originalDpi = dpi;
+                auto originalDocument = doc;
+                auto originalTheme = dark;
+                auto originalAnchor = anchor, originalCaret = caret;
+                anchor = 1;
+                caret = 3;
+                for (bool full : {false, true}) {
+                    if (fullscreen != full)
+                        toggleFullscreen();
+                    for (UINT testDpi : {96u, 120u, 144u, 192u, 216u, 288u, 96u}) {
+                        LONG x = testDpi == 144 ? -1280 : 80;
+                        RECT suggested{x, 80, x + 1200, 900};
+                        auto updates = viewportUpdates;
+                        SendMessageW(hwnd, WM_DPICHANGED, MAKELONG(testDpi, testDpi), (LPARAM)&suggested);
+                        RECT client, control, zoomBounds;
+                        GetClientRect(hwnd, &client);
+                        GetWindowRect(buttons[0], &control);
+                        GetWindowRect(zoomPanel, &zoomBounds);
+                        POINT zoomPoint{zoomBounds.right, zoomBounds.bottom};
+                        ScreenToClient(hwnd, &zoomPoint);
+                        float targetX = 0, targetY = 0;
+                        if (target)
+                            target->GetDpi(&targetX, &targetY);
+                        check(dpi == testDpi && viewportUpdates > updates &&
+                                  std::abs(width - (client.right / scale() - 12)) < .01f &&
+                                  control.right - control.left == (int)(34 * scale()) &&
+                                  zoomPoint.x < client.right && zoomPoint.y < client.bottom &&
+                                  (!target || (targetX == testDpi && targetY == testDpi)),
+                              full ? "simulated_fullscreen_dpi_geometry" : "simulated_windowed_dpi_geometry");
+                        check(doc == originalDocument && anchor == 1 && caret == 3 && dark == originalTheme,
+                              "simulated_dpi_preserves_document_selection_and_theme");
+                        double sum = 0;
+                        bool indexValid = true;
+                        for (size_t i = 0; i < heights.values.size(); ++i) {
+                            indexValid &= std::abs(heights.before(i) - sum) < .001;
+                            sum += heights.values[i];
+                        }
+                        check(indexValid && std::abs(heights.total() - sum) < .001,
+                              "linear_height_index_matches_prefix_sums_after_dpi_change");
+                    }
+                }
+                if (fullscreen)
+                    toggleFullscreen();
+                SendMessageW(hwnd, WM_DPICHANGED, MAKELONG((UINT)originalDpi, (UINT)originalDpi),
+                             (LPARAM)&originalBounds);
+                anchor = originalAnchor;
+                caret = originalCaret;
+            }
+
             command(102);
             break;
         case 1:
@@ -2546,6 +2654,7 @@ In the **three-dot menu**:
         }
     }
     void close() {
+        stopScrolling();
         closing = true;
         for (auto &w : workers)
             w.cancel->store(true);
@@ -2699,6 +2808,54 @@ In the **three-dot menu**:
             } else if (wp == 9) {
                 KillTimer(hwnd, 9);
                 DestroyWindow(hwnd);
+            } else if (wp == 13) {
+                double limit = std::max(0., heights.total() - (height - top - bottom));
+                if (limit <= 0) {
+                    KillTimer(hwnd, 13);
+                    checksPassed = false;
+                    std::ofstream out(std::filesystem::path(verifyFile), std::ios::app);
+                    out << "{\"passed\":false,\"check\":\"scrollable_content_required\"}\n";
+                    out.close();
+                    DestroyWindow(hwnd);
+                    return 0;
+                }
+                if (std::chrono::steady_clock::now() - scrollBenchmarkStarted < std::chrono::seconds(10)) {
+                    if ((scrollBenchmarkDirection > 0 && scroll >= limit - .2) ||
+                        (scrollBenchmarkDirection < 0 && scroll <= .2)) {
+                        scrollBenchmarkDirection = -scrollBenchmarkDirection;
+                        ++scrollBenchmarkReversals;
+                    }
+                    ++scrollFrames;
+                    scrollTo(scrollTarget + scrollBenchmarkDirection * 48);
+                } else {
+                    KillTimer(hwnd, 13);
+                    auto samples = paintTimes;
+                    std::sort(samples.begin(), samples.end());
+                    double mean = 0;
+                    for (auto value : samples)
+                        mean += value;
+                    BOOL animations = TRUE;
+                    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
+                    std::ofstream out(std::filesystem::path(verifyFile), std::ios::app);
+                    out << "{\"passed\":true,\"system_animations_enabled\":"
+                        << (animations ? "true" : "false")
+                        << ",\"benchmark_forces_animation\":" << (benchmarkAnimations ? "true" : "false")
+                        << ",\"scroll_input_samples\":" << scrollFrames
+                        << ",\"scroll_boundary_reversals\":" << scrollBenchmarkReversals
+                        << ",\"scroll_paint_samples\":" << samples.size()
+                        << ",\"paint_mean_ms\":" << mean / std::max<size_t>(1, samples.size())
+                        << ",\"paint_p95_ms\":"
+                        << (samples.empty() ? 0 : samples[(samples.size() - 1) * 95 / 100]) << "}\n";
+                    out.close();
+                    DestroyWindow(hwnd);
+                }
+            } else if (wp == 14) {
+                auto now = std::chrono::steady_clock::now();
+                loadingHeartbeatMaxMs =
+                    std::max(loadingHeartbeatMaxMs,
+                             std::chrono::duration<double, std::milli>(now - heartbeatAt).count());
+                heartbeatAt = now;
+                ++loadingHeartbeatSamples;
             } else if (wp == 10)
                 verifyUi();
             else if (wp == 11)
@@ -2963,7 +3120,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             app.verifyCloseFullscreen = true;
         else if (a == L"--metrics" && i + 1 < argc)
             app.metricsFile = args[++i];
-        else if (a == L"--benchmark") {
+        else if (a == L"--benchmark-animations")
+            app.benchmarkAnimations = true;
+        else if (a == L"--scroll-benchmark" && i + 1 < argc) {
+            app.scrollBenchmark = true;
+            app.verifyFile = args[++i];
+            app.selfTest = true;
+        } else if (a == L"--benchmark") {
             app.exitOnContent = true;
             app.selfTest = true;
         } else if (a == L"--verify-ui" && i + 1 < argc) {
@@ -3004,12 +3167,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         CoUninitialize();
         return 1;
     }
+    app.startupPhase("window_created");
     if (!path.empty())
         app.open(path);
     if (app.prefs.startFullscreen)
         app.toggleFullscreen();
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
+    app.startupPhase("window_shown");
+    if (!app.metricsFile.empty()) {
+        app.heartbeatAt = std::chrono::steady_clock::now();
+        SetTimer(hwnd, 14, 16, nullptr);
+    }
     if (exitAfter)
         SetTimer(hwnd, 9, exitAfter, nullptr);
     MSG message;
@@ -3026,5 +3195,5 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         DispatchMessageW(&message);
     }
     CoUninitialize();
-    return 0;
+    return app.scrollBenchmark && !app.checksPassed ? 1 : 0;
 }

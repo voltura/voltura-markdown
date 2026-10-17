@@ -17,7 +17,7 @@ The reader is a native Windows process with one window per invocation. Its prior
 | `scripts/installer.nsi` / `scripts/build-installer.ps1` | NSIS packaging, per-user install/upgrade/uninstall integration | Optional Windows Setup distribution |
 | [CMakeLists.txt](../CMakeLists.txt) | Targets, static runtime, system libraries, test registration | Build dependencies and packaging configuration |
 
-`vm::Document` retains original decoded source, rendered text, flat blocks, path/encoding metadata, and timings. `Block` references text ranges with style/link `Run` entries and table `Cell` entries. The flat structure avoids a native window/widget per Markdown element.
+`vm::Document` retains original decoded source, rendered text, flat blocks, path/encoding metadata, and timings. `Block` references text ranges with style/link `Run` entries and table `Cell` entries. Blocks use segmented storage to avoid whole-document reallocation peaks. Ordinary text has no style record; image, language and anchor metadata allocate only when present. The flat structure avoids a native window/widget per Markdown element.
 
 ## Document flow
 
@@ -39,7 +39,7 @@ Bounded DirectWrite layouts → Direct2D document canvas
 
 Parsing covers the complete document for references and nesting. Layout is progressive around the viewport. Very long source/code/paragraph text is split into bounded layout units; unusually long table cells use continuation rows. Parsed document/source memory still grows with input, independently of bounded layout and image caches.
 
-Source view derives blocks from the original decoded source. Theme/view changes retain document structure and reuse or rebuild layout as appropriate. If formatting fails, the reader attempts to expose complete read-only source. Selection/copy never modifies source bytes or saves files.
+Source view derives blocks lazily from the original decoded source. The initial scroll-height index is built in linear time; measured-height updates remain logarithmic. Theme/view changes retain document structure and reuse or rebuild layout as appropriate. If a block cannot be laid out, its text remains readable locally; parser failure retains the complete text in reading mode when memory permits. Selection/copy never modifies source bytes or saves files.
 
 ## Independent UI and image paths
 

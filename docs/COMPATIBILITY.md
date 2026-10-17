@@ -4,7 +4,7 @@
 
 Windows 10/11 x64. The app is Per-Monitor V2 DPI aware and uses Windows system graphics, shell, image, and networking libraries. No separate runtime is required.
 
-Current validation: Windows 11 at 225% scaling. Clean Windows 10/11, physical mixed-DPI movement, actual default-app selection in an isolated profile, publicly trusted signing, cold-cache startup, and display-frame delivery remain unverified. Local self-signed Authenticode signing and timestamping are verified. Installer lifecycle checks cover install, upgrade, relocation, removal, and retained documents/preferences. See [performance and verification](../PERFORMANCE.md).
+Windows 11 at 225% scaling is locally validated. The maintainer reports clean Windows execution and default-app association checks completed on 2026-10-17. Automated scale-change checks cover 100%, 125%, 150%, 200%, 225%, and 300% in windowed and fullscreen modes, including negative window coordinates and returning to the original scale. These simulate application message handling; physical mixed-DPI monitor movement remains unverified. Separate first launches after reboot passed the 500 ms small-file and 2 s 10 MiB targets; Windows prefetching was not disabled. An elevated trace confirms 59.6 displayed updates/s on a 60 Hz display with the 10 MiB workload. Local self-signed signing/timestamping and isolated installer lifecycle tests are verified. See [performance and verification](../PERFORMANCE.md).
 
 ## Markdown and HTML
 
@@ -29,4 +29,4 @@ UTF-8 is preferred. UTF-8 BOM and BOM-marked UTF-16 LE/BE are supported. Invalid
 
 Input limits: 1 GB of bytes and 500 million decoded UTF-16 units. Very long text/code lines use bounded visual segments; source copying preserves the original content. Long table cells use continuation rows. Tables wider than 256 columns display as readable text within the formatted document. A failed block layout falls back locally to wrapped text; a parser failure keeps the complete original text in reading view when memory permits. Source view is always an explicit choice.
 
-Parsed structure and source memory grow with document size. Dense 100 MiB stress documents can require several GiB; [measurements](../PERFORMANCE.md) describe the tested workload. Layout/image caches are bounded. The viewer does not automatically reload external edits.
+Parsed structure and source memory grow with document size. The tested dense 100 MiB document peaks at about 1.3 GiB in the full viewer; [measurements](../PERFORMANCE.md) describe the tested workload. Layout/image caches are bounded. The viewer does not automatically reload external edits.

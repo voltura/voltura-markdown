@@ -1,36 +1,58 @@
 # Performance and verification
 
-Local x64 MSVC Release measurements, 2026-10-16. Hardware: Intel Core Ultra 9 185H, 22 logical processors, 63.5 GiB usable RAM; Windows 11 Pro build 26300, 3840×2160 at 225% scaling.
+Local x64 MSVC Release measurements, 2026-10-17. Intel Core Ultra 9 185H, 22 logical processors, 63.5 GiB usable RAM; Windows 11 Pro build 26300, 3840×2160 at 225% scaling.
 
 ## Startup and memory
 
 Three separate launches per generated document, with ordinary Windows filesystem caching:
 
-| Input | Median first content | Median read + parse | Peak parser working set |
-| --- | ---: | ---: | ---: |
-| 1 KiB | 134 ms | 0.32 ms | 3.6 MiB |
-| 1 MiB | 144 ms | 38.8 ms | 21.6 MiB |
-| 10 MiB | 549 ms | 563 ms | 199.5 MiB |
-| 100 MiB stress | 3.98 s | 3.87 s | 2.12 GiB |
+| Input | Median first content (app entry) | Median process launch to metric | Median read + parse | Peak parser working set | Peak viewer working set |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 KiB | 135 ms | 159 ms | 0.30 ms | 3.6 MiB | 92.1 MiB |
+| 1 MiB | 170 ms | 191 ms | 35 ms | 16.3 MiB | 103.3 MiB |
+| 10 MiB | 511 ms | 534 ms | 457 ms | 126.8 MiB | 206.7 MiB |
+| 100 MiB stress | 3.54 s | 3.56 s | 3.07 s | 1,224.3 MiB | 1,304.0 MiB |
 
-First-content and parsing measurements use separate processes. First-content timing begins near application entry and excludes OS loader time; cold-cache startup was not isolated. The 10 MiB fixture contains about 364,000 blocks, with first-content runs ranging from 383 to 765 ms. These are workload-specific measurements, not guarantees.
+The dense 100 MiB fixture contains 3,640,889 blocks. Before optimization, the same fixture used 2,175.7 MiB peak parser memory and took 4.52 s to first content. The revised model reduces that peak by 44% and first-content time by 22% in these runs. Segmented block storage avoids whole-list growth copies, plain text has implicit formatting, optional metadata allocates on demand, source-view segmentation is lazy, and the initial height index builds in linear time.
 
-Pathological parsing: a 10 MiB unbroken paragraph took 81 ms; a 10 MiB fenced-code line 47 ms; a table with a 1 MiB cell 13 ms. Long content is segmented for layout. Parsed source/structure memory grows with input even though layout/image caches are bounded.
+The app-entry metric excludes OS loader time. The external metric includes process creation and approximately 5 ms polling granularity. The final benchmark launches the viewer before its parser-only run. Neither method purges Windows caches: these are not verified cold-cache measurements. The 1 KiB process-launch result narrowly misses the 150 ms warm target; the 10 MiB result meets the 1 s warm target. Results vary with system load and workload.
 
-Regenerate results with `python scripts/benchmark.py`; output goes to ignored `build/bench/`.
+A UI heartbeat sampled loading and first-layout work. The largest observed gap was 44 ms for 10 MiB and 124 ms for the dense 100 MiB stress case. This is message-loop scheduling evidence, not an end-to-end keyboard latency measurement. Full source and parsed structure still scale with document size; the stress case is not a constant-memory reader.
+
+Pathological parsing: a 10 MiB unbroken paragraph took 71 ms; a 10 MiB fenced-code line 53 ms; a table with a 1 MiB cell 12 ms. Long content remains segmented for bounded layout work.
+
+Run `python scripts/benchmark.py --output acceptance-results.json`. Generated fixtures and detailed results stay under ignored `build/bench/`. See [Building](docs/BUILDING.md#display-and-startup-validation) for first-launch and display-trace commands.
+
+## First launch after reboot
+
+The maintainer ran each case after a separate Windows restart on 2026-10-17, before opening the reader. Existing fixtures were generated beforehand.
+
+| Input | App entry to first content | Process launch to metric | Target | Result |
+| --- | ---: | ---: | ---: | --- |
+| 1 KiB | 178 ms | 232 ms | 500 ms | Pass |
+| 10 MiB | 468 ms | 564 ms | 2,000 ms | Pass |
+
+One sample per case, saved as `build/bench/cold-small.json` and `cold-10mb.json`. These validate first launch after reboot; Windows prefetching was not disabled and an empty filesystem cache is not asserted.
 
 ## Rendering
 
 The document canvas is separate from the buffered toolbar. Viewport layouts and narrow invalidation limit redraw work; scrolling honors Windows' reduced-motion setting.
 
-Sample UI runs measured 2.14 ms mean / 3.88 ms p95 document paint time for the showcase and 0.75 ms / 1.12 ms for a 10 MiB fixture. Toolbar paint counters stayed unchanged during scrolling/loading; a focused-search capture series contained 12 identical toolbar frames. CPU paint timings and sampled captures do not establish sustained display-frame delivery.
+A ten-second 10 MiB scrolling test at 60 Hz produced 722 CPU paint samples (0.53 ms mean / 0.86 ms p95). The input driver issued 629 updates; it uses a 10 ms Windows timer because requesting 16 ms under coarse timer scheduling can undersupply a 60 Hz display.
 
-## Automated coverage
+An elevated PresentMon 2.6.0 capture run by the maintainer measured **59.6 displayed updates/s** at 3840×2160, 60 Hz and 225% scaling. Excluding the first 500 ms and last 200 ms, 550 of 554 displayed intervals were approximately 16.7 ms, with four at 33.3 ms. GPU work averaged 1.87 ms. A preceding 30 Hz trace measured 29.8 displayed updates/s. CSV records are filtered to the test-owned process.
+
+Windows interface animations were disabled during the display capture, and the reader honored that setting. A separate 100 MiB test forced smooth scrolling inside the test process without changing Windows preferences: 724 CPU paint samples, 0.53 ms mean / 0.84 ms p95. This second test did not collect display-level timings.
+
+Startup profiling attributes roughly 130 ms to initial hardware render-target setup in the sampled runs. An explicitly software target reduced small-file process-to-content time to 145 ms, but increased scrolling paint cost to 8.8 ms mean / 11.7 ms p95. Hardware rendering is retained for rendering efficiency. A subsequent seven-run warm sample at 60 Hz measured 186 ms median process-to-content for 1 KiB and 402 ms for 10 MiB. The small-file 150 ms target remains a measured miss.
+
+## Validation
 
 - 652/652 CommonMark 0.31.2 examples: normalized parser HTML and adapter bounds, not pixel-identical renderer proof.
-- Native/integration suites: encodings, Unicode boundaries, tables, search, limits/cancellation, images, clipboard, paths, and isolated registration.
-- UI harness: 57 checks in the fullscreen-close run, including Help/About, search, themes, resize, floating zoom controls, table navigation, and toolbar stability.
-- Package verifier: static runtime, system-only DLL imports, metadata, size, and ten icon frames.
-- Isolated installer identity: install, upgrade, relocation, removal, binary identity, notices, and retained documents/preferences.
+- Native/integration suites: encodings, Unicode, tables, search, cancellation, sparse formatting, segmented code metadata, images, clipboard, paths and isolated registration.
+- UI harness: windowed/fullscreen simulated DPI transitions through 100%, 125%, 150%, 200%, 225%, 300% and back; negative window coordinates; render-target DPI, control sizes, zoom clearance, preserved selection/theme and height-index consistency. Existing Help/About, source view, search, themes and both close paths also pass.
+- DPI simulation exercises Windows message handling without altering display settings. It does not certify physical monitor topology, driver behavior or visual sharpness across real monitors.
+- Package checks: static runtime, system-only imports, embedded metadata/licenses and ten icon frames; executable remains below 1 MiB.
+- Maintainer reports clean Windows execution and default-app association checks completed. Automated installer lifecycle tests cover install, upgrade, relocation, removal and retained documents/preferences.
 
-See [Building](docs/BUILDING.md) for commands. Tests and review reduce risk; they do not prove absence of bugs. Outstanding platform/environment checks are listed once in [Compatibility](docs/COMPATIBILITY.md#platform); stable-release gates are in [Releasing](docs/RELEASING.md).
+First-launch-after-reboot targets pass. The maintainer accepted retaining hardware rendering for 1.0 despite the small-file warm-target miss. Physical mixed-DPI movement is additional unverified hardware coverage; simulated scale transitions pass. Display-frame delivery at 60 Hz is validated for the 10 MiB workload. The small-file warm-start miss is recorded above. See [Compatibility](docs/COMPATIBILITY.md#platform) and [Releasing](docs/RELEASING.md).
