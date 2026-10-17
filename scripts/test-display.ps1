@@ -4,6 +4,7 @@ param(
     [switch]$Animate,
     [switch]$TraceDisplay,
     [switch]$CloseFullscreen,
+    [switch]$StagedRenderer,
     [string]$PresentMon = 'build/tools/PresentMon.exe'
 )
 
@@ -43,6 +44,7 @@ try {
     )
     if ($CloseFullscreen) { $appArguments += '--verify-close-fullscreen' }
     if ($Animate) { $appArguments += '--benchmark-animations' }
+    if ($StagedRenderer) { $appArguments += '--staged-renderer' }
     $app = Start-Process -FilePath $executable -ArgumentList $appArguments -PassThru -WindowStyle Normal
     if (!$app.WaitForExit(40000)) { throw 'Display test timed out.' }
     if ($app.ExitCode) { throw 'Display test process failed.' }

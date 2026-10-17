@@ -102,6 +102,50 @@ struct Worker {
     std::shared_ptr<std::atomic_bool> done;
 };
 struct App {
+    struct PreparedRenderer {
+        std::atomic_bool ready = false;
+        ComPtr<ID2D1Factory> factory;
+        ComPtr<ID2D1HwndRenderTarget> target;
+        HRESULT result = E_PENDING;
+        double prepareMs = 0;
+    };
+    bool stagedRenderer = false, rendererStarted = false, hardwareActive = false;
+    bool closeRequested = false, promotionPending = false;
+    std::shared_ptr<PreparedRenderer> preparedRenderer;
+    std::thread rendererWorker;
+    double rendererPromotionMs = 0;
+    std::chrono::steady_clock::time_point promotionBegan;
+    ComPtr<ID2D1Factory> softwareFactory;
+    ComPtr<ID2D1HwndRenderTarget> softwareTarget;
+    ComPtr<ID2D1SolidColorBrush> softwareBrush;
+    void finishRenderer() {
+        if (!rendererWorker.joinable())
+            return;
+        // Window destruction must keep servicing cross-thread window messages until creation ends.
+        HANDLE worker = rendererWorker.native_handle();
+        bool quit = false;
+        int quitCode = 0;
+        while (WaitForSingleObject(worker, 0) == WAIT_TIMEOUT) {
+            if (MsgWaitForMultipleObjects(1, &worker, FALSE, INFINITE, QS_ALLINPUT) == WAIT_OBJECT_0 + 1) {
+                MSG message;
+                while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                    if (message.message == WM_QUIT) {
+                        quit = true;
+                        quitCode = (int)message.wParam;
+                        break;
+                    }
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+        }
+        rendererWorker.join();
+        if (quit)
+            PostQuitMessage(quitCode);
+    }
+    ~App() {
+        finishRenderer();
+    }
     HWND hwnd = nullptr, canvas = nullptr, tooltip = nullptr, search = nullptr, backButton = nullptr;
     std::array<HWND, 7> buttons{};
     std::array<HWND, 3> zoomButtons{};
@@ -357,7 +401,8 @@ struct App {
         RECT r;
         GetClientRect(canvas, &r);
         HRESULT hr = d2d->CreateHwndRenderTarget(
-            D2D1::RenderTargetProperties(),
+            D2D1::RenderTargetProperties(stagedRenderer && !hardwareActive ? D2D1_RENDER_TARGET_TYPE_SOFTWARE
+                                                                           : D2D1_RENDER_TARGET_TYPE_DEFAULT),
             D2D1::HwndRenderTargetProperties(canvas, D2D1::SizeU(r.right, r.bottom),
                                              D2D1_PRESENT_OPTIONS_IMMEDIATELY),
             &target);
@@ -367,6 +412,127 @@ struct App {
         target->SetDpi(dpi, dpi);
         target->SetTransform(D2D1::Matrix3x2F::Translation(0, -top));
         return SUCCEEDED(target->CreateSolidColorBrush(rgb(0), &brush));
+    }
+    void prepareHardware() {
+        if (!stagedRenderer || rendererStarted || closing || closeRequested)
+            return;
+        rendererStarted = true;
+        auto prepared = std::make_shared<PreparedRenderer>();
+        preparedRenderer = prepared;
+        RECT bounds{};
+        GetClientRect(canvas, &bounds);
+        auto size = D2D1::SizeU(std::max(1L, bounds.right), std::max(1L, bounds.bottom));
+        HWND destination = canvas;
+        // The factory is private to this worker until the release/acquire handoff.
+        // No drawing occurs here; the software frame remains visible throughout preparation.
+        rendererWorker = std::thread([prepared, destination, size] {
+            auto began = std::chrono::steady_clock::now();
+            HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            prepared->result =
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, prepared->factory.GetAddressOf());
+            if (SUCCEEDED(prepared->result))
+                prepared->result = prepared->factory->CreateHwndRenderTarget(
+                    D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_HARDWARE),
+                    D2D1::HwndRenderTargetProperties(destination, size, D2D1_PRESENT_OPTIONS_IMMEDIATELY),
+                    &prepared->target);
+            prepared->prepareMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+            if (SUCCEEDED(apartment))
+                CoUninitialize();
+            prepared->ready.store(true, std::memory_order_release);
+        });
+        SetTimer(hwnd, 15, 10, nullptr);
+        if (!metricsFile.empty()) {
+            std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+            out << "{\"renderer_preparing\":true}\n";
+        }
+    }
+    void recordPromotion(bool success, HRESULT result) {
+        if (metricsFile.empty())
+            return;
+        std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+        RECT bounds{};
+        GetClientRect(canvas, &bounds);
+        float targetDpiX = 0, targetDpiY = 0;
+        if (target)
+            target->GetDpi(&targetDpiX, &targetDpiY);
+        auto pixels = target ? target->GetPixelSize() : D2D1::SizeU(0, 0);
+        out << "{\"renderer_promotion\":" << (success ? "true" : "false")
+            << ",\"prepare_ms\":" << preparedRenderer->prepareMs
+            << ",\"ui_promotion_ms\":" << rendererPromotionMs << ",\"since_start_ms\":"
+            << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count()
+            << ",\"hresult\":" << result << ",\"viewport_matches\":"
+            << (targetDpiX == dpi && targetDpiY == dpi && pixels.width == (UINT32)bounds.right &&
+                        pixels.height == (UINT32)bounds.bottom
+                    ? "true"
+                    : "false")
+            << "}\n";
+    }
+    void promoteHardware() {
+        if (closing || !preparedRenderer || !preparedRenderer->ready.load(std::memory_order_acquire))
+            return;
+        KillTimer(hwnd, 15);
+        rendererWorker.join();
+        if (closeRequested) {
+            preparedRenderer.reset();
+            DestroyWindow(hwnd);
+            return;
+        }
+        auto began = std::chrono::steady_clock::now();
+        HRESULT result = preparedRenderer->result;
+        ComPtr<ID2D1SolidColorBrush> nextBrush;
+        if (SUCCEEDED(result)) {
+            RECT bounds{};
+            GetClientRect(canvas, &bounds);
+            result = preparedRenderer->target->Resize(
+                D2D1::SizeU(std::max(1L, bounds.right), std::max(1L, bounds.bottom)));
+        }
+        if (SUCCEEDED(result))
+            result = preparedRenderer->target->CreateSolidColorBrush(rgb(0), &nextBrush);
+        if (FAILED(result)) {
+            recordPromotion(false, result);
+            preparedRenderer.reset();
+            if (exitOnContent)
+                SetTimer(hwnd, 9, 100, nullptr);
+            return;
+        }
+        preparedRenderer->target->SetDpi(dpi, dpi);
+        preparedRenderer->target->SetTransform(D2D1::Matrix3x2F::Translation(0, -top));
+        for (auto i = cache.begin(); i != cache.end();) {
+            if (i->second.bitmap) {
+                cacheCost -= i->second.cost;
+                i = cache.erase(i);
+            } else
+                ++i;
+        }
+        softwareBrush = std::move(brush);
+        softwareTarget = std::move(target);
+        softwareFactory = std::move(d2d);
+        brush = std::move(nextBrush);
+        target = std::move(preparedRenderer->target);
+        d2d = std::move(preparedRenderer->factory);
+        hardwareActive = true;
+        promotionPending = true;
+        promotionBegan = began;
+        rendererPromotionMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+        invalidate();
+    }
+    void requestClose() {
+        if (closing)
+            return;
+        // Keep the HWND alive while the worker prepares its target, without blocking the UI thread.
+        if (rendererWorker.joinable() && !preparedRenderer->ready.load(std::memory_order_acquire)) {
+            closeRequested = true;
+            if (!metricsFile.empty()) {
+                std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+                out << "{\"renderer_close_deferred\":true}\n";
+            }
+            return;
+        }
+        if (rendererWorker.joinable())
+            rendererWorker.join();
+        DestroyWindow(hwnd);
     }
     void clearLayouts() {
         cache.clear();
@@ -848,18 +1014,55 @@ struct App {
         }
         drawScrollbars(colors);
         HRESULT hr = target->EndDraw();
+        bool retryPaint = hr == D2DERR_RECREATE_TARGET;
         if (hr == D2DERR_RECREATE_TARGET) {
             target.Reset();
             brush.Reset();
             clearLayouts();
         }
-        if (paintedDocument && !firstPaint) {
-            firstPaint = true;
-            recordMetric();
+        if (promotionPending) {
+            rendererPromotionMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - promotionBegan)
+                    .count();
+            recordPromotion(SUCCEEDED(hr), hr);
+            if (FAILED(hr)) {
+                target = std::move(softwareTarget);
+                brush = std::move(softwareBrush);
+                d2d = std::move(softwareFactory);
+                hardwareActive = false;
+                RECT bounds{};
+                GetClientRect(canvas, &bounds);
+                if (FAILED(target->Resize(
+                        D2D1::SizeU(std::max(1L, bounds.right), std::max(1L, bounds.bottom))))) {
+                    brush.Reset();
+                    target.Reset();
+                } else {
+                    target->SetDpi(dpi, dpi);
+                    target->SetTransform(D2D1::Matrix3x2F::Translation(0, -top));
+                }
+                clearLayouts();
+                retryPaint = true;
+            } else {
+                softwareBrush.Reset();
+                softwareTarget.Reset();
+                softwareFactory.Reset();
+            }
+            promotionPending = false;
+            preparedRenderer.reset();
             if (exitOnContent)
                 SetTimer(hwnd, 9, 100, nullptr);
         }
+        if (paintedDocument && SUCCEEDED(hr) && !firstPaint) {
+            firstPaint = true;
+            recordMetric();
+            if (exitOnContent && !stagedRenderer)
+                SetTimer(hwnd, 9, 100, nullptr);
+        }
         EndPaint(canvas, &ps);
+        if (retryPaint)
+            invalidate();
+        if (SUCCEEDED(hr) && (firstPaint || (!doc && !loading)))
+            prepareHardware();
         if (paintedDocument && !verifyFile.empty())
             paintTimes.push_back(
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - paintStarted)
@@ -1598,7 +1801,7 @@ struct App {
             closeInformation();
             break;
         case 107:
-            DestroyWindow(hwnd);
+            requestClose();
             break;
         case 110:
             if (notice != L"Windows could not draw part of this document.") {
@@ -1993,7 +2196,7 @@ In the **three-dot menu**:
             else if (fullscreen && !launchedWithFile)
                 toggleFullscreen();
             else
-                DestroyWindow(hwnd);
+                requestClose();
             return;
         }
         if (!ctrl && !shift && (key == VK_LEFT || key == VK_RIGHT)) {
@@ -2656,6 +2859,7 @@ In the **three-dot menu**:
     void close() {
         stopScrolling();
         closing = true;
+        finishRenderer();
         for (auto &w : workers)
             w.cancel->store(true);
         for (auto &w : workers)
@@ -2787,6 +2991,10 @@ In the **three-dot menu**:
             return 0;
         }
         case WM_TIMER:
+            if (wp == 15) {
+                promoteHardware();
+                return 0;
+            }
             if (wp == 1)
                 timer();
             else if (wp == 2) {
@@ -2807,7 +3015,7 @@ In the **three-dot menu**:
                 InvalidateRect(hwnd, &spinner, FALSE);
             } else if (wp == 9) {
                 KillTimer(hwnd, 9);
-                DestroyWindow(hwnd);
+                requestClose();
             } else if (wp == 13) {
                 double limit = std::max(0., heights.total() - (height - top - bottom));
                 if (limit <= 0) {
@@ -2816,7 +3024,7 @@ In the **three-dot menu**:
                     std::ofstream out(std::filesystem::path(verifyFile), std::ios::app);
                     out << "{\"passed\":false,\"check\":\"scrollable_content_required\"}\n";
                     out.close();
-                    DestroyWindow(hwnd);
+                    requestClose();
                     return 0;
                 }
                 if (std::chrono::steady_clock::now() - scrollBenchmarkStarted < std::chrono::seconds(10)) {
@@ -2847,7 +3055,7 @@ In the **three-dot menu**:
                         << ",\"paint_p95_ms\":"
                         << (samples.empty() ? 0 : samples[(samples.size() - 1) * 95 / 100]) << "}\n";
                     out.close();
-                    DestroyWindow(hwnd);
+                    requestClose();
                 }
             } else if (wp == 14) {
                 auto now = std::chrono::steady_clock::now();
@@ -3074,7 +3282,7 @@ In the **three-dot menu**:
             return 0;
         }
         case WM_CLOSE:
-            DestroyWindow(hwnd);
+            requestClose();
             return 0;
         case WM_DESTROY:
             close();
@@ -3122,6 +3330,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             app.metricsFile = args[++i];
         else if (a == L"--benchmark-animations")
             app.benchmarkAnimations = true;
+        else if (a == L"--staged-renderer")
+            app.stagedRenderer = true;
         else if (a == L"--scroll-benchmark" && i + 1 < argc) {
             app.scrollBenchmark = true;
             app.verifyFile = args[++i];
