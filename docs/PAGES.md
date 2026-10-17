@@ -48,6 +48,8 @@ The DNS target is a hostname without a scheme or repository path. Keep **Enforce
 
 The publication script preserves the published branch's `CNAME`, so subsequent releases retain the custom domain. After publication, verify that file, the Pages domain and HTTPS settings, styles/artwork, and both downloads. DNS propagation and certificate provisioning can take time; confirm successful HTTPS before declaring the domain ready.
 
+Social previews use the checked-in 1200×630 `site/assets/social-preview.png`, copied by the site build and referenced with absolute HTTPS URLs in Open Graph and Twitter card metadata. Rebuild the card with `python scripts/create-social-preview.py` (development-only Pillow and Windows Segoe UI). The card uses the existing app icon and adds no page-load request. After publishing metadata changes, request a fresh scrape in Facebook's Sharing Debugger if an old preview is cached.
+
 For rollback, remove this hostname's DNS record before removing the GitHub Pages custom-domain binding. Preserve the apex, wildcard, email, and other product DNS records.
 
 ## Source map

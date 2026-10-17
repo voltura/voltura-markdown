@@ -55,6 +55,7 @@ if ($page -match '__[A-Z_]+__') {
 [IO.File]::WriteAllText((Join-Path $output 'index.html'), $page, [Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath (Join-Path $repo 'site\styles.css') -Destination (Join-Path $output 'styles.css')
 Copy-Item -LiteralPath (Join-Path $repo 'assets\icon-master.png') -Destination (Join-Path $output 'assets\icon.png')
+Copy-Item -LiteralPath (Join-Path $repo 'site\assets\social-preview.png') -Destination (Join-Path $output 'assets\social-preview.png')
 [IO.File]::WriteAllText((Join-Path $output '.nojekyll'), '')
 Write-Host "Pages built: $output"
 Write-Host "Repository links: $repositoryUrl"
