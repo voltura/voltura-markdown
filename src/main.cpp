@@ -1858,9 +1858,9 @@ struct App {
                                     zoomClass.lpszClassName, L"Zoom controls", WS_POPUP | WS_CLIPCHILDREN, 0,
                                     0, 1, 1, hwnd, nullptr, zoomClass.hInstance, this);
         SetLayeredWindowAttributes(zoomPanel, RGB(255, 0, 255), 0, LWA_COLORKEY | LWA_ALPHA);
-        const wchar_t *zoomNames[] = {L"Zoom out (Ctrl+-)", L"100%", L"Zoom in (Ctrl++)"};
-        const wchar_t *zoomTips[] = {L"Zoom out (Ctrl+-)", L"Reset zoom to 100% (Ctrl+0)",
-                                     L"Zoom in (Ctrl++)"};
+        const wchar_t *zoomNames[] = {L"Zoom out (- or Ctrl+-)", L"100%", L"Zoom in (+ or Ctrl++)"};
+        const wchar_t *zoomTips[] = {L"Zoom out (- or Ctrl+-)", L"Reset zoom to 100% (Ctrl+0)",
+                                     L"Zoom in (+ or Ctrl++)"};
         for (size_t i = 0; i < zoomButtons.size(); ++i) {
             zoomButtons[i] =
                 CreateWindowExW(0, L"BUTTON", zoomNames[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
@@ -1914,6 +1914,9 @@ struct App {
             return 1;
         if (msg == WM_GETDLGCODE && w == a->search)
             return DLGC_WANTALLKEYS;
+        if (msg == WM_CHAR && w != a->search && !(a->associationPanel && IsChild(a->associationPanel, w)) &&
+            a->zoomCharacter(wp))
+            return 0;
         // TranslateMessage queues WM_CHAR before WM_KEYDOWN is dispatched. Enter
         // already navigates below; the single-line edit would beep on its character.
         if (w == a->search && msg == WM_CHAR && (wp == L'\r' || wp == L'\n'))
@@ -2090,6 +2093,14 @@ struct App {
         bars();
         invalidate();
         SetFocus(hwnd);
+    }
+    bool zoomCharacter(WPARAM character) {
+        // Use translated characters so Shift and keyboard layouts produce the actual symbol.
+        if ((character != L'+' && character != L'-') || GetKeyState(VK_CONTROL) < 0 ||
+            GetKeyState(VK_MENU) < 0)
+            return false;
+        zoomBy(zoom + (character == L'+' ? .1f : -.1f));
+        return true;
     }
     void zoomBy(float next) {
         float previous = zoom;
@@ -2409,7 +2420,10 @@ Use the **back arrow** or <kbd>Escape</kbd> to return to your reading position.
 
 The search field shows your current match and total, such as **3 of 12**. The first hit appears before background counting finishes. A navigation hint appears for multiple hits when there is room, and matches keep two text lines of context above them where possible.
 - **Copy text:** drag to select, then press <kbd>Ctrl</kbd>+<kbd>C</kbd>. <kbd>Ctrl</kbd>+<kbd>A</kbd> selects all.
-- **Change text size:** use <kbd>Ctrl</kbd> + mouse wheel or <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>Ctrl</kbd>+<kbd>−</kbd>.
+- **Zoom in:** press <kbd>+</kbd> or <kbd>Ctrl</kbd>+<kbd>+</kbd>.
+- **Zoom out:** press <kbd>-</kbd> or <kbd>Ctrl</kbd>+<kbd>-</kbd>.
+- **Change text size with the mouse:** use <kbd>Ctrl</kbd> + mouse wheel.
+- While typing in **Find**, <kbd>+</kbd> and <kbd>-</kbd> enter search text.
 - **Reset text size:** press <kbd>Ctrl</kbd>+<kbd>0</kbd>, or click the current zoom percentage.
 
 Zoom controls appear in the lower-right corner when you change text size: **−**, **percentage**, and **+**. They fade away after returning to **100%**.
@@ -3459,10 +3473,110 @@ In the **three-dot menu**:
                         keycapGeometry |= !part.keycaps.empty();
                 check(keycapGeometry && doc->text.find(L"<kbd>") == std::wstring::npos,
                       "help_keyboard_shortcuts_have_cached_keycap_geometry");
+                check(doc->text.find(L"Zoom in: press +") != std::wstring::npos &&
+                          doc->text.find(L"Zoom out: press -") != std::wstring::npos,
+                      "help_documents_plain_plus_and_minus_shortcuts");
+                zoomBy(1);
+                SendMessageW(hwnd, WM_CHAR, L'+', 1);
+                check(std::abs(zoom - 1.1f) < .001f, "help_zoom_character_handled");
                 showAbout();
                 key(VK_ESCAPE);
                 check(!informationView && doc == original && std::abs(scroll - originalScroll) < 1,
                       "switching_help_to_about_preserves_original_reading_position");
+            }
+            {
+                // Exercise the same translation and dispatch sequence as the message loop.
+                // Modifier state is local to this test thread and restored after every input.
+                auto press = [&](HWND window, UINT vk, bool ctrl = false, bool shift = false,
+                                 bool alt = false) {
+                    BYTE savedKeys[256]{}, state[256]{};
+                    GetKeyboardState(savedKeys);
+                    state[VK_CONTROL] = ctrl ? 0x80 : 0;
+                    state[VK_SHIFT] = shift ? 0x80 : 0;
+                    state[VK_MENU] = alt ? 0x80 : 0;
+                    SetKeyboardState(state);
+                    MSG input{};
+                    input.hwnd = window;
+                    input.message = WM_KEYDOWN;
+                    input.wParam = vk;
+                    input.lParam = 1 | (MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) << 16);
+                    TranslateMessage(&input);
+                    DispatchMessageW(&input);
+                    MSG character{};
+                    while (PeekMessageW(&character, window, WM_CHAR, WM_CHAR, PM_REMOVE))
+                        DispatchMessageW(&character);
+                    SetKeyboardState(savedKeys);
+                };
+                zoomBy(1);
+                for (wchar_t symbol : {L'+', L'-'}) {
+                    SHORT mapping = VkKeyScanW(symbol);
+                    check(mapping != -1 && !(HIBYTE(mapping) & 6), "zoom_symbol_has_keyboard_mapping");
+                    if (mapping == -1 || (HIBYTE(mapping) & 6))
+                        continue;
+                    press(hwnd, LOBYTE(mapping), false, (HIBYTE(mapping) & 1) != 0);
+                    check(std::abs(zoom - (symbol == L'+' ? 1.1f : 1.f)) < .001f,
+                          symbol == L'+' ? "translated_main_keyboard_plus"
+                                         : "translated_main_keyboard_minus");
+                }
+                press(hwnd, VK_ADD);
+                check(std::abs(zoom - 1.1f) < .001f, "numeric_keypad_plus");
+                press(hwnd, VK_SUBTRACT);
+                check(zoom == 1.f, "numeric_keypad_minus");
+                press(hwnd, VK_OEM_PLUS, true, true);
+                check(std::abs(zoom - 1.1f) < .001f, "ctrl_plus_zooms_exactly_once");
+                press(hwnd, VK_SUBTRACT, true);
+                check(zoom == 1.f, "ctrl_keypad_minus_zooms_exactly_once");
+                press(hwnd, VK_ADD, true);
+                check(std::abs(zoom - 1.1f) < .001f, "ctrl_keypad_plus_zooms_exactly_once");
+                press(hwnd, VK_OEM_MINUS, true);
+                check(zoom == 1.f, "ctrl_minus_zooms_exactly_once");
+                zoomBy(1.2f);
+                press(hwnd, '0', true);
+                check(zoom == 1.f, "ctrl_zero_still_resets_zoom");
+                {
+                    BYTE savedKeys[256]{}, state[256]{};
+                    GetKeyboardState(savedKeys);
+                    state[VK_MENU] = 0x80;
+                    SetKeyboardState(state);
+                    SendMessageW(hwnd, WM_CHAR, L'+', 1);
+                    SendMessageW(hwnd, WM_CHAR, L'-', 1);
+                    SetKeyboardState(savedKeys);
+                    check(zoom == 1.f, "alt_characters_do_not_zoom");
+                }
+                SendMessageW(hwnd, WM_CHAR, L'=', 1);
+                check(zoom == 1.f, "equals_is_not_a_zoom_alias");
+                for (auto control : {buttons[0], zoomButtons[0], backButton}) {
+                    SetFocus(control);
+                    SendMessageW(control, WM_CHAR, L'+', 1);
+                    check(std::abs(zoom - 1.1f) < .001f, "control_focus_plus_zooms");
+                    SendMessageW(control, WM_CHAR, L'-', 1);
+                }
+                toggleSource();
+                press(hwnd, VK_ADD);
+                check(source && std::abs(zoom - 1.1f) < .001f, "source_view_plus_zooms");
+                toggleSource();
+                zoomBy(2.9f);
+                for (int i = 0; i < 3; ++i)
+                    press(hwnd, VK_ADD);
+                check(zoom == 3.f, "repeated_plus_respects_upper_zoom_limit");
+                zoomBy(.6f);
+                for (int i = 0; i < 3; ++i)
+                    press(hwnd, VK_SUBTRACT);
+                check(zoom == .5f, "repeated_minus_respects_lower_zoom_limit");
+                zoomBy(1);
+                for (int i = 0; i < 3; ++i)
+                    press(hwnd, VK_ADD);
+                check(std::abs(zoom - 1.3f) < .001f, "repeated_plus_applies_one_step_per_character");
+                showSearch();
+                SetWindowTextW(search, L"");
+                press(search, VK_ADD);
+                press(search, VK_SUBTRACT);
+                SendMessageW(search, WM_CHAR, L'=', 1);
+                wchar_t searchSymbols[8]{};
+                GetWindowTextW(search, searchSymbols, 8);
+                check(std::wstring(searchSymbols) == L"+-=" && std::abs(zoom - 1.3f) < .001f,
+                      "find_accepts_zoom_symbols_without_zooming");
+                key(VK_ESCAPE);
             }
             zoomBy(1.2f);
             check(zoom > 1.19f, "zoom");
@@ -4085,6 +4199,10 @@ In the **three-dot menu**:
                 }
             }
             return 0;
+        case WM_CHAR:
+            if (zoomCharacter(wp))
+                return 0;
+            break;
         case WM_KEYDOWN:
             key(wp);
             return 0;

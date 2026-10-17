@@ -23,7 +23,7 @@ The reader starts in a normal window without a document, and fullscreen when lau
 | Formatted / source | Ctrl+Shift+V / code |
 | Light / dark | Sun; three-dot menu → Use Windows theme |
 | Fullscreen | F11 / corners |
-| Zoom | Ctrl+wheel, Ctrl+plus/minus; Ctrl+0 resets |
+| Zoom | + / -, Ctrl+wheel, Ctrl+plus/minus; Ctrl+0 resets |
 | Copy selection / select all | Ctrl+C / Ctrl+A |
 | Scroll | Wheel, trackpad, arrows, Page Up/Down, Space, Home/End, scrollbars |
 
@@ -32,6 +32,8 @@ The reader starts in a normal window without a document, and fullscreen when lau
 Horizontal scrolling appears only when content extends beyond the viewport. Scrollbar tracks and dragging use the arrow cursor; document text uses the text-selection cursor.
 
 Double-click selects a word; Shift+arrows extends selection. Source copying retains the original decoded text and line endings. Formatted copying produces displayed plain text. Checkboxes and text are read-only.
+
+Press **+** to zoom in or **-** to zoom out, including on the numeric keypad. While typing in Find, these keys enter search text.
 
 Zooming reveals **−, percentage, +** floating over the lower-right corner, inset from the scrollbars. The document keeps its full viewing area, and scrollbar sizes update with the zoomed content without a second adjustment from background layout. Click the percentage to return to **100%**. The group fades away at 100% and follows fullscreen toolbar visibility.
 

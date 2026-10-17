@@ -2,6 +2,12 @@
 
 Local x64 MSVC Release measurements, 2026-10-17. Intel Core Ultra 9 185H, 22 logical processors, 63.5 GiB usable RAM; Windows 11 Pro build 26300, 3840×2160 at 225% scaling.
 
+## 1.1.8 zoom shortcut checks
+
+The shortcuts reuse the existing zoom path only on character input. No startup work, background polling, or rendering changes were added. Native input checks cover translated main-keyboard symbols, numeric keypad input, Ctrl shortcuts applying exactly one step, zoom limits/repetition, control focus, source/Help views, and normal Find text entry. Native Help captures at two window widths show boxed + and - keys without clipping.
+
+Alternating baseline/changed instrumented Release builds, with preferences disabled and identical documents, produced these local warm-cache medians (five launches per build/document): first-content time 127.0 → 123.8 ms for 1 KiB and 483.8 → 477.9 ms for 10 MiB. Three scroll runs per build on the showcase document gave median mean paint time 4.28 → 4.47 ms and median p95 5.00 → 5.20 ms, with 123 median boundary reversals in both builds. These small samples show comparable timings with a small observed scroll difference; they do not establish identical performance or cold-start behavior. Raw samples and captures remain under ignored `build/zoom-ab/`.
+
 ## 1.1.7 association notice checks
 
 The existing notice title, explanation, dimensions, and delayed background association probe are retained. Copy path reads the executable location and writes clipboard text only on explicit activation; feedback stays inside the button. Association tests cover Unicode/spaces in a renamed executable path, success/failure feedback, tab order, dismissal, synchronous focus preservation, and unchanged registration/defaults. A test-only clipboard sink leaves the user's clipboard untouched; it validates the requested text and UI behavior, not an actual system clipboard write. Dark/light notice captures were inspected.

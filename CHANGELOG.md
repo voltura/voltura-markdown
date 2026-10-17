@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.8 — 2026-10-17
+
+- Adds + and - keyboard shortcuts for zoom, including the numeric keypad, while preserving normal typing in Find.
+- Updates Help with boxed zoom shortcuts and clarifies the existing Ctrl alternatives and reset shortcut.
+- Updates zoom button tooltips and accessible names without adding startup or background work.
+
 ## 1.1.7 — 2026-10-17
 
 - Adds Copy path to the existing default-app notice, copying the running executable location.
@@ -82,4 +88,4 @@
 - Background loading, bounded layout/image caches, Unicode boundary handling, and cancellable search.
 - MIT-licensed application, documentation, and current artwork.
 
-See [release notes](docs/releases/1.1.7.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
+See [release notes](docs/releases/1.1.8.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
