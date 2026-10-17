@@ -81,4 +81,4 @@ Use [Building](BUILDING.md) for commands and [Performance](../PERFORMANCE.md) fo
 
 Release assets contain executable packages and metadata only: exclude PDBs, tests, benchmarks, and build trees. Use the [notes template](RELEASE-NOTES-TEMPLATE.md) for concise download/use instructions. All preparation, signing, and publication run locally; GitHub Actions is not required.
 
-Stable publication also rebuilds and publishes the product page locally. Download links use GitHub's latest release route and the current versioned installer filename. Publish each stable version through this script so the page and installer remain synchronized.
+Stable publication also rebuilds and publishes the product page locally. Both download links are pinned to the matching release tag, including the versioned installer filename, so cached pages keep working after later releases. Publish each stable version through this script so the page and installer remain synchronized.

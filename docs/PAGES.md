@@ -13,7 +13,7 @@ python -m http.server 8080 --bind 127.0.0.1 --directory build/pages
 
 Open `http://127.0.0.1:8080`; Ctrl+C stops the server. Output lives in ignored `build/pages`. Repository/release links become usable once those destinations are actually published.
 
-`-ReleaseTag` points downloads directly at that tag, including a prerelease. Omit it to use GitHub's latest **stable** release. The installer filename uses the version from `CMakeLists.txt`; ensure the chosen release contains both matching assets. Update the first-release availability message in `site/index.html` only after downloads exist.
+`-ReleaseTag` points downloads directly at that tag, including a prerelease. Omit it to use the stable `v<version>` tag matching `CMakeLists.txt`. Pin both downloads to the page's release so cached pages never combine an older installer filename with a newer release. Ensure the chosen release contains both matching assets. Update the first-release availability message in `site/index.html` only after downloads exist.
 
 ## Publish explicitly
 

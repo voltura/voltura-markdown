@@ -39,7 +39,7 @@ if ($ReleaseTag.Contains('..')) { throw 'Release tags must not contain consecuti
 $downloadUrl = if ($ReleaseTag) {
     "$repositoryUrl/releases/download/$([uri]::EscapeDataString($ReleaseTag))"
 } else {
-    "$repositoryUrl/releases/latest/download"
+    "$repositoryUrl/releases/download/v$releaseVersion"
 }
 $page = Get-Content -LiteralPath (Join-Path $repo 'site\index.html') -Raw
 $page = $page.Replace('__REPOSITORY_URL__', $repositoryUrl).Replace('__RELEASES_URL__', "$repositoryUrl/releases").Replace('__VERSION__', $releaseVersion).Replace('__DOWNLOAD_URL__', $downloadUrl)
