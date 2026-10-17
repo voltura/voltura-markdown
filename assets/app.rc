@@ -29,7 +29,7 @@ BEGIN
    VALUE "Authors", "Joakim Skoglund"
    VALUE "DeveloperName", "Joakim Skoglund"
    VALUE "Producer", "Voltura AB"
-   VALUE "Website", "https://voltura.se/"
+   VALUE "Website", "https://markdown.voltura.se/"
    VALUE "PostalAddress", "Voltura AB; Hästholmsvägen 33; SE-131 71 Nacka; Sweden"
    VALUE "Comments", "Read-only Markdown reader. Developed by Joakim Skoglund, Voltura AB."
   END

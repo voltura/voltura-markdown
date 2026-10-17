@@ -44,7 +44,7 @@ for action in ("close", "dpi_resize"):
     metric = folder / (action + ".jsonl")
     process = subprocess.Popen(
         [
-            str(root / "build/Release/vmd.exe"),
+            str(root / "build/Release/vmd-test.exe"),
             str(document),
             "--staged-renderer",
             "--no-preferences",

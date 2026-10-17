@@ -1,6 +1,7 @@
 #include "document.h"
 #include "empty-state.h"
 #include "images.h"
+#include "search.h"
 #include "shell.h"
 #include <algorithm>
 #include <array>
@@ -17,6 +18,7 @@
 #include <memory>
 #include <psapi.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -24,9 +26,14 @@
 #include <windowsx.h>
 #include <wrl/client.h>
 using Microsoft::WRL::ComPtr;
+#ifdef VMD_TESTING
+#define VMD_TEST_ONLY(...) __VA_ARGS__
+#else
+#define VMD_TEST_ONLY(...)
+#endif
 namespace {
 using namespace vm;
-constexpr UINT Loaded = WM_APP + 1, ImagesReady = WM_APP + 2;
+constexpr UINT Loaded = WM_APP + 1, ImagesReady = WM_APP + 2, ScheduleAssociation = WM_APP + 4;
 constexpr float bottom = 24;
 struct Palette {
     D2D1_COLOR_F bg, fg, muted, panel, border, accent, selection, code;
@@ -107,15 +114,26 @@ struct App {
         ComPtr<ID2D1Factory> factory;
         ComPtr<ID2D1HwndRenderTarget> target;
         HRESULT result = E_PENDING;
+#ifdef VMD_TESTING
         double prepareMs = 0;
+#endif
     };
-    bool stagedRenderer = true, rendererStarted = false, hardwareActive = false;
+#ifdef VMD_TESTING
+    bool stagedRenderer = true;
+#else
+    static constexpr bool stagedRenderer = true;
+#endif
+    bool rendererStarted = false, hardwareActive = false;
     bool closeRequested = false, promotionPending = false;
+#ifdef VMD_TESTING
     bool failRendererPreparation = false, failRendererFirstFrame = false, fallbackAwaitingFrame = false;
+#endif
     std::shared_ptr<PreparedRenderer> preparedRenderer;
     std::thread rendererWorker;
+#ifdef VMD_TESTING
     double rendererPromotionMs = 0;
     std::chrono::steady_clock::time_point promotionBegan;
+#endif
     ComPtr<ID2D1Factory> softwareFactory;
     ComPtr<ID2D1HwndRenderTarget> softwareTarget;
     ComPtr<ID2D1SolidColorBrush> softwareBrush;
@@ -159,8 +177,12 @@ struct App {
     Preferences prefs;
     bool dark = false, source = false, fullscreen = false, showControls = true, dragging = false,
          searching = false, loading = false;
-    bool closing = false, selfTest = false, searchMatch = false, launchedWithFile = false;
+    bool closing = false, searchMatch = false, launchedWithFile = false;
+#ifdef VMD_TESTING
+    bool selfTest = false;
+#endif
     float dpi = 96, zoom = 1, width = 900, height = 700, horizontal = 0, maxWidth = 0;
+    bool zoomLayoutPending = false;
     unsigned viewportUpdates = 0;
     int scrollDrag = 0;
     float dragStart = 0;
@@ -189,8 +211,26 @@ struct App {
     HICON largeIcon = nullptr, smallIcon = nullptr;
     std::wstring notice, query, lastError;
     std::filesystem::path pendingPath;
+#ifdef VMD_TESTING
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now(), openStarted = started;
+#endif
     bool firstPaint = false;
+    enum class AssociationPhase { WaitingForPaint, Posted, Delay, Running, Finished };
+    AssociationPhase associationPhase = AssociationPhase::WaitingForPaint;
+    uint64_t associationReadyGeneration = UINT64_MAX;
+    struct AssociationResult {
+        std::atomic_bool done = false;
+        MarkdownAssociation association = MarkdownAssociation::Unknown;
+        bool registration = false, succeeded = false;
+    };
+    std::shared_ptr<AssociationResult> associationResult;
+    HWND associationPanel = nullptr;
+    std::array<HWND, 2> associationButtons{};
+    std::wstring associationError;
+#ifdef VMD_TESTING
+    std::wstring testAssociation;
+#endif
+#ifdef VMD_TESTING
     std::wstring metricsFile;
     std::vector<std::pair<const char *, double>> startupPhases;
     void startupPhase(const char *name) {
@@ -212,8 +252,10 @@ struct App {
     uint64_t toolbarBeforeScroll = 0, toolbarBeforeReload = 0;
     uint64_t spinnerPaints = 0, spinnerBeforeReload = 0;
     bool verificationReload = false;
+    uint64_t verificationCountGeneration = 0;
     bool checksPassed = true;
     std::vector<double> paintTimes;
+#endif
     struct MenuRow {
         UINT id;
         std::wstring text;
@@ -307,17 +349,29 @@ struct App {
             auto box = CreateSolidBrush(dark ? RGB(28, 34, 45) : RGB(255, 255, 255));
             auto oldBrush = SelectObject(dc, box);
             auto oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
-            float boxWidth = std::max(100.f, width - 7 * 38 - 20 - 48);
+            float boxWidth = searchBoxWidth();
             RoundRect(dc, (int)(28 * scale()), (int)(20 * scale()), (int)((28 + boxWidth) * scale()),
                       (int)(54 * scale()), (int)(8 * scale()), (int)(8 * scale()));
             SelectObject(dc, oldBrush);
             SelectObject(dc, oldPen);
             DeleteObject(box);
+            RECT countBounds{(LONG)((28 + boxWidth - searchCountWidth()) * scale()), (LONG)(20 * scale()),
+                             (LONG)((20 + boxWidth) * scale()), (LONG)(54 * scale())};
+            DrawTextW(dc, searchStatus.c_str(), (int)searchStatus.size(), &countBounds,
+                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            if (showSearchHint()) {
+                RECT hintBounds{(LONG)(28 * scale()), (LONG)(55 * scale()), (LONG)((20 + boxWidth) * scale()),
+                                (LONG)(76 * scale())};
+                DrawTextW(dc, L"Enter: next · Shift+Enter: previous", -1, &hintBounds,
+                          DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            }
         }
         std::wstring title = doc ? doc->path.filename().wstring() : L"";
         if (showControls && !searching && loading) {
+#ifdef VMD_TESTING
             if (!verifyFile.empty())
                 ++spinnerPaints;
+#endif
             float phase = (GetTickCount64() % 1200) / 1200.f * 6.2831853f;
             auto oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
             for (int i = 0; i < 8; ++i) {
@@ -365,6 +419,13 @@ struct App {
         }
         if (msg == WM_ERASEBKGND)
             return 1;
+        if (msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT) {
+            POINT point;
+            if (GetCursorPos(&point) && ScreenToClient(a->hwnd, &point)) {
+                SetCursor(a->documentCursor(point.x / a->scale(), point.y / a->scale()));
+                return TRUE;
+            }
+        }
         if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL)
             return a->message(msg, wp, lp);
         if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_LBUTTONDBLCLK || msg == WM_MOUSEMOVE) {
@@ -409,7 +470,7 @@ struct App {
             &target);
         if (FAILED(hr))
             return false;
-        startupPhase("render_target_ready");
+        VMD_TEST_ONLY(startupPhase("render_target_ready");)
         target->SetDpi(dpi, dpi);
         target->SetTransform(D2D1::Matrix3x2F::Translation(0, -top));
         return SUCCEEDED(target->CreateSolidColorBrush(rgb(0), &brush));
@@ -424,33 +485,46 @@ struct App {
         GetClientRect(canvas, &bounds);
         auto size = D2D1::SizeU(std::max(1L, bounds.right), std::max(1L, bounds.bottom));
         HWND destination = canvas;
+#ifdef VMD_TESTING
         bool failPreparation = failRendererPreparation;
+#endif
         // The factory is private to this worker until the release/acquire handoff.
         // No drawing occurs here; the software frame remains visible throughout preparation.
-        rendererWorker = std::thread([prepared, destination, size, failPreparation] {
+        rendererWorker = std::thread([prepared, destination, size VMD_TEST_ONLY(, failPreparation)] {
+#ifdef VMD_TESTING
+#ifdef VMD_TESTING
             auto began = std::chrono::steady_clock::now();
+#endif
+#endif
             HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             prepared->result =
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, prepared->factory.GetAddressOf());
+#ifdef VMD_TESTING
             if (failPreparation)
                 prepared->result = E_FAIL;
+#endif
             if (SUCCEEDED(prepared->result))
                 prepared->result = prepared->factory->CreateHwndRenderTarget(
                     D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_HARDWARE),
                     D2D1::HwndRenderTargetProperties(destination, size, D2D1_PRESENT_OPTIONS_IMMEDIATELY),
                     &prepared->target);
+#ifdef VMD_TESTING
             prepared->prepareMs =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+#endif
             if (SUCCEEDED(apartment))
                 CoUninitialize();
             prepared->ready.store(true, std::memory_order_release);
         });
         SetTimer(hwnd, 15, 10, nullptr);
+#ifdef VMD_TESTING
         if (!metricsFile.empty()) {
             std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
             out << "{\"renderer_preparing\":true}\n";
         }
+#endif
     }
+#ifdef VMD_TESTING
     void recordPromotion(bool success, HRESULT result) {
         if (metricsFile.empty())
             return;
@@ -476,6 +550,7 @@ struct App {
                     : "false")
             << "}\n";
     }
+#endif
     void promoteHardware() {
         if (closing || !preparedRenderer || !preparedRenderer->ready.load(std::memory_order_acquire))
             return;
@@ -498,12 +573,14 @@ struct App {
         if (SUCCEEDED(result))
             result = preparedRenderer->target->CreateSolidColorBrush(rgb(0), &nextBrush);
         if (FAILED(result)) {
-            recordPromotion(false, result);
+            VMD_TEST_ONLY(recordPromotion(false, result);)
             preparedRenderer.reset();
-            fallbackAwaitingFrame = true;
+            VMD_TEST_ONLY(fallbackAwaitingFrame = true;)
             invalidate();
+#ifdef VMD_TESTING
             if (exitOnContent)
                 SetTimer(hwnd, 9, 100, nullptr);
+#endif
             return;
         }
         preparedRenderer->target->SetDpi(dpi, dpi);
@@ -523,9 +600,11 @@ struct App {
         d2d = std::move(preparedRenderer->factory);
         hardwareActive = true;
         promotionPending = true;
+#ifdef VMD_TESTING
         promotionBegan = began;
         rendererPromotionMs =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+#endif
         invalidate();
     }
     void requestClose() {
@@ -534,10 +613,12 @@ struct App {
         // Keep the HWND alive while the worker prepares its target, without blocking the UI thread.
         if (rendererWorker.joinable() && !preparedRenderer->ready.load(std::memory_order_acquire)) {
             closeRequested = true;
+#ifdef VMD_TESTING
             if (!metricsFile.empty()) {
                 std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
                 out << "{\"renderer_close_deferred\":true}\n";
             }
+#endif
             return;
         }
         if (rendererWorker.joinable())
@@ -662,7 +743,7 @@ struct App {
         }
         out.height += 14 * zoom;
         heights.set(index, out.height);
-        maxWidth = std::max(maxWidth, out.width + left() * 2);
+        maxWidth = std::max(maxWidth, out.width + left());
         cacheCost += out.cost;
         auto [found, inserted] = cache.emplace(index, std::move(out));
         evict(index);
@@ -834,7 +915,8 @@ struct App {
         }
         out.height = std::max(out.height, 1.f);
         heights.set(index, out.height);
-        maxWidth = std::max(maxWidth, out.width + left() * 2);
+        // Only the actual right edge can overflow; the centering margin is not content.
+        maxWidth = std::max(maxWidth, out.width + left());
         cacheCost += out.cost;
         auto [it, _] = cache.emplace(index, std::move(out));
         evict(index);
@@ -843,6 +925,9 @@ struct App {
     void bars() {
         double page = std::max(1.f, height - top - bottom);
         scroll = std::clamp(scroll, 0., std::max(0., heights.total() - page));
+        // Layout arithmetic can put a fitting table a fraction of a pixel past the viewport.
+        if (maxWidth > width && (maxWidth - width) * scale() < .5f)
+            maxWidth = width;
         horizontal = std::clamp(horizontal, 0.f, std::max(0.f, maxWidth - width));
     }
     void stopScrolling() {
@@ -854,8 +939,10 @@ struct App {
         BOOL animations = TRUE;
         SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
         scrollTarget = std::clamp(destination, 0., std::max(0., heights.total() - (height - top - bottom)));
+#ifdef VMD_TESTING
         if (scrollBenchmark && benchmarkAnimations)
             animations = TRUE;
+#endif
         if (!animations) {
             scroll = scrollTarget;
             stopScrolling();
@@ -899,6 +986,20 @@ struct App {
         float pos = 16 + horizontal / std::max(1.f, maxWidth - width) * (track - thumb);
         return D2D1::RectF(pos, height + 3, pos + thumb, height + 9);
     }
+    int scrollbarAt(float x, float y) const {
+        if (!doc)
+            return 0;
+        if (x >= width && x <= width + 12 && y >= top && y <= height - bottom &&
+            heights.total() > height - top - bottom)
+            return 1;
+        if (y >= height && y <= height + 12 && x >= 0 && x <= width && maxWidth > width)
+            return 2;
+        return 0;
+    }
+    HCURSOR documentCursor(float x, float y) const {
+        bool textArea = doc && x >= 0 && x < width && y >= top && y < height - bottom;
+        return LoadCursorW(nullptr, scrollDrag || scrollbarAt(x, y) || !textArea ? IDC_ARROW : IDC_IBEAM);
+    }
     void drawScrollbars(const Palette &colors) {
         if (heights.total() > height - top - bottom) {
             auto r = verticalThumb();
@@ -923,12 +1024,20 @@ struct App {
                 fill(D2D1::RectF(h.left, h.top, h.left + h.width, h.top + h.height), c, 2);
     }
     void paint() {
+#ifdef VMD_TESTING
         auto paintStarted = std::chrono::steady_clock::now();
+#endif
         PAINTSTRUCT ps;
         BeginPaint(canvas, &ps);
         if (!device()) {
             EndPaint(canvas, &ps);
             return;
+        }
+        if (zoomLayoutPending) {
+            zoomLayoutPending = false;
+            // Publish the new zoom with measured look-ahead extents, so the next timer
+            // cannot immediately resize the scrollbar from the estimated heights.
+            measureAhead(false);
         }
         auto colors = palette(dark);
         target->BeginDraw();
@@ -1025,8 +1134,10 @@ struct App {
         drawScrollbars(colors);
         HRESULT hr = target->EndDraw();
         // Exercise the recovery from an EndDraw device-loss result without requiring a real GPU reset.
+#ifdef VMD_TESTING
         if (promotionPending && failRendererFirstFrame)
             hr = D2DERR_RECREATE_TARGET;
+#endif
         bool retryPaint = hr == D2DERR_RECREATE_TARGET;
         if (hr == D2DERR_RECREATE_TARGET) {
             target.Reset();
@@ -1034,10 +1145,12 @@ struct App {
             clearLayouts();
         }
         if (promotionPending) {
+#ifdef VMD_TESTING
             rendererPromotionMs =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - promotionBegan)
                     .count();
-            recordPromotion(SUCCEEDED(hr), hr);
+#endif
+            VMD_TEST_ONLY(recordPromotion(SUCCEEDED(hr), hr);)
             if (FAILED(hr)) {
                 target = std::move(softwareTarget);
                 brush = std::move(softwareBrush);
@@ -1055,7 +1168,7 @@ struct App {
                 }
                 clearLayouts();
                 retryPaint = true;
-                fallbackAwaitingFrame = true;
+                VMD_TEST_ONLY(fallbackAwaitingFrame = true;)
             } else {
                 softwareBrush.Reset();
                 softwareTarget.Reset();
@@ -1063,34 +1176,68 @@ struct App {
             }
             promotionPending = false;
             preparedRenderer.reset();
+#ifdef VMD_TESTING
             if (exitOnContent)
                 SetTimer(hwnd, 9, 100, nullptr);
+#endif
         }
         if (paintedDocument && SUCCEEDED(hr) && !firstPaint) {
             firstPaint = true;
-            recordMetric();
+            VMD_TEST_ONLY(recordMetric();)
+#ifdef VMD_TESTING
             if (exitOnContent && !stagedRenderer)
                 SetTimer(hwnd, 9, 100, nullptr);
+#endif
         }
+#ifdef VMD_TESTING
         if (fallbackAwaitingFrame && paintedDocument && SUCCEEDED(hr) && !hardwareActive) {
             fallbackAwaitingFrame = false;
+#ifdef VMD_TESTING
             if (!metricsFile.empty()) {
                 std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
                 out << "{\"software_fallback_frame\":true,\"blocks\":" << doc->blocks.size() << "}\n";
             }
+#endif
         }
+#endif
         EndPaint(canvas, &ps);
+#ifdef VMD_TESTING
+        if (!metricsFile.empty() && searchMatch && paintedFindGeneration != findGeneration && SUCCEEDED(hr)) {
+            paintedFindGeneration = findGeneration;
+            std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+            out << "{\"search_match_paint_ms\":"
+                << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - findStarted)
+                       .count()
+                << ",\"count_started\":" << (countStarted ? "true" : "false")
+                << ",\"search_anchor\":" << anchor << "}\n";
+        }
+#endif
+        if (SUCCEEDED(hr) && paintedDocument && countPending) {
+            countPending = false;
+            startCount(countStart, countBackwards);
+        }
+        // No shell work, worker, or notice controls exist on the path to first content.
+        if (SUCCEEDED(hr) && !loading && (firstPaint || !doc || blocks().empty())) {
+            associationReadyGeneration = generation;
+            if (associationPhase == AssociationPhase::WaitingForPaint) {
+                associationPhase = AssociationPhase::Posted;
+                PostMessageW(hwnd, ScheduleAssociation, (WPARAM)generation, 0);
+            }
+        }
         if (retryPaint)
             invalidate();
         if (SUCCEEDED(hr) && (firstPaint || (!doc && !loading)))
             prepareHardware();
+#ifdef VMD_TESTING
         if (paintedDocument && !verifyFile.empty())
             paintTimes.push_back(
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - paintStarted)
                     .count());
         if (paintTimes.size() > 1000)
             paintTimes.erase(paintTimes.begin(), paintTimes.begin() + 500);
+#endif
     }
+#ifdef VMD_TESTING
     void recordMetric() {
         if (metricsFile.empty())
             return;
@@ -1120,6 +1267,214 @@ struct App {
             out << '\"' << name << "\":" << elapsed;
         }
         out << "}}\n";
+    }
+#endif
+#ifdef VMD_TESTING
+    void associationTrace(const char *event) {
+        if (metricsFile.empty())
+            return;
+        std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+        out << "{\"association\":\"" << event << "\",\"elapsed_ms\":"
+            << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count()
+            << ",\"generation\":" << generation << "}\n";
+    }
+#endif
+    void startAssociationWork(bool registration = false) {
+        auto result = std::make_shared<AssociationResult>();
+        result->registration = registration;
+#ifdef VMD_TESTING
+        auto test = testAssociation;
+#endif
+        // The worker owns only its result, never App or an HWND. Closing never joins it.
+        try {
+            std::thread([result VMD_TEST_ONLY(, test)] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                try {
+                    if (result->registration) {
+#ifdef VMD_TESTING
+                        if (test.empty())
+#endif
+                        {
+                            registerApplication(false, false, &result->succeeded);
+                            if (result->succeeded)
+                                SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSHNOWAIT, nullptr,
+                                               nullptr);
+                        }
+                    }
+#ifdef VMD_TESTING
+                    else if (!test.empty()) {
+                        if (test == L"slow")
+                            Sleep(15000);
+                        result->association =
+                            test == L"unknown" ? MarkdownAssociation::Unknown : MarkdownAssociation::Mismatch;
+                    }
+#endif
+                    else
+                        result->association = probeMarkdownAssociation();
+                } catch (...) {
+                    // Optional shell integration must not affect reading or terminate the process.
+                }
+                result->done.store(true);
+            }).detach();
+        } catch (const std::exception &) {
+            associationPhase = AssociationPhase::Finished;
+            if (registration)
+                associationFailed();
+            return;
+        }
+        associationResult = std::move(result);
+        associationPhase = AssociationPhase::Running;
+        SetTimer(hwnd, 17, 100, nullptr);
+        VMD_TEST_ONLY(associationTrace(registration ? "registration_started" : "probe_started");)
+    }
+    void associationFailed() {
+        associationError = L"Could not register this location. Try again.";
+        EnableWindow(associationButtons[0], TRUE);
+        positionAssociation();
+        InvalidateRect(associationPanel, nullptr, TRUE);
+        VMD_TEST_ONLY(associationTrace("registration_failed");)
+    }
+    void pollAssociation() {
+        if (!associationResult || !associationResult->done.load())
+            return;
+        // A later document also gets its first paint before any notice work.
+        if (loading || associationReadyGeneration != generation)
+            return;
+        KillTimer(hwnd, 17);
+        auto result = std::move(associationResult);
+        associationPhase = AssociationPhase::Finished;
+        if (result->registration) {
+            if (result->succeeded) {
+                if (openDefaultSettings()) {
+                    VMD_TEST_ONLY(associationTrace("settings_opened");)
+                    dismissAssociation();
+                } else {
+                    associationError = L"Could not open Default apps. Try Windows Settings.";
+                    EnableWindow(associationButtons[0], TRUE);
+                    positionAssociation();
+                }
+            } else
+                associationFailed();
+        } else {
+            VMD_TEST_ONLY(associationTrace("probe_finished");)
+            if (result->association == MarkdownAssociation::Mismatch)
+                showAssociation();
+        }
+    }
+    static constexpr auto associationTitle = L"Use this copy for .md files?";
+    static constexpr auto associationText =
+        L"Windows points to Voltura Markdown at another location. Choose this copy in Windows Default apps.";
+    int associationTextHeight(HDC dc, int panelWidth) {
+        RECT text{0, 0, panelWidth - (LONG)(32 * scale()), 0};
+        DrawTextW(dc, associationText, -1, &text, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        return text.bottom;
+    }
+    void positionAssociation() {
+        if (!associationPanel)
+            return;
+        auto s = scale();
+        int panelWidth = (int)(std::min(540.f, width - 40) * s);
+        auto dc = GetDC(associationPanel);
+        auto old = SelectObject(dc, uiFont);
+        int textHeight = associationTextHeight(dc, panelWidth);
+        SelectObject(dc, old);
+        ReleaseDC(associationPanel, dc);
+        int buttonY = (int)(54 * s) + textHeight + (associationError.empty() ? 0 : (int)(28 * s));
+        int panelHeight = buttonY + (int)(48 * s);
+        POINT origin{(LONG)(20 * s), std::max((LONG)(top * s), (LONG)((height - 80) * s) - panelHeight)};
+        ClientToScreen(hwnd, &origin);
+        SetWindowPos(associationPanel, nullptr, origin.x, origin.y, panelWidth, panelHeight,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        MoveWindow(associationButtons[0], (int)(16 * s), buttonY, (int)(170 * s), (int)(32 * s), TRUE);
+        MoveWindow(associationButtons[1], (int)(196 * s), buttonY, (int)(86 * s), (int)(32 * s), TRUE);
+        InvalidateRect(associationPanel, nullptr, FALSE);
+    }
+    static LRESULT CALLBACK associationProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
+        auto app = (App *)GetWindowLongPtrW(window, GWLP_USERDATA);
+        if (msg == WM_NCCREATE) {
+            app = (App *)((CREATESTRUCTW *)lp)->lpCreateParams;
+            SetWindowLongPtrW(window, GWLP_USERDATA, (LONG_PTR)app);
+        }
+        if (!app)
+            return DefWindowProcW(window, msg, wp, lp);
+        if (msg == WM_ERASEBKGND)
+            return 1;
+        if (msg == WM_MOUSEACTIVATE)
+            return MA_NOACTIVATE;
+        if (msg == WM_DRAWITEM) {
+            app->drawButton(*(DRAWITEMSTRUCT *)lp);
+            return TRUE;
+        }
+        if (msg == WM_COMMAND) {
+            app->command(LOWORD(wp));
+            return 0;
+        }
+        if (msg == WM_PAINT) {
+            PAINTSTRUCT ps;
+            auto screen = BeginPaint(window, &ps);
+            RECT bounds;
+            GetClientRect(window, &bounds);
+            auto dc = CreateCompatibleDC(screen);
+            auto bitmap = CreateCompatibleBitmap(screen, bounds.right, bounds.bottom);
+            auto oldBitmap = SelectObject(dc, bitmap);
+            auto background = CreateSolidBrush(app->dark ? RGB(28, 34, 45) : RGB(255, 255, 255));
+            FillRect(dc, &bounds, background);
+            DeleteObject(background);
+            auto border = CreateSolidBrush(app->dark ? RGB(48, 58, 73) : RGB(220, 226, 235));
+            FrameRect(dc, &bounds, border);
+            DeleteObject(border);
+            auto oldFont = SelectObject(dc, app->uiFont);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, app->dark ? RGB(229, 233, 240) : RGB(32, 41, 56));
+            auto s = app->scale();
+            RECT title{(LONG)(16 * s), (LONG)(14 * s), bounds.right - (LONG)(16 * s), (LONG)(38 * s)};
+            DrawTextW(dc, associationTitle, -1, &title, DT_SINGLELINE | DT_NOPREFIX);
+            RECT text{(LONG)(16 * s), (LONG)(44 * s), bounds.right - (LONG)(16 * s), bounds.bottom};
+            DrawTextW(dc, associationText, -1, &text, DT_WORDBREAK | DT_NOPREFIX);
+            if (!app->associationError.empty()) {
+                text.top += app->associationTextHeight(dc, bounds.right) + (LONG)(8 * s);
+                DrawTextW(dc, app->associationError.c_str(), -1, &text, DT_SINGLELINE | DT_NOPREFIX);
+            }
+            SelectObject(dc, oldFont);
+            BitBlt(screen, 0, 0, bounds.right, bounds.bottom, dc, 0, 0, SRCCOPY);
+            SelectObject(dc, oldBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            EndPaint(window, &ps);
+            return 0;
+        }
+        if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL)
+            return app->message(msg, wp, lp);
+        return DefWindowProcW(window, msg, wp, lp);
+    }
+    void showAssociation() {
+        WNDCLASSEXW c{sizeof(c)};
+        c.lpfnWndProc = associationProc;
+        c.hInstance = GetModuleHandleW(nullptr);
+        c.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        c.lpszClassName = L"VolturaMarkdownAssociation";
+        RegisterClassExW(&c);
+        associationPanel =
+            CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, c.lpszClassName, associationTitle,
+                            WS_POPUP | WS_CLIPCHILDREN, 0, 0, 1, 1, hwnd, nullptr, c.hInstance, this);
+        if (!associationPanel)
+            return;
+        const wchar_t *names[] = {L"Open Default apps", L"Dismiss"};
+        for (size_t i = 0; i < associationButtons.size(); ++i) {
+            associationButtons[i] =
+                CreateWindowExW(0, L"BUTTON", names[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0,
+                                0, 1, 1, associationPanel, (HMENU)(INT_PTR)(150 + i), nullptr, nullptr);
+            SetWindowSubclass(associationButtons[i], childProc, 1, (DWORD_PTR)this);
+        }
+        positionAssociation();
+        ShowWindow(associationPanel, SW_SHOWNOACTIVATE);
+        VMD_TEST_ONLY(associationTrace("notice_shown");)
+    }
+    void dismissAssociation() {
+        if (associationPanel && IsChild(associationPanel, GetFocus()))
+            SetFocus(hwnd);
+        ShowWindow(associationPanel, SW_HIDE);
+        VMD_TEST_ONLY(associationTrace("notice_dismissed");)
     }
     void zoomVisibility() {
         bool visible = showControls && zoomExpanded;
@@ -1185,6 +1540,28 @@ struct App {
     HWND nextTabControl(HWND current, bool reverse) {
         auto first = GetNextDlgTabItem(hwnd, nullptr, FALSE);
         auto last = GetNextDlgTabItem(hwnd, nullptr, TRUE);
+        if (IsWindowVisible(associationPanel)) {
+            std::vector<HWND> controls;
+            auto control = first;
+            if (control)
+                do {
+                    if (IsWindowVisible(control) && IsWindowEnabled(control))
+                        controls.push_back(control);
+                    control = GetNextDlgTabItem(hwnd, control, FALSE);
+                } while (control && control != first);
+            for (auto button : associationButtons)
+                if (IsWindowEnabled(button))
+                    controls.push_back(button);
+            if (IsWindowVisible(zoomPanel))
+                controls.insert(controls.end(), zoomButtons.begin(), zoomButtons.end());
+            auto found = std::find(controls.begin(), controls.end(), current);
+            if (found == controls.end())
+                return reverse ? controls.back() : controls.front();
+            auto index = (size_t)(found - controls.begin());
+            return controls[(index + controls.size() + (reverse ? -1 : 1)) % controls.size()];
+        }
+        if (!current && reverse && IsWindowVisible(zoomPanel))
+            return zoomButtons.back();
         auto zoomControl = std::find(zoomButtons.begin(), zoomButtons.end(), current);
         if (zoomControl != zoomButtons.end()) {
             auto index = (int)(zoomControl - zoomButtons.begin()) + (reverse ? -1 : 1);
@@ -1226,6 +1603,7 @@ struct App {
             MoveWindow(buttons[i], (int)((start + i * 38) * scale()), (int)(20 * scale()),
                        (int)(34 * scale()), (int)(34 * scale()), TRUE);
         positionZoomOverlay();
+        positionAssociation();
         if (canvas)
             MoveWindow(canvas, 0, (int)(top * scale()), r.right,
                        std::max<LONG>(1, r.bottom - (int)(top * scale())), FALSE);
@@ -1234,6 +1612,16 @@ struct App {
         if (backButton)
             MoveWindow(backButton, (int)(20 * scale()), (int)(20 * scale()), (int)(34 * scale()),
                        (int)(34 * scale()), TRUE);
+    }
+    float searchBoxWidth() const {
+        return std::max(100.f, width - (fullscreen ? 7 : 6) * 38 - 20 - 48);
+    }
+    float searchCountWidth() const {
+        return std::min(searchBoxWidth() * .55f,
+                        std::clamp((float)searchStatus.size() * 8 + 12, 96.f, 180.f));
+    }
+    bool showSearchHint() const {
+        return searching && countReady && searchTotal > 1 && searchBoxWidth() >= 350;
     }
     void positionSearch() {
         if (!search)
@@ -1245,9 +1633,9 @@ struct App {
         SelectObject(dc, oldFont);
         ReleaseDC(search, dc);
         int fieldHeight = metrics.tmHeight + 2 * GetSystemMetricsForDpi(SM_CYBORDER, (UINT)dpi);
-        float start = width - (fullscreen ? 7 : 6) * 38 - 20;
         MoveWindow(search, (int)(36 * scale()), (int)(37 * scale()) - fieldHeight / 2,
-                   (int)((std::max(100.f, start - 48) - 16) * scale()), fieldHeight, TRUE);
+                   (int)(std::max(24.f, searchBoxWidth() - searchCountWidth() - 24) * scale()), fieldHeight,
+                   TRUE);
     }
     void visibility(bool show) {
         if (show == showControls)
@@ -1307,6 +1695,11 @@ struct App {
             InvalidateRect(backButton, nullptr, FALSE);
         if (search)
             InvalidateRect(search, nullptr, FALSE);
+        if (associationPanel) {
+            InvalidateRect(associationPanel, nullptr, FALSE);
+            for (auto button : associationButtons)
+                InvalidateRect(button, nullptr, FALSE);
+        }
         invalidateHeader();
         invalidate();
     }
@@ -1321,6 +1714,7 @@ struct App {
         uiFont = nextFont;
         themeTooltip();
         positionSearch();
+        positionAssociation();
         auto instance = GetModuleHandleW(nullptr);
         auto big = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(1), IMAGE_ICON,
                                      GetSystemMetricsForDpi(SM_CXICON, (UINT)dpi),
@@ -1344,8 +1738,12 @@ struct App {
                             (IUnknown **)write.GetAddressOf());
         if (!d2d || !write)
             throw std::runtime_error("Windows text rendering could not be initialized.");
-        startupPhase("graphics_factories_ready");
+        VMD_TEST_ONLY(startupPhase("graphics_factories_ready");)
+#ifdef VMD_TESTING
         prefs = selfTest ? Preferences{} : readPreferences();
+#else
+        prefs = readPreferences();
+#endif
         zoom = prefs.zoom;
         zoomExpanded = std::abs(zoom - 1.f) > .001f;
         images = std::make_unique<Images>(hwnd);
@@ -1403,7 +1801,7 @@ struct App {
             info.lpszText = const_cast<wchar_t *>(zoomTips[i]);
             SendMessageW(tooltip, TTM_ADDTOOLW, 0, (LPARAM)&info);
         }
-        startupPhase("buttons_ready");
+        VMD_TEST_ONLY(startupPhase("buttons_ready");)
         updateZoomControls();
         search = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                                  (HMENU)200, nullptr, nullptr);
@@ -1426,7 +1824,7 @@ struct App {
         positions();
         refreshDpiAssets();
         theme();
-        startupPhase("controls_ready");
+        VMD_TEST_ONLY(startupPhase("controls_ready");)
         if (prefs.placed) {
             auto p = prefs.placement;
             if (p.showCmd == SW_SHOWMINIMIZED)
@@ -1444,8 +1842,22 @@ struct App {
             return 1;
         if (msg == WM_GETDLGCODE && w == a->search)
             return DLGC_WANTALLKEYS;
+        // TranslateMessage queues WM_CHAR before WM_KEYDOWN is dispatched. Enter
+        // already navigates below; the single-line edit would beep on its character.
+        if (w == a->search && msg == WM_CHAR && (wp == L'\r' || wp == L'\n'))
+            return 0;
         if (msg == WM_KEYDOWN) {
             bool ctrl = GetKeyState(VK_CONTROL) < 0;
+            if (a->associationPanel && IsChild(a->associationPanel, w)) {
+                if (wp == VK_RETURN) {
+                    a->command(GetDlgCtrlID(w));
+                    return 0;
+                }
+                if (wp == VK_ESCAPE) {
+                    a->dismissAssociation();
+                    return 0;
+                }
+            }
             if (w == a->search && wp == VK_RETURN) {
                 a->find(true, GetKeyState(VK_SHIFT) < 0);
                 return 0;
@@ -1500,6 +1912,7 @@ struct App {
         }
     }
     void open(std::filesystem::path path) {
+        cancelSearch();
         if (informationView)
             closeInformation();
         for (auto &w : workers)
@@ -1511,7 +1924,9 @@ struct App {
         notice.clear();
         invalidateHeader();
         firstPaint = false;
+#ifdef VMD_TESTING
         openStarted = std::chrono::steady_clock::now();
+#endif
         pendingPath = path;
         invalidate();
         auto cancel = std::make_shared<std::atomic_bool>(false),
@@ -1557,7 +1972,7 @@ struct App {
             invalidate();
             return;
         }
-        startupPhase("document_delivered");
+        VMD_TEST_ONLY(startupPhase("document_delivered");)
         doc = std::move(r->document);
         source = false;
         rawBlocks.clear();
@@ -1569,6 +1984,7 @@ struct App {
         invalidateHeader();
         if (searching)
             find(false);
+#ifdef VMD_TESTING
         if (scrollBenchmark) {
             paintTimes.clear();
             scrollFrames = 0;
@@ -1579,6 +1995,7 @@ struct App {
             SetTimer(hwnd, 13, 10, nullptr);
         } else if (!verifyFile.empty())
             SetTimer(hwnd, 10, 120, nullptr);
+#endif
     }
     void toggleSource() {
         if (!doc)
@@ -1604,8 +2021,10 @@ struct App {
         visibility(true);
         updateZoomControls();
         SetTimer(hwnd, 12, 2200, nullptr);
-        if (zoom != previous)
+        if (zoom != previous) {
             resetLayout();
+            zoomLayoutPending = true;
+        }
     }
     void toggleFullscreen() {
         stopScrolling();
@@ -1758,6 +2177,16 @@ struct App {
     }
     void command(int id) {
         switch (id) {
+        case 150:
+            if (associationResult || !IsWindowVisible(associationPanel))
+                break;
+            associationError.clear();
+            EnableWindow(associationButtons[0], FALSE);
+            startAssociationWork(true);
+            break;
+        case 151:
+            dismissAssociation();
+            break;
         case 130:
         case 131:
         case 132:
@@ -1872,7 +2301,9 @@ Use the **back arrow** or <kbd>Escape</kbd> to return to your reading position.
 ## Find, copy and zoom
 
 - **Find text:** press <kbd>Ctrl</kbd>+<kbd>F</kbd>.
-- **Next / previous match:** press <kbd>Enter</kbd> / <kbd>Shift</kbd>+<kbd>Enter</kbd>.
+- **Next / previous match:** press <kbd>Enter</kbd> / <kbd>Shift</kbd>+<kbd>Enter</kbd>, or <kbd>F3</kbd> / <kbd>Shift</kbd>+<kbd>F3</kbd>.
+
+The search field shows your current match and total, such as **3 of 12**. The first hit appears before background counting finishes. A navigation hint appears for multiple hits when there is room, and matches keep two text lines of context above them where possible.
 - **Copy text:** drag to select, then press <kbd>Ctrl</kbd>+<kbd>C</kbd>. <kbd>Ctrl</kbd>+<kbd>A</kbd> selects all.
 - **Change text size:** use <kbd>Ctrl</kbd> + mouse wheel or <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>Ctrl</kbd>+<kbd>−</kbd>.
 - **Reset text size:** press <kbd>Ctrl</kbd>+<kbd>0</kbd>, or click the current zoom percentage.
@@ -1996,14 +2427,47 @@ In the **three-dot menu**:
         invalidateHeader();
         invalidate();
     }
-    void cancelSearch() {
+    void cancelCount() {
+        ++countGeneration;
+        if (countCancel)
+            countCancel->store(true);
+        countCancel.reset();
+        countStarted = countReady = countPending = false;
+        searchTotal = 0;
+        searchIndex = 0;
+        countQuery.clear();
+        if (!searchStatus.empty()) {
+            float previousWidth = searchCountWidth();
+            searchStatus.clear();
+            if (previousWidth != searchCountWidth())
+                positionSearch();
+            invalidateHeader();
+        }
+    }
+    void cancelSearch(bool resetCount = true) {
         ++findGeneration;
         KillTimer(hwnd, 3);
         if (findCancel)
             findCancel->store(true);
+        if (resetCount)
+            cancelCount();
+    }
+    void refreshSearchStatus() {
+        float previousWidth = searchCountWidth();
+        int64_t total = (int64_t)searchTotal;
+        int64_t current = searchMatch && total ? (searchIndex % total + total) % total + 1 : 0;
+        searchStatus =
+            countReady ? std::to_wstring(current) + L" of " + std::to_wstring(searchTotal) : L"Counting…";
+        if (previousWidth != searchCountWidth())
+            positionSearch();
+        invalidateHeader();
     }
     void find(bool advance, bool backwards = false) {
-        cancelSearch();
+#ifdef VMD_TESTING
+        if (!metricsFile.empty())
+            findStarted = std::chrono::steady_clock::now();
+#endif
+        cancelSearch(false);
         if (!doc)
             return;
         int n = GetWindowTextLengthW(search);
@@ -2011,6 +2475,7 @@ In the **three-dot menu**:
         GetWindowTextW(search, query.data(), n + 1);
         query.resize(n);
         if (query.empty()) {
+            cancelCount();
             if (notice == L"No matches")
                 notice.clear();
             searchMatch = false;
@@ -2018,79 +2483,125 @@ In the **three-dot menu**:
             invalidate();
             return;
         }
-        // Invariant ordinal, case-insensitive matching; scanning runs off the UI thread for large documents.
+        bool continuing = advance && searchMatch && countCancel && query == countQuery;
+        uint32_t start = advance ? (backwards    ? std::min(anchor, caret)
+                                    : continuing ? anchor + 1
+                                                 : std::max(anchor, caret))
+                                 : 0;
+        if (!continuing) {
+            cancelCount();
+            countQuery = query;
+            countCancel = std::make_shared<std::atomic_bool>(false);
+#ifdef VMD_TESTING
+            if (!metricsFile.empty())
+                countBegan = findStarted;
+#endif
+            refreshSearchStatus();
+        }
         auto document = doc;
         bool raw = source;
         auto q = query;
-        uint32_t start = advance ? (backwards ? std::min(anchor, caret) : std::max(anchor, caret)) : 0;
         auto gen = findGeneration;
+        auto countGen = countGeneration;
+        int step = continuing ? (backwards ? -1 : 1) : 0;
         findCancel = std::make_shared<std::atomic_bool>(false);
         auto cancel = findCancel;
         auto done = std::make_shared<std::atomic_bool>(false);
         HWND destination = hwnd;
         auto documentGen = generation;
         reap();
-        workers.push_back(
-            {std::thread([document, raw, q, start, gen, cancel, done, destination, documentGen, backwards] {
-                 auto &s = raw || document->plainSource ? document->source : document->text;
-                 int found = -1;
-                 size_t count = s.size();
-                 auto match = [&](size_t at) {
-                     return at + q.size() <= count &&
-                            CompareStringOrdinal(s.data() + at, (int)q.size(), q.data(), (int)q.size(),
-                                                 TRUE) == CSTR_EQUAL;
-                 };
-                 if (!backwards) {
-                     for (size_t pass = 0; pass < 2 && found < 0 && !cancel->load(); ++pass) {
-                         size_t begin = pass ? 0 : std::min<size_t>(start, count),
-                                end = pass ? std::min<size_t>(start, count) : count;
-                         for (size_t i = begin; i < end; ++i) {
-                             if ((i & 4095) == 0 && cancel->load())
-                                 break;
-                             if (match(i)) {
-                                 found = (int)i;
-                                 break;
-                             }
-                         }
-                     }
-                 } else {
-                     for (size_t pass = 0; pass < 2 && found < 0 && !cancel->load(); ++pass) {
-                         size_t begin = pass ? count : std::min<size_t>(start, count),
-                                end = pass ? std::min<size_t>(start, count) : 0;
-                         for (size_t i = begin; i > end;) {
-                             --i;
-                             if ((i & 4095) == 0 && cancel->load())
-                                 break;
-                             if (match(i)) {
-                                 found = (int)i;
-                                 break;
-                             }
-                         }
-                     }
-                 }
-                 if (!cancel->load()) {
-                     auto r = new SearchResult{gen, documentGen, raw, found, (uint32_t)q.size()};
-                     if (!PostMessageW(destination, WM_APP + 3, 0, (LPARAM)r))
-                         delete r;
-                 }
-                 done->store(true);
-             }),
-             cancel, done});
+        workers.push_back({std::thread([document, raw, q, start, gen, cancel, done, destination, documentGen,
+                                        backwards, step, countGen] {
+                               auto &s = raw || document->plainSource ? document->source : document->text;
+                               int found = findMatch(s, q, start, backwards, *cancel);
+                               if (!cancel->load()) {
+                                   auto r = new SearchResult{gen,   documentGen,        raw,
+                                                             found, (uint32_t)q.size(), step,
+                                                             start, backwards,          countGen};
+                                   if (!PostMessageW(destination, WM_APP + 3, 0, (LPARAM)r))
+                                       delete r;
+                               }
+                               done->store(true);
+                           }),
+                           cancel, done});
     }
     struct SearchResult {
         uint64_t gen, documentGen;
         bool source;
         int found;
         uint32_t length;
+        int step = 0;
+        uint32_t start = 0;
+        bool backwards = false;
+        uint64_t countGen = 0;
     };
-    uint64_t findGeneration = 0;
-    std::shared_ptr<std::atomic_bool> findCancel;
+    struct CountResult {
+        uint64_t gen, documentGen;
+        bool source;
+        MatchCount count;
+        bool backwards;
+    };
+    uint64_t findGeneration = 0, countGeneration = 0, searchTotal = 0;
+#ifdef VMD_TESTING
+    uint64_t paintedFindGeneration = 0;
+    std::chrono::steady_clock::time_point findStarted, countBegan;
+#endif
+    int64_t searchIndex = 0;
+    bool countStarted = false, countReady = false, countPending = false, countBackwards = false;
+    uint32_t countStart = 0;
+    std::wstring countQuery, searchStatus;
+    std::shared_ptr<std::atomic_bool> findCancel, countCancel;
+    void startCount(uint32_t start, bool backwards) {
+        if (countStarted || !countCancel)
+            return;
+        countStarted = true;
+        auto document = doc;
+        auto q = countQuery;
+        auto cancel = countCancel;
+        auto done = std::make_shared<std::atomic_bool>(false);
+        auto gen = countGeneration, documentGen = generation;
+        bool raw = source;
+        HWND destination = hwnd;
+        workers.push_back(
+            {std::thread([document, q, cancel, done, gen, documentGen, raw, destination, start, backwards] {
+                 SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                 auto &s = raw || document->plainSource ? document->source : document->text;
+                 auto count = countMatches(s, q, start, *cancel);
+                 if (!cancel->load()) {
+                     auto r = new CountResult{gen, documentGen, raw, count, backwards};
+                     if (!PostMessageW(destination, WM_APP + 5, 0, (LPARAM)r))
+                         delete r;
+                 }
+                 done->store(true);
+             }),
+             cancel, done});
+    }
+    void countResult(std::unique_ptr<CountResult> r) {
+        if (r->gen != countGeneration || r->documentGen != generation || r->source != source || !countCancel)
+            return;
+        searchTotal = r->count.total;
+        searchIndex += (int64_t)r->count.beforeStart - (r->backwards ? 1 : 0);
+        countReady = true;
+        refreshSearchStatus();
+#ifdef VMD_TESTING
+        if (!metricsFile.empty()) {
+            std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+            out << "{\"search_total\":" << searchTotal << ",\"search_count_ms\":"
+                << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - countBegan)
+                       .count()
+                << "}\n";
+        }
+#endif
+    }
     void searchResult(std::unique_ptr<SearchResult> r) {
         if (r->gen != findGeneration || r->documentGen != generation || r->source != source)
             return;
         if (r->found < 0) {
             notice = L"No matches";
             searchMatch = false;
+            searchTotal = 0;
+            countReady = true;
+            refreshSearchStatus();
             invalidate();
             return;
         }
@@ -2098,10 +2609,18 @@ In the **three-dot menu**:
         anchor = (uint32_t)r->found;
         caret = anchor + r->length;
         searchMatch = true;
-        jump(anchor);
+        searchIndex += r->step;
+        jump(anchor, true);
+        refreshSearchStatus();
         invalidate();
+        // Begin the lower-priority count only after the first highlighted frame is presented.
+        if (!countStarted && !countPending) {
+            countStart = r->start;
+            countBackwards = r->backwards;
+            countPending = true;
+        }
     }
-    void jump(uint32_t position) {
+    void jump(uint32_t position, bool context = false) {
         stopScrolling();
         if (!doc || blocks().empty())
             return;
@@ -2114,7 +2633,9 @@ In the **three-dot menu**:
                 FLOAT x, y;
                 DWRITE_HIT_TEST_METRICS m{};
                 p.layout->HitTestTextPosition(position - p.start, FALSE, &x, &y, &m);
-                scroll += y;
+                scroll += p.y + y;
+                if (context)
+                    scroll -= std::min<double>(2 * m.height, std::max(0.f, height - top - bottom - m.height));
                 horizontal = std::max(0.f, left() + p.x + x - width / 2);
                 break;
             }
@@ -2320,7 +2841,7 @@ In the **three-dot menu**:
         }
         if (key == VK_TAB) {
             visibility(true);
-            SetFocus(shift && IsWindowVisible(zoomPanel) ? zoomButtons.back() : buttons[shift ? 5 : 0]);
+            SetFocus(nextTabControl(nullptr, shift));
             return;
         }
         double delta = key == VK_NEXT || key == VK_SPACE ? height - top - bottom - 24
@@ -2343,8 +2864,10 @@ In the **three-dot menu**:
         }
     }
     void drawButton(const DRAWITEMSTRUCT &item) {
+#ifdef VMD_TESTING
         if (!verifyFile.empty() && item.CtlID >= 100 && item.CtlID < 106)
             ++buttonPaints[item.CtlID - 100];
+#endif
         RECT r = item.rcItem;
         HDC dc = CreateCompatibleDC(item.hDC);
         HBITMAP buffer = CreateCompatibleBitmap(item.hDC, r.right, r.bottom);
@@ -2360,13 +2883,18 @@ In the **three-dot menu**:
             bg = dark ? RGB(46, 59, 78) : RGB(230, 237, 250);
         if (item.itemState & ODS_SELECTED)
             bg = dark ? RGB(63, 82, 112) : RGB(209, 223, 248);
+        bool associationButton = item.CtlID == 150 || item.CtlID == 151;
         auto background = CreateSolidBrush(item.CtlID >= 140 && item.CtlID <= 142 ? RGB(255, 0, 255)
-                                           : dark                                 ? RGB(16, 19, 25)
-                                                                                  : RGB(250, 251, 253));
+                                           : associationButton ? (dark ? RGB(28, 34, 45) : RGB(255, 255, 255))
+                                           : dark              ? RGB(16, 19, 25)
+                                                               : RGB(250, 251, 253));
         FillRect(dc, &r, background);
         DeleteObject(background);
         auto b = CreateSolidBrush(bg);
-        auto pen = CreatePen(PS_SOLID, 1, focus ? (dark ? RGB(144, 185, 255) : RGB(39, 95, 199)) : bg);
+        auto pen = CreatePen(PS_SOLID, 1,
+                             focus               ? (dark ? RGB(144, 185, 255) : RGB(39, 95, 199))
+                             : associationButton ? (dark ? RGB(48, 58, 73) : RGB(220, 226, 235))
+                                                 : bg);
         auto ob = SelectObject(dc, b), op = SelectObject(dc, pen);
         RoundRect(dc, 1, 1, r.right - 1, r.bottom - 1, (int)(10 * scale()), (int)(10 * scale()));
         SelectObject(dc, ob);
@@ -2385,6 +2913,18 @@ In the **three-dot menu**:
         op = SelectObject(dc, pen);
         ob = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
         switch (item.CtlID) {
+        case 150:
+        case 151: {
+            wchar_t label[64]{};
+            GetWindowTextW(item.hwndItem, label, 64);
+            auto font = SelectObject(dc, uiFont);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(
+                dc, IsWindowEnabled(item.hwndItem) ? fg : (dark ? RGB(146, 158, 175) : RGB(102, 117, 138)));
+            DrawTextW(dc, label, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(dc, font);
+            break;
+        }
         case 140:
         case 142:
             path({{-6, 0}, {6, 0}});
@@ -2457,23 +2997,35 @@ In the **three-dot menu**:
     }
     void timer() {
         reap();
+        measureAhead();
+    }
+    void measureAhead(bool bounded = true) {
         if (!doc || loading || !target || blocks().empty())
             return;
         auto start = std::chrono::steady_clock::now();
-        size_t i = heights.find(scroll), end = heights.find(scroll + 2 * (height - top));
+        size_t i = heights.find(scroll);
+        double y = heights.before(i), end = scroll + 2 * (height - top);
         bool changed = false;
-        for (; i <= end && i < blocks().size(); ++i) {
+        for (; i < blocks().size() && y <= end; ++i) {
             if (!cache.contains(i)) {
                 layout(i);
                 changed = true;
             }
-            if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(3))
+            y += heights.values[i];
+            if (bounded && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(3))
                 break;
         }
         if (changed) {
             bars();
             invalidate();
         }
+    }
+#ifdef VMD_TESTING
+    static LRESULT CALLBACK searchCharProbe(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR,
+                                            DWORD_PTR data) {
+        if (msg == WM_CHAR)
+            ++*(unsigned *)data;
+        return DefSubclassProc(window, msg, wp, lp);
     }
     void verifyUi() {
         auto check = [&](bool ok, const char *name) {
@@ -2484,6 +3036,15 @@ In the **three-dot menu**:
         switch (verifyStage++) {
         case 0:
             check(doc && !source && !loading, "formatted_default");
+            {
+                float right = 0;
+                clearLayouts();
+                for (size_t i = 0; i < std::min<size_t>(64, blocks().size()); ++i)
+                    right = std::max(right, left() + layout(i).width);
+                bars();
+                check(right > width || maxWidth <= width,
+                      "fitting_document_does_not_scroll_empty_right_margin");
+            }
             {
                 auto popup = createMenu();
                 check(GetMenuItemCount(popup) == 13, "file_operations_menu_items");
@@ -2554,6 +3115,14 @@ In the **three-dot menu**:
                               full ? "simulated_fullscreen_dpi_geometry" : "simulated_windowed_dpi_geometry");
                         check(doc == originalDocument && anchor == 1 && caret == 3 && dark == originalTheme,
                               "simulated_dpi_preserves_document_selection_and_theme");
+                        RECT searchBounds;
+                        GetWindowRect(search, &searchBounds);
+                        MapWindowPoints(nullptr, hwnd, (POINT *)&searchBounds, 2);
+                        check(searchBounds.left >= 28 * scale() &&
+                                  searchBounds.right <=
+                                      (28 + searchBoxWidth() - searchCountWidth()) * scale() &&
+                                  searchBounds.top >= 20 * scale() && searchBounds.bottom <= 54 * scale(),
+                              "search_edit_right_edge_stays_inside_rounded_field_at_each_dpi");
                         double sum = 0;
                         bool indexValid = true;
                         for (size_t i = 0; i < heights.values.size(); ++i) {
@@ -2625,6 +3194,21 @@ In the **three-dot menu**:
                       "parser_fallback_stays_in_reading_view_with_complete_text");
                 doc = original;
                 resetLayout(false);
+                {
+                    float savedWidth = width, savedZoom = zoom;
+                    width = 1700;
+                    zoom = 1;
+                    doc = std::make_shared<Document>(parse(L"```\n" + std::wstring(114, L'x') + L"\n```\n"));
+                    resetLayout(false);
+                    float right = left() + layout(0).width;
+                    bars();
+                    check(right > width - left() && right < width && maxWidth <= width,
+                          "code_fitting_in_centering_margin_needs_no_horizontal_scrollbar");
+                    width = savedWidth;
+                    zoom = savedZoom;
+                    doc = original;
+                    resetLayout(false);
+                }
                 std::wstring wideTable = L"|";
                 for (int column = 0; column < 16; ++column)
                     wideTable += L" column " + std::to_wstring(column) + L" |";
@@ -2636,6 +3220,13 @@ In the **three-dot menu**:
                 resetLayout(false);
                 jump(doc->blocks.front().cells.back().start);
                 check(horizontal > 0, "search_reveals_match_in_horizontally_scrolled_table");
+                auto arrow = LoadCursorW(nullptr, IDC_ARROW), ibeam = LoadCursorW(nullptr, IDC_IBEAM);
+                check(scrollbarAt(30, height + 6) == 2 && documentCursor(30, height + 6) == arrow,
+                      "horizontal_scrollbar_uses_arrow_cursor");
+                check(documentCursor(30, top + 20) == ibeam, "document_text_keeps_selection_cursor");
+                scrollDrag = 2;
+                check(documentCursor(30, top + 20) == arrow, "scrollbar_drag_keeps_arrow_outside_track");
+                scrollDrag = 0;
                 horizontal = 0;
                 auto savedCaret = caret;
                 key(VK_RIGHT);
@@ -2701,6 +3292,52 @@ In the **three-dot menu**:
             }
             zoomBy(1.2f);
             check(zoom > 1.19f, "zoom");
+            {
+                auto original = doc;
+                std::wstring paragraphs;
+                for (int i = 0; i < 100; ++i)
+                    paragraphs += L"A short paragraph for zoom layout measurement.\n\n";
+                doc = std::make_shared<Document>(parse(std::move(paragraphs)));
+                resetLayout(false);
+                bool stable = true;
+                for (bool sourceView : {false, true}) {
+                    source = sourceView;
+                    if (source)
+                        rawBlocks = sourceBlocks(doc->source);
+                    resetLayout(false);
+                    for (float factor : {.5f, .9f, 1.1f, 1.3f, 2.f, 3.f}) {
+                        for (bool atEnd : {false, true}) {
+                            zoomBy(factor == 3.f ? 2.9f : factor + .1f);
+                            scroll = atEnd ? heights.total() : 0;
+                            bars();
+                            zoomBy(factor);
+                            RedrawWindow(canvas, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+                            double firstHeight = heights.total();
+                            auto firstThumb = verticalThumb();
+                            for (int i = 0; i < 20; ++i)
+                                timer();
+                            RedrawWindow(canvas, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+                            auto settledThumb = verticalThumb();
+                            stable &= std::abs(heights.total() - firstHeight) < .001 &&
+                                      std::abs(firstThumb.top - settledThumb.top) < .001f &&
+                                      std::abs(firstThumb.bottom - settledThumb.bottom) < .001f;
+                        }
+                    }
+                }
+                check(stable, "zoom_scrollbar_is_stable_after_first_frame");
+                maxWidth = width + .001f;
+                bars();
+                check(maxWidth <= width && horizontal == 0,
+                      "subpixel_overflow_does_not_show_horizontal_scrollbar");
+                maxWidth = width + 100;
+                horizontal = 50;
+                bars();
+                check(maxWidth > width && horizontal == 50, "real_horizontal_overflow_remains_scrollable");
+                source = false;
+                rawBlocks.clear();
+                doc = std::move(original);
+                zoomBy(1.2f);
+            }
             {
                 RECT client;
                 GetClientRect(hwnd, &client);
@@ -2780,6 +3417,20 @@ In the **three-dot menu**:
             zoomBy(1);
             showSearch();
             {
+                unsigned forwarded = 0;
+                RemoveWindowSubclass(search, childProc, 1);
+                SetWindowSubclass(search, searchCharProbe, 2, (DWORD_PTR)&forwarded);
+                SetWindowSubclass(search, childProc, 1, (DWORD_PTR)this);
+                auto before = findGeneration;
+                SendMessageW(search, WM_CHAR, L'\r', 0);
+                SendMessageW(search, WM_CHAR, L'\n', 0);
+                check(forwarded == 0 && before == findGeneration,
+                      "search_enter_characters_never_reach_beeping_native_edit_or_navigate_twice");
+                SendMessageW(search, WM_CHAR, L'Z', 0);
+                check(forwarded == 1, "search_printable_characters_still_reach_native_edit");
+                RemoveWindowSubclass(search, searchCharProbe, 2);
+            }
+            {
                 RECT input, control;
                 GetWindowRect(search, &input);
                 GetWindowRect(buttons[0], &control);
@@ -2793,24 +3444,128 @@ In the **three-dot menu**:
             find(false);
             break;
         case 4:
-            if (!searchMatch) {
+            if (!searchMatch || !countReady) {
                 --verifyStage;
                 return;
             }
             check(caret > anchor && doc->text.substr(anchor, caret - anchor) == L"Voltura", "async_search");
             {
+                std::atomic_bool cancel = false;
+                auto expected = countMatches(doc->text, L"Voltura", 0, cancel).total;
+                check(searchTotal == expected && searchStatus == L"1 of " + std::to_wstring(expected),
+                      "background_count_shows_current_match_and_total");
+                check(showSearchHint() == (expected > 1 && searchBoxWidth() >= 350),
+                      "search_shortcut_hint_only_for_multiple_hits_with_room");
+                verificationCountGeneration = countGeneration;
+                find(true);
+            }
+            break;
+        case 5:
+            if (!searchMatch || searchIndex != 1) {
+                --verifyStage;
+                return;
+            }
+            check(countReady && countGeneration == verificationCountGeneration &&
+                      searchStatus ==
+                          std::to_wstring(searchTotal > 1 ? 2 : 1) + L" of " + std::to_wstring(searchTotal),
+                  "next_match_updates_ordinal_without_recounting");
+            find(true, true);
+            break;
+        case 6:
+            if (searchIndex != 0) {
+                --verifyStage;
+                return;
+            }
+            check(countGeneration == verificationCountGeneration &&
+                      searchStatus == L"1 of " + std::to_wstring(searchTotal),
+                  "previous_match_updates_ordinal_without_recounting");
+            {
+                auto savedAnchor = anchor, savedCaret = caret;
+                auto savedScroll = scroll;
+                countResult(std::make_unique<CountResult>(
+                    CountResult{countGeneration - 1, generation, source, {999, 0}, false}));
+                check(searchTotal != 999 && anchor == savedAnchor && caret == savedCaret &&
+                          scroll == savedScroll,
+                      "stale_count_cannot_change_current_search_or_position");
+            }
+            {
                 auto staleGeneration = findGeneration;
+                auto staleCountGeneration = countGeneration;
                 SetWindowTextW(search, L"");
                 find(false);
                 searchResult(
                     std::make_unique<SearchResult>(SearchResult{staleGeneration, generation, source, 0, 7}));
-                check(!searchMatch && anchor == 0 && caret == 0, "cleared_search_rejects_pending_result");
+                countResult(std::make_unique<CountResult>(
+                    CountResult{staleCountGeneration, generation, source, {12, 0}, false}));
+                check(!searchMatch && anchor == 0 && caret == 0 && searchStatus.empty(),
+                      "cleared_search_rejects_pending_result");
                 auto dismissedGeneration = findGeneration;
                 key(VK_ESCAPE);
                 searchResult(std::make_unique<SearchResult>(
                     SearchResult{dismissedGeneration, generation, source, -1, 7}));
                 check(!searching && notice != L"No matches" && findGeneration != dismissedGeneration,
                       "dismissed_search_rejects_pending_result");
+            }
+            {
+                countCancel = std::make_shared<std::atomic_bool>(false);
+                countStarted = countReady = true;
+                searchTotal = 12;
+                searchMatch = true;
+                searchIndex = 2;
+                refreshSearchStatus();
+                check(searchStatus == L"3 of 12", "search_status_formats_current_and_total");
+                searchIndex = 12;
+                refreshSearchStatus();
+                check(searchStatus == L"1 of 12", "search_status_wraps_forward");
+                searchIndex = -1;
+                refreshSearchStatus();
+                check(searchStatus == L"12 of 12", "search_status_wraps_backwards");
+                auto savedWidth = width;
+                width = 460;
+                check(!showSearchHint(), "shortcut_hint_yields_space_in_narrow_window");
+                width = savedWidth;
+                searchTotal = 1;
+                check(!showSearchHint(), "shortcut_hint_hidden_for_single_match");
+                cancelSearch();
+                searchResult(
+                    std::make_unique<SearchResult>(SearchResult{findGeneration, generation, source, -1, 7}));
+                check(searchStatus == L"0 of 0" && !searchMatch && !showSearchHint(),
+                      "no_results_show_zero_count_without_shortcut_hint");
+                cancelSearch();
+            }
+            {
+                auto original = doc;
+                auto savedRaw = std::move(rawBlocks);
+                auto savedZoom = zoom;
+                doc = std::make_shared<Document>(parse(L"```\n" + std::wstring(40, L'\n') + L"target\n" +
+                                                       std::wstring(100, L'\n') + L"```\n"));
+                for (bool raw : {false, true}) {
+                    source = raw;
+                    if (raw)
+                        rawBlocks = sourceBlocks(doc->source);
+                    for (float factor : {.5f, 1.f, 3.f}) {
+                        zoom = factor;
+                        resetLayout(false);
+                        uint32_t position = (uint32_t)text().find(L"target");
+                        auto index = blockAtPosition(blocks(), position);
+                        auto &l = layout(index);
+                        auto &part = l.parts.front();
+                        FLOAT x, y;
+                        DWRITE_HIT_TEST_METRICS metrics{};
+                        part.layout->HitTestTextPosition(position - part.start, FALSE, &x, &y, &metrics);
+                        jump(position, true);
+                        double gap = heights.before(index) + part.y + y - scroll;
+                        check(std::abs(gap - 2 * metrics.height) < .01,
+                              "search_match_keeps_two_rows_of_context_at_each_zoom");
+                        jump(part.start, true);
+                        check(scroll == 0, "first_line_match_clamps_context_to_document_start");
+                    }
+                }
+                doc = original;
+                source = false;
+                rawBlocks = std::move(savedRaw);
+                zoom = savedZoom;
+                resetLayout(false);
             }
             searchMatch = false;
             anchor = caret = 0;
@@ -2851,6 +3606,10 @@ In the **three-dot menu**:
                   "scroll_bounds");
             auto thumb = verticalThumb();
             check(std::isfinite(thumb.top) && thumb.bottom >= thumb.top, "themed_thumb_geometry");
+            check(heights.total() <= height - top - bottom ||
+                      (scrollbarAt(width + 6, top + 10) == 1 &&
+                       documentCursor(width + 6, top + 10) == LoadCursorW(nullptr, IDC_ARROW)),
+                  "vertical_scrollbar_uses_arrow_cursor");
             {
                 auto samples = paintTimes;
                 std::sort(samples.begin(), samples.end());
@@ -2877,9 +3636,13 @@ In the **three-dot menu**:
             break;
         }
     }
+#endif
     void close() {
         stopScrolling();
         closing = true;
+        KillTimer(hwnd, 16);
+        KillTimer(hwnd, 17);
+        associationResult.reset();
         finishRenderer();
         for (auto &w : workers)
             w.cancel->store(true);
@@ -2892,8 +3655,13 @@ In the **three-dot menu**:
             delete (LoadedDocument *)message.lParam;
         while (PeekMessageW(&message, hwnd, WM_APP + 3, WM_APP + 3, PM_REMOVE))
             delete (SearchResult *)message.lParam;
+        while (PeekMessageW(&message, hwnd, WM_APP + 5, WM_APP + 5, PM_REMOVE))
+            delete (CountResult *)message.lParam;
         images.reset();
-        if (!selfTest) {
+#ifdef VMD_TESTING
+        if (!selfTest)
+#endif
+        {
             prefs.zoom = informationView ? informationView->zoom : zoom;
             if (fullscreen)
                 prefs.placement = saved;
@@ -2916,6 +3684,19 @@ In the **three-dot menu**:
         case WM_CREATE:
             initialise();
             return 0;
+        case ScheduleAssociation:
+            if (associationPhase == AssociationPhase::Posted && !closing) {
+                if (loading || wp != generation || associationReadyGeneration != generation) {
+                    associationPhase = AssociationPhase::WaitingForPaint;
+                    if (!loading)
+                        invalidate();
+                    return 0;
+                }
+                associationPhase = AssociationPhase::Delay;
+                SetTimer(hwnd, 16, 3000, nullptr);
+                VMD_TEST_ONLY(associationTrace("delay_started");)
+            }
+            return 0;
         case WM_PAINT:
             paintHeader();
             return 0;
@@ -2923,6 +3704,7 @@ In the **three-dot menu**:
             return 1;
         case WM_MOVE:
             positionZoomOverlay();
+            positionAssociation();
             return 0;
         case WM_SIZE:
             if (wp == SIZE_MINIMIZED)
@@ -2997,6 +3779,9 @@ In the **three-dot menu**:
         case Loaded:
             loaded(std::unique_ptr<LoadedDocument>((LoadedDocument *)lp));
             return 0;
+        case WM_APP + 5:
+            countResult(std::unique_ptr<CountResult>((CountResult *)lp));
+            return 0;
         case WM_APP + 3:
             searchResult(std::unique_ptr<SearchResult>((SearchResult *)lp));
             return 0;
@@ -3012,6 +3797,25 @@ In the **three-dot menu**:
             return 0;
         }
         case WM_TIMER:
+            if (wp == 16) {
+                KillTimer(hwnd, 16);
+                if (associationPhase == AssociationPhase::Delay) {
+#ifdef VMD_TESTING
+                    if (testAssociation == L"defer" && generation == 1)
+                        open(pendingPath);
+#endif
+                    if (loading || associationReadyGeneration != generation) {
+                        associationPhase = AssociationPhase::WaitingForPaint;
+                        VMD_TEST_ONLY(associationTrace("deferred");)
+                    } else
+                        startAssociationWork();
+                }
+                return 0;
+            }
+            if (wp == 17) {
+                pollAssociation();
+                return 0;
+            }
             if (wp == 15) {
                 promoteHardware();
                 return 0;
@@ -3034,7 +3838,9 @@ In the **three-dot menu**:
                 RECT spinner{(LONG)(24 * scale()), (LONG)(25 * scale()), (LONG)(48 * scale()),
                              (LONG)(49 * scale())};
                 InvalidateRect(hwnd, &spinner, FALSE);
-            } else if (wp == 9) {
+            }
+#ifdef VMD_TESTING
+            else if (wp == 9) {
                 KillTimer(hwnd, 9);
                 requestClose();
             } else if (wp == 13) {
@@ -3087,6 +3893,7 @@ In the **three-dot menu**:
                 ++loadingHeartbeatSamples;
             } else if (wp == 10)
                 verifyUi();
+#endif
             else if (wp == 11)
                 zoomFade();
             else if (wp == 12) {
@@ -3183,8 +3990,7 @@ In the **three-dot menu**:
             float x = GET_X_LPARAM(lp) / scale(), y = GET_Y_LPARAM(lp) / scale();
             SetFocus(hwnd);
             stopScrolling();
-            if (doc && x >= width && y >= top && y <= height - bottom &&
-                heights.total() > height - top - bottom) {
+            if (scrollbarAt(x, y) == 1) {
                 auto r = verticalThumb();
                 if (y < r.top || y > r.bottom) {
                     scroll += (y < r.top ? -1 : 1) * (height - top - bottom);
@@ -3198,7 +4004,7 @@ In the **three-dot menu**:
                 invalidate();
                 return 0;
             }
-            if (doc && y >= height && maxWidth > width) {
+            if (scrollbarAt(x, y) == 2) {
                 auto r = horizontalThumb();
                 if (x < r.left || x > r.right) {
                     horizontal += (x < r.left ? -1 : 1) * width * .8f;
@@ -3239,6 +4045,8 @@ In the **three-dot menu**:
                 SetTimer(hwnd, 2, 1800, nullptr);
             }
             float x = GET_X_LPARAM(lp) / scale(), y = GET_Y_LPARAM(lp) / scale();
+            // Captured mouse movement does not reliably generate WM_SETCURSOR.
+            SetCursor(documentCursor(x, y));
             if (scrollDrag == 1) {
                 auto r = verticalThumb();
                 scroll = dragScroll + (y - dragStart) *
@@ -3339,13 +4147,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     int argc = 0;
     auto args = CommandLineToArgvW(GetCommandLineW(), &argc);
     std::filesystem::path path;
+#ifdef VMD_TESTING
     UINT exitAfter = 0;
+#endif
     bool configureDefaults = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = args[i];
         if (a == L"--configure-defaults")
             configureDefaults = true;
-        else if (a == L"--verify-close-fullscreen")
+#ifdef VMD_TESTING
+        else if (a == L"--test-association" && i + 1 < argc) {
+            app.testAssociation = args[++i];
+            app.selfTest = true;
+        } else if (a == L"--verify-close-fullscreen")
             app.verifyCloseFullscreen = true;
         else if (a == L"--metrics" && i + 1 < argc)
             app.metricsFile = args[++i];
@@ -3374,6 +4188,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             app.selfTest = true;
         } else if (a == L"--no-preferences")
             app.selfTest = true;
+#endif
         else if (!a.starts_with(L"--"))
             path = a;
     }
@@ -3404,20 +4219,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         CoUninitialize();
         return 1;
     }
-    app.startupPhase("window_created");
+    VMD_TEST_ONLY(app.startupPhase("window_created");)
     if (!path.empty())
         app.open(path);
     if (app.launchedWithFile && app.prefs.startFullscreen)
         app.toggleFullscreen();
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
-    app.startupPhase("window_shown");
+    VMD_TEST_ONLY(app.startupPhase("window_shown");)
+#ifdef VMD_TESTING
     if (!app.metricsFile.empty()) {
         app.heartbeatAt = std::chrono::steady_clock::now();
         SetTimer(hwnd, 14, 16, nullptr);
     }
     if (exitAfter)
         SetTimer(hwnd, 9, exitAfter, nullptr);
+#endif
     MSG message;
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && GetFocus() != hwnd) {
@@ -3432,5 +4249,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         DispatchMessageW(&message);
     }
     CoUninitialize();
+#ifdef VMD_TESTING
     return app.scrollBenchmark && !app.checksPassed ? 1 : 0;
+#else
+    return 0;
+#endif
 }

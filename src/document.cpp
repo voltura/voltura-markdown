@@ -4,7 +4,9 @@ extern "C" {
 #include "entity.h"
 }
 #include <algorithm>
+#ifdef VMD_TESTING
 #include <chrono>
+#endif
 #include <cwctype>
 #include <fstream>
 #include <memory>
@@ -693,7 +695,9 @@ struct Parser {
 };
 } // namespace
 Document parse(std::wstring source, const std::atomic_bool *cancel, unsigned flags) {
+#ifdef VMD_TESTING
     auto begin = std::chrono::steady_clock::now();
+#endif
     if (source.size() > 500000000)
         throw std::runtime_error("Document exceeds the 500 million character safety limit.");
     Parser p{};
@@ -822,14 +826,18 @@ Document parse(std::wstring source, const std::atomic_bool *cancel, unsigned fla
         }
         p.doc.blocks = std::move(bounded);
     }
+#ifdef VMD_TESTING
     p.doc.parseMs =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+#endif
     return std::move(p.doc);
 }
 Document loadSource(const std::filesystem::path &path, const std::atomic_bool *cancel) {
     if (cancel && cancel->load())
         throw std::runtime_error("Cancelled");
+#ifdef VMD_TESTING
     auto begin = std::chrono::steady_clock::now();
+#endif
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f)
         throw std::runtime_error("The file could not be opened.");
@@ -858,7 +866,9 @@ Document loadSource(const std::filesystem::path &path, const std::atomic_bool *c
     if (doc.source.size() > 500000000)
         throw std::runtime_error("Document exceeds the 500 million character safety limit.");
     doc.path = path;
+#ifdef VMD_TESTING
     doc.readMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+#endif
     return doc;
 }
 Document load(const std::filesystem::path &path, const std::atomic_bool *cancel) {
@@ -866,7 +876,9 @@ Document load(const std::filesystem::path &path, const std::atomic_bool *cancel)
     auto doc = parse(std::move(source.source), cancel);
     doc.path = std::move(source.path);
     doc.encoding = std::move(source.encoding);
+#ifdef VMD_TESTING
     doc.readMs = source.readMs;
+#endif
     return doc;
 }
 size_t blockAtPosition(const std::deque<Block> &blocks, uint32_t position) {

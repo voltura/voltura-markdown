@@ -2,6 +2,12 @@
 
 ## 1.1.1 — 2026-10-17
 
+- Prevents scrollbar flicker when changing zoom.
+- Avoids horizontal scrolling into empty centering margins and uses the arrow cursor over scrollbars.
+- Shows the current search match and total, with navigation hints when there are multiple hits and room to display them.
+- Leaves two text lines of context above search matches where space permits, and fixes the search field's right edge.
+- Excludes test options, verification routines, failure injection, and timing instrumentation from the production executable.
+- Prevents the Windows beep when Enter or Shift+Enter navigates search results.
 - Starts in a normal window when launched without a document.
 - Opens the app's Default apps settings directly on supported Windows versions, with Windows confirmation for .md files.
 - Clearer installer welcome and completion text.

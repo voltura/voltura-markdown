@@ -6,7 +6,7 @@ A fast, compact, read-only Markdown reader for Windows 10/11 x64. One portable e
 
 ## Download
 
-Visit the [product website](https://voltura.github.io/voltura-markdown/) or open [Releases](https://github.com/voltura/voltura-markdown/releases) and choose an asset:
+Visit the [product website](https://markdown.voltura.se/) or open [Releases](https://github.com/voltura/voltura-markdown/releases) and choose an asset:
 
 | Download | Use |
 | --- | --- |

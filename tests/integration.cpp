@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <shellapi.h>
+#include <shlwapi.h>
 #include <stdexcept>
 #include <thread>
 #include <wincodec.h>
@@ -61,6 +62,37 @@ int main() {
         okay &= RegGetValueW(hive, L"Software\\Classes\\Voltura.Markdown\\shell\\open\\command", nullptr,
                              RRF_RT_REG_SZ, nullptr, command, &size) == ERROR_SUCCESS;
         okay &= std::wstring(command).ends_with(L"\" \"%1\"");
+        HKEY classes = nullptr;
+        require(RegOpenKeyExW(hive, L"Software\\Classes", 0, KEY_ALL_ACCESS, &classes) == ERROR_SUCCESS,
+                "isolated association classes");
+        require(RegOverridePredefKey(HKEY_CLASSES_ROOT, classes) == ERROR_SUCCESS, "isolated HKCR override");
+        wchar_t resolved[32768]{};
+        DWORD resolvedSize = (DWORD)std::size(resolved);
+        okay &= SUCCEEDED(AssocQueryStringW(ASSOCF_INIT_FIXED_PROGID | ASSOCF_NOFIXUPS, ASSOCSTR_COMMAND,
+                                            L"Voltura.Markdown", L"open", resolved, &resolvedSize));
+        okay &= std::wstring(resolved) == command;
+        HKEY openCommand = nullptr;
+        require(RegOpenKeyExW(classes, L"Voltura.Markdown\\shell\\open\\command", 0, KEY_SET_VALUE,
+                              &openCommand) == ERROR_SUCCESS,
+                "isolated command key");
+        const wchar_t moved[] = L"\"C:\\Missing portable copy\\vmd.exe\" \"%1\"";
+        RegSetValueExW(openCommand, nullptr, 0, REG_SZ, (const BYTE *)moved, sizeof(moved));
+        RegCloseKey(openCommand);
+        resolvedSize = (DWORD)std::size(resolved);
+        okay &= SUCCEEDED(AssocQueryStringW(ASSOCF_INIT_FIXED_PROGID | ASSOCF_NOFIXUPS, ASSOCSTR_COMMAND,
+                                            L"Voltura.Markdown", L"open", resolved, &resolvedSize));
+        okay &= std::wstring(resolved) == moved;
+        require(RegCreateKeyExW(classes, L"Applications\\vmd.exe\\shell\\open\\command", 0, nullptr, 0,
+                                KEY_SET_VALUE, nullptr, &openCommand, nullptr) == ERROR_SUCCESS,
+                "isolated Open with command");
+        RegSetValueExW(openCommand, nullptr, 0, REG_SZ, (const BYTE *)moved, sizeof(moved));
+        RegCloseKey(openCommand);
+        resolvedSize = (DWORD)std::size(resolved);
+        okay &= SUCCEEDED(AssocQueryStringW(ASSOCF_INIT_BYEXENAME | ASSOCF_NOFIXUPS, ASSOCSTR_COMMAND,
+                                            L"vmd.exe", L"open", resolved, &resolvedSize));
+        okay &= std::wstring(resolved) == moved;
+        RegOverridePredefKey(HKEY_CLASSES_ROOT, nullptr);
+        RegCloseKey(classes);
         registerApplication(true, false);
         HKEY probe = nullptr;
         okay &= RegOpenKeyExW(hive, L"Software\\Classes\\Voltura.Markdown", 0, KEY_READ, &probe) ==
@@ -71,6 +103,41 @@ int main() {
         RegCloseKey(hive);
         RegDeleteTreeW(HKEY_CURRENT_USER, root.c_str());
         require(okay, "isolated file association roundtrip");
+        const std::filesystem::path current = LR"(C:\Readers\Voltura Markdown\vmd.exe)";
+        auto association = [&](std::wstring_view prog, std::wstring_view command) {
+            return classifyMarkdownAssociation(prog, command, current);
+        };
+        require(association(L"Voltura.Markdown", LR"("C:\Readers\Voltura Markdown\vmd.exe" "%1")") ==
+                    MarkdownAssociation::Matching,
+                "association matches quoted executable");
+        require(association(L"voltura.markdown",
+                            LR"("c:/READERS/Voltura Markdown/../Voltura Markdown/vmd.exe" "%1")") ==
+                    MarkdownAssociation::Matching,
+                "association normalizes case separators and parent segments");
+        require(association(L"Voltura.Markdown", LR"("\\?\C:\Readers\Voltura Markdown\vmd.exe" "%1")") ==
+                    MarkdownAssociation::Matching,
+                "association normalizes extended path prefix");
+        require(association(L"Voltura.Markdown", LR"("C:\Missing old copy\vmd.exe" "%1")") ==
+                    MarkdownAssociation::Mismatch,
+                "association retains missing executable target");
+        require(classifyMarkdownAssociation(L"Voltura.Markdown", LR"("C:\Läsare\日本語\vmd.exe" "%1")",
+                                            LR"(C:\Läsare\日本語\vmd.exe)") == MarkdownAssociation::Matching,
+                "association preserves Unicode executable paths");
+        wchar_t running[32768]{};
+        GetModuleFileNameW(nullptr, running, (DWORD)std::size(running));
+        require(association(L"Voltura.Markdown", L"\"" + std::wstring(running) + L"\" \"%1\"") ==
+                    MarkdownAssociation::Mismatch,
+                "association warns for another existing executable");
+        require(association(L"Applications\\vmd.exe", LR"("C:\Old\vmd.exe" "%1")") ==
+                    MarkdownAssociation::Mismatch,
+                "association recognizes Windows Open with registration");
+        for (auto command : {L"", L"vmd.exe \"%1\"", L"C:\\Program Files\\vmd.exe \"%1\"",
+                             L"\"C:\\Readers\\bad.txt\" \"%1\""})
+            require(association(L"Voltura.Markdown", command) == MarkdownAssociation::Unknown,
+                    "inconclusive association stays quiet");
+        require(association(L"Other.Markdown", LR"("C:\Old\vmd.exe" "%1")") == MarkdownAssociation::Other,
+                "another default application stays quiet");
+        require(association(L"", L"") == MarkdownAssociation::Unknown, "no default stays quiet");
         temp = std::filesystem::temp_directory_path() /
                (L"VolturaMarkdownTests-" + std::to_wstring(GetCurrentProcessId()));
         std::filesystem::create_directories(temp);

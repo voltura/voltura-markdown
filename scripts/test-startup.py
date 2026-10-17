@@ -35,7 +35,7 @@ def window_for(pid):
 
 
 for with_document in (False, True):
-    args = [str(root / "build/Release/vmd.exe"), "--no-preferences"]
+    args = [str(root / "build/Release/vmd-test.exe"), "--no-preferences"]
     if with_document:
         args.append(str(root / "tests/showcase.md"))
     process = subprocess.Popen(args)

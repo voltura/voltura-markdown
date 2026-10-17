@@ -8,11 +8,11 @@ python scripts/commonmark.py
 python scripts/verify-package.py
 ```
 
-The build script compiles the x64 Release build, runs CTest, and copies the standalone executable to `dist/vmd.exe`. Build intermediates and test executables in `build/Release` are not distribution files. Python is needed only for optional verification/benchmark tooling. Pillow is needed only to regenerate or inspect icon artwork.
+The build script compiles the x64 Release build, runs CTest, and copies the standalone executable to `dist/vmd.exe`. The production target does not define `VMD_TESTING`: test options, verification routines, failure injection, diagnostic logs, and timing measurements are excluded at compile time. A separate optimized `build/Release/vmd-test.exe` and parser library define `VMD_TESTING` for verification and performance measurements. They are never copied to `dist/` or installed. Build intermediates and test executables are not distribution files. Python is needed only for optional verification/benchmark tooling and enables the production package check in CTest. Pillow is needed only to regenerate or inspect icon artwork.
 
 ```powershell
 python scripts/benchmark.py
-.\build\Release\vmd.exe "$PWD\tests\showcase.md" --verify-ui "$PWD\build\ui-checks.jsonl" --exit-after 20000
+.\build\Release\vmd-test.exe "$PWD\tests\showcase.md" --verify-ui "$PWD\build\ui-checks.jsonl" --exit-after 20000
 ```
 
 Benchmarks write generated documents and JSON measurements under `build/bench`. UI verification uses a temporary in-process preference state and leaves saved preferences unchanged. See [Performance](../PERFORMANCE.md) for measurements and coverage.
@@ -59,8 +59,12 @@ See [Compatibility](COMPATIBILITY.md#platform) for outstanding environment check
 
 ## Display and startup validation
 
+The association test covers delayed detection, loading deferral, keyboard access, dismissal, action failure, and closing during a stalled probe. It uses test results instead of changing real defaults and verifies the user's registration stays unchanged. With Pillow installed, it also captures the notice in both themes under `build/`.
+
 ```powershell
 python scripts/test-startup.py
+python scripts/test-association.py
+python scripts/test-search.py --document PERFORMANCE.md --query ms --capture
 .\scripts\test-display.ps1
 .\scripts\test-display.ps1 -CloseFullscreen
 .\scripts\test-display.ps1 -Scroll -Document .\build\bench\10485760.md

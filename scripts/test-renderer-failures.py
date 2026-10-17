@@ -25,7 +25,7 @@ for failure in ("preparation", "first-frame"):
         checks = folder / (name + "-checks.jsonl")
         document = root / "tests/showcase.md" if mode == "ui" else scroll_document
         command = [
-            str(root / "build/Release/vmd.exe"),
+            str(root / "build/Release/vmd-test.exe"),
             str(document),
             "--staged-renderer",
             "--test-renderer-fail-" + failure,

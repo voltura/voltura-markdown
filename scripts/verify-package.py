@@ -11,6 +11,30 @@ import sys
 root = pathlib.Path(__file__).resolve().parents[1]
 exe = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else root / "dist/vmd.exe"
 data = exe.read_bytes()
+test_markers = (
+    "--verify-ui",
+    "--metrics",
+    "--benchmark",
+    "--scroll-benchmark",
+    "--no-preferences",
+    "--exit-after",
+    "--test-association",
+    "--test-renderer-fail-preparation",
+    "--test-renderer-fail-first-frame",
+    "--hardware-renderer",
+    "--staged-renderer",
+    "--benchmark-animations",
+    "--verify-close-fullscreen",
+    "search_match_paint_ms",
+    "first_content_ms",
+    "failure_injection",
+    "formatted_default",
+    "search_match_keeps_two_rows_of_context_at_each_zoom",
+)
+for marker in test_markers:
+    assert all(
+        marker.encode(encoding) not in data for encoding in ("utf-8", "utf-16-le")
+    ), f"Test instrumentation in production executable: {marker}"
 pe = struct.unpack_from("<I", data, 0x3C)[0]
 assert data[pe : pe + 4] == b"PE\0\0", "Not a Windows executable"
 _, sections, _, _, _, optional_size, _ = struct.unpack_from("<HHIIIHH", data, pe + 4)

@@ -29,7 +29,26 @@ The repository must already exist. Install Git/GitHub CLI and configure authenti
 
 `-Publish` uses an isolated checkout under `build/pages-publish`, preserves existing `gh-pages` history and `CNAME`, pushes without force, then configures [branch-based Pages](https://docs.github.com/en/rest/pages/pages) at `gh-pages:/`. It never switches the main checkout's branch. No project GitHub Actions workflow is required. A concurrent push is rejected normally; review and rerun rather than force-pushing.
 
-If Pages settings fail after the branch push, inspect the error and **Settings → Pages**. Verify the public URL and both downloads once deployment completes. Publication has not been performed during development.
+If Pages settings fail after the branch push, inspect the error and **Settings → Pages**. Verify the public URL and both downloads once deployment completes.
+
+## Custom domain
+
+The public product address is [https://markdown.voltura.se/](https://markdown.voltura.se/). GitHub Pages serves the existing `gh-pages:/` site directly at this hostname; one.com manages its DNS.
+
+| Setting | Value |
+| --- | --- |
+| GitHub Pages custom domain | `markdown.voltura.se` |
+| Published branch root `CNAME` file | `markdown.voltura.se` |
+| one.com DNS type | `CNAME` |
+| one.com hostname | `markdown` |
+| one.com target | `voltura.github.io` |
+| TTL | Provider default |
+
+The DNS target is a hostname without a scheme or repository path. Keep **Enforce HTTPS** enabled after GitHub provisions the custom-domain certificate. The previous `https://voltura.github.io/voltura-markdown/` address redirects to the custom domain.
+
+The publication script preserves the published branch's `CNAME`, so subsequent releases retain the custom domain. After publication, verify that file, the Pages domain and HTTPS settings, styles/artwork, and both downloads. DNS propagation and certificate provisioning can take time; confirm successful HTTPS before declaring the domain ready.
+
+For rollback, remove this hostname's DNS record before removing the GitHub Pages custom-domain binding. Preserve the apex, wildcard, email, and other product DNS records.
 
 ## Source map
 

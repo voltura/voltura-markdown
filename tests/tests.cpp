@@ -1,5 +1,6 @@
 #include "document.h"
 #include "md4c-html.h"
+#include "search.h"
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -50,6 +51,31 @@ int wmain(int argc, wchar_t **argv) {
                 << ",\"working_set_bytes\":" << memory.WorkingSetSize
                 << ",\"peak_working_set_bytes\":" << memory.PeakWorkingSetSize << "}\n";
             return 0;
+        }
+        {
+            std::atomic_bool cancel = false;
+            const std::wstring text = L"Ångström one åNGSTRÖM two Ångström";
+            auto count = countMatches(text, L"ångström", 13, cancel);
+            require(count.total == 3 && count.beforeStart == 1, "ordinal Unicode search count");
+            require(findMatch(text, L"ångström", 0, false, cancel) == 0, "first Unicode match");
+            require(findMatch(text, L"ångström", text.size(), false, cancel) == 0, "forward search wraps");
+            require(findMatch(text, L"ångström", 0, true, cancel) == 26, "backward search wraps");
+            require(countMatches(L"aaaaa", L"aa", 2, cancel).total == 4 &&
+                        findMatch(L"aaaaa", L"aa", 1, false, cancel) == 1,
+                    "overlapping matches count and navigate consistently");
+            require(countMatches(text, L"missing", 0, cancel).total == 0 &&
+                        countMatches(text, L"", 0, cancel).total == 0 &&
+                        findMatch(text, L"", 0, false, cancel) == -1,
+                    "empty and missing searches");
+            cancel = true;
+            require(countMatches(text, L"one", 0, cancel).total == 0 &&
+                        findMatch(text, L"one", 0, false, cancel) == -1,
+                    "cancelled search stops promptly");
+            cancel = false;
+            std::wstring dense(1024 * 1024, L'a');
+            require(findMatch(dense, L"a", 0, false, cancel) == 0 &&
+                        countMatches(dense, L"a", 0, cancel).total == dense.size(),
+                    "dense results use constant-size count state");
         }
         auto d = parse(
             L"# Hello &amp; world\n\nA **bold** and *italic* [link](https://example.com).\n\n> Quote\n\n- "

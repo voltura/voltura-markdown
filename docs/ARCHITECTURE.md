@@ -9,6 +9,7 @@ The reader is a native Windows process with one window per invocation. Its prior
 | File | Responsibility | Change it for |
 | --- | --- | --- |
 | [main.cpp](../src/main.cpp) | Application/window lifecycle, DirectWrite layouts, Direct2D canvas, selection/search, scrolling, themes, toolbar/menu, Help/About navigation | Reading interactions, controls, layout, painting, fullscreen, DPI |
+| [search.h](../src/search.h) | Shared ordinal case-insensitive search and constant-memory counting | Matching, wrapping, cancellation and total-count consistency |
 | [document.h](../src/document.h) / [document.cpp](../src/document.cpp) | Encodings, MD4C adapter, formatted text, blocks/runs/cells, source segmentation, safe HTML subset | Syntax, text/anchor model, encoding handling, parser bounds |
 | [images.h](../src/images.h) / [images.cpp](../src/images.cpp) | Background image queue/cache, local/HTTPS reads, WIC and NanoSVG decoding | Image formats, fetch/decode limits, caching |
 | [shell.h](../src/shell.h) / [shell.cpp](../src/shell.cpp) | Preferences, links, registration, clipboard/file actions, external app chooser, license text | Windows integration and persisted options |
@@ -17,7 +18,7 @@ The reader is a native Windows process with one window per invocation. Its prior
 | `scripts/installer.nsi` / `scripts/build-installer.ps1` | NSIS packaging, per-user install/upgrade/uninstall integration | Optional Windows Setup distribution |
 | [CMakeLists.txt](../CMakeLists.txt) | Targets, static runtime, system libraries, test registration | Build dependencies and packaging configuration |
 
-`vm::Document` retains original decoded source, rendered text, flat blocks, path/encoding metadata, and timings. `Block` references text ranges with style/link `Run` entries and table `Cell` entries. Blocks use segmented storage to avoid whole-document reallocation peaks. Ordinary text has no style record; image, language and anchor metadata allocate only when present. The flat structure avoids a native window/widget per Markdown element.
+`vm::Document` retains original decoded source, rendered text, flat blocks, path/encoding metadata. Timing fields exist only in the instrumented test build. `Block` references text ranges with style/link `Run` entries and table `Cell` entries. Blocks use segmented storage to avoid whole-document reallocation peaks. Ordinary text has no style record; image, language and anchor metadata allocate only when present. The flat structure avoids a native window/widget per Markdown element.
 
 ## Document flow
 
@@ -47,9 +48,9 @@ The toolbar/header and document canvas are separate windows. Native controls use
 
 Visible/nearby image blocks request `vm::Images` entries. Background workers fetch/decode with bounded work and cache limits, then notify the UI. Text interaction does not wait for image network or decoding work. WIC handles PNG/JPEG/GIF, and NanoSVG handles a restricted static SVG subset.
 
-Search also runs in the background and returns results through a window message. Opening a new file cancels obsolete work. Window destruction owns cleanup; do not leave workers targeting a destroyed window.
+Search also runs in the background and returns results through a window message. After the first highlighted frame is presented, a separate lower-priority worker counts hits using constant memory. Navigation keeps the total and advances the current ordinal without restarting that count. Independent query and navigation generations reject obsolete results. Opening a new file cancels obsolete work. Window destruction owns cleanup; do not leave workers targeting a destroyed window.
 
-The shell boundary owns optional per-user registration, file clipboard data, supported URL launching, Explorer, and the external-editor chooser. Default application selection remains with Windows Settings. Preferences are small per-user local data; self-test modes avoid changing normal preferences.
+The shell boundary owns optional per-user registration, file clipboard data, supported URL launching, Explorer, and the external-editor chooser. Default application selection remains with Windows Settings. Preferences are small per-user local data; the separate test executable can use temporary preferences. Production `vmd.exe` and its parser exclude test state, options, verification routines, failure injection and timing code with `VMD_TESTING` guards; `vmd-test.exe` and `markdown_test` explicitly enable those guards.
 
 ## Change and verification map
 
@@ -57,7 +58,7 @@ The shell boundary owns optional per-user registration, file clipboard data, sup
 | --- | --- |
 | Parsing/encoding/source fidelity | [tests.cpp](../tests/tests.cpp), [CommonMark runner](../scripts/commonmark.py), [compatibility guide](COMPATIBILITY.md) |
 | Images, registry, clipboard, Unicode paths | [integration.cpp](../tests/integration.cpp); registry tests use an isolated override |
-| Toolbar, search, scrolling, themes, fullscreen, Help/About | `--verify-ui`, [showcase fixture](../tests/showcase.md), actual light/dark display inspection |
+| Toolbar, search, scrolling, themes, fullscreen, Help/About | `vmd-test.exe --verify-ui`, [showcase fixture](../tests/showcase.md), actual light/dark display inspection |
 | Runtime/resources/icon/version | [package verifier](../scripts/verify-package.py), [artwork notes](../assets/ICON-NOTES.md), clean Windows execution |
 | Startup/layout/memory | [benchmark runner](../scripts/benchmark.py), [performance methodology](../PERFORMANCE.md), actual cold/warm conditions |
 

@@ -23,7 +23,7 @@ for document in args.documents:
         for staged in ([False, True] if iteration % 2 == 0 else [True, False]):
             metric = folder / f"{len(results)}.jsonl"
             command = [
-                str(root / "build/Release/vmd.exe"),
+                str(root / "build/Release/vmd-test.exe"),
                 str(document),
                 "--benchmark",
                 "--no-preferences",

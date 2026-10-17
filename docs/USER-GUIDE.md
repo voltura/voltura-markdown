@@ -29,11 +29,19 @@ The reader starts in a normal window without a document, and fullscreen when lau
 
 **Up/Down** scroll vertically. **Left/Right** scroll the whole document horizontally when wide tables or code extend beyond the window.
 
+Horizontal scrolling appears only when content extends beyond the viewport. Scrollbar tracks and dragging use the arrow cursor; document text uses the text-selection cursor.
+
 Double-click selects a word; Shift+arrows extends selection. Source copying retains the original decoded text and line endings. Formatted copying produces displayed plain text. Checkboxes and text are read-only.
 
-Zooming reveals **−, percentage, +** floating over the lower-right corner, inset from the scrollbars. The document keeps its full viewing area. Click the percentage to return to **100%**. The group fades away at 100% and follows fullscreen toolbar visibility.
+Zooming reveals **−, percentage, +** floating over the lower-right corner, inset from the scrollbars. The document keeps its full viewing area, and scrollbar sizes update with the zoomed content without a second adjustment from background layout. Click the percentage to return to **100%**. The group fades away at 100% and follows fullscreen toolbar visibility.
 
 Fullscreen controls hide after inactivity and return with pointer movement or keyboard focus. Change **Start fullscreen** in the three-dot menu. Theme, zoom, startup mode, and window placement are remembered.
+
+## Find text
+
+Press **Ctrl+F** and type a phrase. The first match appears without waiting for the total count. The count fills in afterward, for example **3 of 12**; **0 of 0** means no matches. Search is case-insensitive and counts overlapping occurrences consistently in both directions.
+
+Use **Enter** or **F3** for the next hit, and **Shift+Enter** or **Shift+F3** for the previous hit. Navigation wraps at either end. A shortcut hint appears below the field for multiple hits when the window has enough room. Matches keep about two text lines above them for context when preceding content and viewport space allow. **Escape** closes search.
 
 ## File actions
 
@@ -55,6 +63,8 @@ Setup installs for your account under `%LOCALAPPDATA%\Programs\Voltura Markdown`
 To use the reader for `.md` files, select Setup's optional **Choose as default Markdown reader**, or choose **Register for .md files** in the app. Both open the app's page in Windows Default apps where supported; otherwise, find **Voltura Markdown** in Default apps. Confirm it for **.md** files. No administrator rights are required. Keep a portable copy at a stable path and register again if you move it. **Unregister application** removes its registration.
 
 ## Troubleshooting
+
+If `.md` files point to Voltura Markdown at another location, a notice appears after the reader is ready. **Open Default apps** registers this copy's location and opens Windows Settings for you to confirm your choice. **Dismiss** hides the notice until the next launch. If moving the executable prevents files from opening, launch the app directly to see the notice.
 
 | Problem | Try |
 | --- | --- |

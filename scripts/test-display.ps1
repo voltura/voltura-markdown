@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$executable = Join-Path $repo 'build/Release/vmd.exe'
+$executable = Join-Path $repo 'build/Release/vmd-test.exe'
 $documentPath = (Resolve-Path -LiteralPath $Document).Path
 $output = Join-Path $repo ('build/display-test-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $output | Out-Null
@@ -30,7 +30,7 @@ try {
         }
         $presentMonPath = (Resolve-Path -LiteralPath $PresentMon).Path
         $trace = Start-Process -FilePath $presentMonPath -ArgumentList @(
-            '--process_name', 'vmd.exe', '--session_name', ('Voltura-' + [Guid]::NewGuid().ToString('N')),
+            '--process_name', 'vmd-test.exe', '--session_name', ('Voltura-' + [Guid]::NewGuid().ToString('N')),
             '--timed', '40', '--terminate_after_timed', '--no_console_stats',
             '--output_file', ('"' + (Join-Path $output 'frames.csv') + '"')
         ) -PassThru -WindowStyle Hidden

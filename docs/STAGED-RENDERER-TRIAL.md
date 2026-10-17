@@ -7,10 +7,10 @@ Software-first startup is the default in 1.1.0 for all document sizes. The measu
 Build with `scripts/build.ps1`, then launch:
 
 ```powershell
-.\dist\vmd.exe "C:\path\document.md" --staged-renderer
+.\build\Release\vmd-test.exe "C:\path\document.md" --staged-renderer
 ```
 
-Use `--hardware-renderer` only for diagnostic comparisons with hardware-first startup.
+These diagnostic switches are available only in `vmd-test.exe`; production `vmd.exe` always uses software-first startup. Use `--hardware-renderer` only for diagnostic comparisons with hardware-first startup.
 
 The first page uses software rendering. After that frame succeeds, a private background factory prepares the hardware target. The UI adopts it at the current window size and DPI. The document is not read or parsed again. Text layouts, selection and scroll state remain; image bitmaps are recreated for the new target.
 

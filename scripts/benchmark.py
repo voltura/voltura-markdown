@@ -26,7 +26,7 @@ if args.runs < 1 or any(size < 1 for size in args.sizes):
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 folder = ROOT / "build/bench"
 folder.mkdir(parents=True, exist_ok=True)
-app = ROOT / "build/Release/vmd.exe"
+app = ROOT / "build/Release/vmd-test.exe"
 parser = ROOT / "build/Release/reader_tests.exe"
 pattern = b"# Voltura performance\n\nA paragraph with **bold**, *emphasis*, Unicode: \xc3\xa5\xc3\xa4\xc3\xb6. Read, copy and scroll.\n\n- One\n- Two\n\n```cpp\nint value = 42;\n```\n\n"
 results = []

@@ -38,7 +38,9 @@ struct Document {
     std::filesystem::path path;
     std::wstring encoding;
     bool plainSource = false;
+#ifdef VMD_TESTING
     double readMs = 0, parseMs = 0;
+#endif
 };
 std::wstring fromUtf8(std::string_view s);
 std::string toUtf8(std::wstring_view s);

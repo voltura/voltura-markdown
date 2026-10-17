@@ -5,6 +5,7 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <vector>
+#include <wrl/client.h>
 namespace vm {
 bool copyText(HWND owner, std::wstring_view text) {
     HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t));
@@ -161,6 +162,75 @@ bool systemDark() {
                  L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size);
     return value == 0;
 }
+static bool sameText(std::wstring_view a, std::wstring_view b) {
+    return CompareStringOrdinal(a.data(), (int)a.size(), b.data(), (int)b.size(), TRUE) == CSTR_EQUAL;
+}
+static std::wstring normalizedExecutable(const std::filesystem::path &path) {
+    if (!path.is_absolute())
+        return {};
+    auto text = path.lexically_normal().wstring();
+    std::replace(text.begin(), text.end(), L'/', L'\\');
+    // Resolve short names when available, but retain missing targets for moved portable copies.
+    std::vector<wchar_t> full(32768);
+    auto size = GetLongPathNameW(text.c_str(), full.data(), (DWORD)full.size());
+    if (size && size < full.size())
+        text.assign(full.data(), size);
+    if (text.starts_with(L"\\\\?\\UNC\\"))
+        text = L"\\\\" + text.substr(8);
+    else if (text.starts_with(L"\\\\?\\"))
+        text.erase(0, 4);
+    return text;
+}
+MarkdownAssociation classifyMarkdownAssociation(std::wstring_view progId, std::wstring_view command,
+                                                const std::filesystem::path &currentExecutable) {
+    bool ownClass = sameText(progId, L"Voltura.Markdown");
+    bool executableClass = sameText(progId, L"Applications\\vmd.exe");
+    auto currentName = currentExecutable.filename().wstring();
+    executableClass |= sameText(progId, L"Applications\\" + currentName);
+    if (!ownClass && !executableClass)
+        return progId.empty() ? MarkdownAssociation::Unknown : MarkdownAssociation::Other;
+    if (command.empty())
+        return MarkdownAssociation::Unknown;
+    int count = 0;
+    auto args = CommandLineToArgvW(std::wstring(command).c_str(), &count);
+    if (!args)
+        return MarkdownAssociation::Unknown;
+    std::filesystem::path target = count ? args[0] : L"";
+    LocalFree(args);
+    auto registered = normalizedExecutable(target), current = normalizedExecutable(currentExecutable);
+    if (registered.empty() || current.empty() || !sameText(target.extension().wstring(), L".exe"))
+        return MarkdownAssociation::Unknown;
+    return sameText(registered, current) ? MarkdownAssociation::Matching : MarkdownAssociation::Mismatch;
+}
+MarkdownAssociation probeMarkdownAssociation() {
+    // Called only by the delayed worker. COM and all shell/path work stay off the UI thread.
+    auto initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(initialized))
+        return MarkdownAssociation::Unknown;
+    MarkdownAssociation result = MarkdownAssociation::Unknown;
+    {
+        Microsoft::WRL::ComPtr<IApplicationAssociationRegistration> associations;
+        PWSTR progId = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_ApplicationAssociationRegistration, nullptr,
+                                       CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&associations))) &&
+            SUCCEEDED(associations->QueryCurrentDefault(L".md", AT_FILEEXTENSION, AL_EFFECTIVE, &progId))) {
+            std::vector<wchar_t> exe(32768), command(32768);
+            auto size = GetModuleFileNameW(nullptr, exe.data(), (DWORD)exe.size());
+            DWORD length = (DWORD)command.size();
+            bool application = std::wstring_view(progId).size() > 13 &&
+                               sameText(std::wstring_view(progId).substr(0, 13), L"Applications\\");
+            auto flags = (application ? ASSOCF_INIT_BYEXENAME : ASSOCF_INIT_FIXED_PROGID) | ASSOCF_NOFIXUPS;
+            auto hr = AssocQueryStringW(flags, ASSOCSTR_COMMAND, application ? progId + 13 : progId, L"open",
+                                        command.data(), &length);
+            if (size && size < exe.size())
+                result = classifyMarkdownAssociation(progId, SUCCEEDED(hr) ? command.data() : L"",
+                                                     std::filesystem::path(exe.data()));
+        }
+        CoTaskMemFree(progId);
+    }
+    CoUninitialize();
+    return result;
+}
 static LONG value(const std::wstring &key, const wchar_t *name, const std::wstring &data) {
     HKEY k;
     LONG result =
@@ -235,12 +305,13 @@ std::wstring registerApplication(bool remove, bool integrateWithShell, bool *reg
            L"supported; otherwise, find Voltura Markdown in Default apps. Confirm it for .md files. "
            L"Keep the executable at this location, or register it again after moving it.";
 }
-void openDefaultSettings() {
+bool openDefaultSettings() {
     auto result =
         ShellExecuteW(nullptr, L"open", L"ms-settings:defaultapps?registeredAppUser=Voltura%20Markdown",
                       nullptr, nullptr, SW_SHOWNORMAL);
     if ((INT_PTR)result <= 32)
-        ShellExecuteW(nullptr, L"open", L"ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
+        result = ShellExecuteW(nullptr, L"open", L"ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
+    return (INT_PTR)result > 32;
 }
 std::filesystem::path markdownLinkPath(std::wstring_view link, const std::filesystem::path &base) {
     auto fragment = link.find(L'#');
@@ -280,7 +351,7 @@ std::wstring licenses() {
     std::wstring text = L"# Voltura Markdown\n\n**Version 1.1.1**\n\n"
                         L"A fast, read-only Markdown reader for Windows.\n\n"
                         L"## Created by\n\n- **Developer:** Joakim Skoglund\n"
-                        L"- **Company:** Voltura AB\n- **Website:** [voltura.se](https://voltura.se/)\n\n"
+                        L"- **Company:** Voltura AB\n- **Website:** [markdown.voltura.se](https://markdown.voltura.se/)\n\n"
                         L"## Help and navigation\n\n- <kbd>F1</kbd>: open Help for controls and shortcuts.\n"
                         L"- **Back arrow** / <kbd>Escape</kbd>: return to your reading position.\n\n"
                         L"## Open-source software\n\n"
