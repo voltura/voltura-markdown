@@ -50,5 +50,5 @@ Document loadSource(const std::filesystem::path &path, const std::atomic_bool *c
 Document load(const std::filesystem::path &path, const std::atomic_bool *cancel = nullptr);
 size_t blockAtPosition(const std::deque<Block> &blocks, uint32_t position);
 std::deque<Block> sourceBlocks(std::wstring_view source);
-std::wstring entity(std::wstring_view text);
+std::wstring entity(std::wstring_view text, const std::atomic_bool *cancel = nullptr);
 } // namespace vm

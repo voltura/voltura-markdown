@@ -14,6 +14,7 @@ Voltura Markdown's own application source, documentation, and current artwork ar
 
 - Source: [memononen/nanosvg](https://github.com/memononen/nanosvg).
 - Pinned revision: `239e102ec2c691f2902e20ace2ed36ee4a35cfe6`.
+- Local fixes bound CSS declaration parsing, prevent recursive structural properties, initialize malformed/singular transforms, and bound stroke-dash expansion with non-progress detection.
 - Vendored files: `third_party/nanosvg/`.
 - Copyright and complete zlib terms: [retained upstream license](third_party/nanosvg/LICENSE.txt).
 - Included in the application; its notice is embedded in About / open-source licenses.

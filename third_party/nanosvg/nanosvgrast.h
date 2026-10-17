@@ -122,6 +122,9 @@ typedef struct NSVGcachedPaint {
 
 struct NSVGrasterizer
 {
+	// Voltura: bound dash expansion across the whole image and report invalid work.
+	unsigned int dashBudget;
+	int failed;
 	float px, py;
 
 	float tessTol;
@@ -794,12 +797,16 @@ static void nsvg__flattenShapeStroke(NSVGrasterizer* r, NSVGshape* shape, float 
 				dashOffset += allDashLen;
 
 			while (dashOffset > shape->strokeDashArray[idash]) {
+				if (r->dashBudget == 0) { r->failed = 1; return; }
+				r->dashBudget--;
 				dashOffset -= shape->strokeDashArray[idash];
 				idash = (idash + 1) % shape->strokeDashCount;
 			}
 			dashLen = (shape->strokeDashArray[idash] - dashOffset) * scale;
 
 			for (j = 1; j < r->npoints2; ) {
+				if (r->dashBudget == 0) { r->failed = 1; return; }
+				r->dashBudget--;
 				float dx = r->points2[j].x - cur.x;
 				float dy = r->points2[j].y - cur.y;
 				float dist = sqrtf(dx*dx + dy*dy);
@@ -809,6 +816,10 @@ static void nsvg__flattenShapeStroke(NSVGrasterizer* r, NSVGshape* shape, float 
 					float d = (dashLen - totalDist) / dist;
 					float x = cur.x + dx * d;
 					float y = cur.y + dy * d;
+					if (dashLen > totalDist && x == cur.x && y == cur.y) {
+						r->failed = 1;
+						return;
+					}
 					nsvg__addPathPoint(r, x, y, NSVG_PT_CORNER);
 
 					// Stroke
@@ -1384,6 +1395,8 @@ void nsvgRasterize(NSVGrasterizer* r,
     unsigned char paintOrder;
 
 	r->bitmap = dst;
+	r->dashBudget = 100000;
+	r->failed = 0;
 	r->width = w;
 	r->height = h;
 	r->stride = stride;
@@ -1435,6 +1448,7 @@ void nsvgRasterize(NSVGrasterizer* r,
                 r->nedges = 0;
 
                 nsvg__flattenShapeStroke(r, shape, scale);
+                if (r->failed) goto cleanup;
 
     //			dumpEdges(r, "edge.svg");
 
@@ -1461,6 +1475,7 @@ void nsvgRasterize(NSVGrasterizer* r,
 
 	nsvg__unpremultiplyAlpha(dst, w, h, stride);
 
+cleanup:
 	r->bitmap = NULL;
 	r->width = 0;
 	r->height = 0;

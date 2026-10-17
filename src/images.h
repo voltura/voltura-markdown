@@ -9,6 +9,9 @@
 #include <unordered_map>
 #include <vector>
 #include <windows.h>
+#ifdef VMD_TESTING
+#include <functional>
+#endif
 namespace vm {
 struct Image {
     std::vector<unsigned char> pixels;
@@ -20,14 +23,27 @@ class Images {
     std::mutex mutex;
     std::condition_variable cv;
     std::atomic_bool stopping = false;
-    std::deque<std::pair<std::wstring, std::shared_ptr<Image>>> jobs;
+    struct Job {
+        std::wstring key;
+        std::shared_ptr<Image> pending;
+        std::shared_ptr<std::atomic_bool> cancel;
+    };
+    std::shared_ptr<std::atomic_bool> generationCancel = std::make_shared<std::atomic_bool>(false);
+    std::deque<Job> jobs;
     std::unordered_map<std::wstring, std::shared_ptr<Image>> cache;
     std::vector<std::thread> workers;
     void run();
+#ifdef VMD_TESTING
+    std::function<Image(const std::wstring &, const std::atomic_bool &)> testLoader;
+#endif
 
   public:
     explicit Images(HWND hwnd);
+#ifdef VMD_TESTING
+    Images(HWND hwnd, std::function<Image(const std::wstring &, const std::atomic_bool &)> loader);
+#endif
     ~Images();
+    void cancelPending();
     std::shared_ptr<Image> get(const std::wstring &url, const std::wstring &base);
 };
 } // namespace vm

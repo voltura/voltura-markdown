@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(VolturaMarkdown VERSION 1.1.4 LANGUAGES C CXX RC)
+project(VolturaMarkdown VERSION 1.1.5 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -58,6 +58,10 @@ target_link_libraries(integration_tests PRIVATE
 )
 target_compile_options(integration_tests PRIVATE /utf-8 /EHsc)
 add_test(NAME integration_tests COMMAND integration_tests)
+add_executable(svg_tests tests/svg.cpp)
+target_compile_options(svg_tests PRIVATE /utf-8 /EHsc)
+add_test(NAME svg_tests COMMAND svg_tests)
+set_tests_properties(reader_tests integration_tests svg_tests PROPERTIES TIMEOUT 30)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)

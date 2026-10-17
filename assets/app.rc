@@ -6,8 +6,8 @@
 3 RCDATA "../third_party/nanosvg/LICENSE.txt"
 4 RCDATA "../LICENSE"
 1 VERSIONINFO
-FILEVERSION 1,1,4,0
-PRODUCTVERSION 1,1,4,0
+FILEVERSION 1,1,5,0
+PRODUCTVERSION 1,1,5,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS VOS_NT_WINDOWS32
@@ -20,8 +20,8 @@ BEGIN
    VALUE "FileDescription", "Voltura Markdown"
    VALUE "CompanyName", "Voltura AB"
    VALUE "ProductName", "Voltura Markdown"
-   VALUE "FileVersion", "1.1.4"
-   VALUE "ProductVersion", "1.1.4"
+   VALUE "FileVersion", "1.1.5"
+   VALUE "ProductVersion", "1.1.5"
    VALUE "InternalName", "vmd"
    VALUE "OriginalFilename", "vmd.exe"
    VALUE "LegalCopyright", "Copyright (c) Voltura AB"

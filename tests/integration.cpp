@@ -146,9 +146,19 @@ int main() {
         raster(temp / L"test.gif", GUID_ContainerFormatGif);
         std::ofstream(temp / L"test.svg") << "<svg xmlns='http://www.w3.org/2000/svg' width='16' "
                                              "height='8'><rect width='16' height='8' fill='#ff6600'/></svg>";
+        std::ofstream(temp / L"classes.svg")
+            << "<svg width='16' height='8'><style>.a{class:b;style:class:a;fill:#ff6600;}"
+               ".b{class:a;}</style><rect class='a' style='class:a;' width='16' height='8'/></svg>";
+        std::ofstream(temp / L"tiny-dash.svg")
+            << "<svg width='200' height='200'><path d='M100 100 L101 100' stroke='black' "
+               "stroke-dasharray='0.000002'/></svg>";
+        std::ofstream(temp / L"dashes.svg")
+            << "<svg width='200' height='200'><path d='M10 10 L100 10' stroke='black' "
+               "stroke-dasharray='0 2 3' stroke-dashoffset='-2'/></svg>";
         {
             Images images(nullptr);
-            for (auto name : {L"test%20image.png", L"test.jpg", L"test.gif", L"test.svg"}) {
+            for (auto name : {L"test%20image.png", L"test.jpg", L"test.gif", L"test.svg", L"classes.svg",
+                              L"dashes.svg"}) {
                 std::shared_ptr<Image> image;
                 for (int i = 0; i < 300; ++i) {
                     image = images.get(name, (temp / L"document.md").wstring());
@@ -173,6 +183,46 @@ int main() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
             require(missing && missing->failed, "missing image fallback");
+            std::shared_ptr<Image> tiny;
+            for (int i = 0; i < 300 && !tiny; ++i) {
+                tiny = images.get(L"tiny-dash.svg", (temp / L"document.md").wstring());
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            require(tiny && tiny->failed, "non-progressing SVG dashes fail without hanging");
+        }
+        {
+            std::atomic_int started = 0, cancelledJobs = 0;
+            Images images(nullptr, [&](const std::wstring &, const std::atomic_bool &cancel) {
+                int ordinal = ++started;
+                if (ordinal <= 2) {
+                    while (!cancel.load())
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    ++cancelledJobs;
+                }
+                Image image;
+                image.width = image.height = 1;
+                image.pixels.assign(4, ordinal <= 2 ? 0 : 255);
+                image.ready = true;
+                return image;
+            });
+            auto base = (temp / L"document.md").wstring();
+            images.get(L"same.png", base);
+            images.get(L"slow.png", base);
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (started < 2 && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            require(started == 2, "both image workers started");
+            for (int i = 0; i < 16; ++i)
+                images.get(L"queued" + std::to_wstring(i) + L".png", base);
+            images.cancelPending();
+            std::shared_ptr<Image> current;
+            while ((!current || cancelledJobs < 2) && std::chrono::steady_clock::now() < deadline) {
+                current = images.get(L"same.png", base);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            require(current && current->ready && current->pixels[0] == 255 && started == 3 &&
+                        cancelledJobs == 2,
+                    "document change cancels obsolete queue and rejects stale same-URL results");
         }
         auto path = temp / L"Unicode åäö 日本語.md";
         {
@@ -218,6 +268,12 @@ int main() {
         require(markdownLinkPath(L"%5C%5Cserver%5Cshare%5Cfile.md", path).empty() &&
                     markdownLinkPath(L"evil%3Afile.md", path).empty(),
                 "encoded absolute and protocol links cannot become file launch paths");
+        for (auto link : {L"x%22%20--configure-defaults%20%22x.md", L"x\" --configure-defaults \"x.md",
+                          L"x%00.md", L"x%0a.md", L"x%3f.md", L"x%7c.md"})
+            require(markdownLinkPath(link, path).empty(), "invalid decoded file names cannot inject options");
+        require(markdownLinkPath(L"../other/My%20Notes.md", path) ==
+                    (temp.parent_path() / L"other/My Notes.md"),
+                "parent-relative document links remain supported");
         auto document = load(path);
         require(document.text.find(L"Hello") != document.text.npos, "Unicode file path");
         HGLOBAL drop = fileDrop(path);

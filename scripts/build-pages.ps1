@@ -13,6 +13,12 @@ if ($project -notmatch 'project\(VolturaMarkdown VERSION (\d+\.\d+\.\d+)') {
     throw 'Project version missing.'
 }
 $releaseVersion = $Matches[1]
+if ($ReleaseTag) {
+    if ($ReleaseTag -notmatch '^v(\d+\.\d+\.\d+)(?:-[A-Za-z0-9.-]+)?$') {
+        throw 'ReleaseTag must identify an asset version, for example v1.1.4 or v1.1.4-preview.1.'
+    }
+    $releaseVersion = $Matches[1]
+}
 $repositoryName = $Repository.Split('/')[1]
 if ($repositoryName -eq '.' -or $repositoryName -eq '..') {
     throw 'Use an actual owner/repository name.'

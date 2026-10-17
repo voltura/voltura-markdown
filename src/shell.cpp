@@ -323,7 +323,8 @@ std::filesystem::path markdownLinkPath(std::wstring_view link, const std::filesy
     if (FAILED(UrlUnescapeW(encoded.data(), decoded.data(), &length, URL_UNESCAPE_AS_UTF8)))
         return {};
     decoded.resize(length);
-    if (decoded.find(L':') != decoded.npos || decoded.find(L'\0') != decoded.npos ||
+    if (decoded.find_first_of(L"\":<>|?*") != decoded.npos ||
+        std::any_of(decoded.begin(), decoded.end(), [](wchar_t c) { return c < 32; }) ||
         decoded.starts_with(L"\\") || decoded.starts_with(L"/"))
         return {};
     auto path = (base.parent_path() / decoded).lexically_normal();
@@ -349,7 +350,7 @@ bool openLink(const std::wstring &link, const std::wstring &base) {
 }
 std::wstring licenses() {
     std::wstring text =
-        L"# Voltura Markdown\n\n**Version 1.1.4**\n\n"
+        L"# Voltura Markdown\n\n**Version 1.1.5**\n\n"
         L"A fast, read-only Markdown reader for Windows.\n\n"
         L"## Created by\n\n- **Developer:** Joakim Skoglund\n"
         L"- **Company:** Voltura AB\n- **Website:** [markdown.voltura.se](https://markdown.voltura.se/)\n\n"

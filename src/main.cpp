@@ -127,6 +127,7 @@ struct App {
     bool closeRequested = false, promotionPending = false;
 #ifdef VMD_TESTING
     bool failRendererPreparation = false, failRendererFirstFrame = false, fallbackAwaitingFrame = false;
+    bool failDeviceBrush = false;
 #endif
     std::shared_ptr<PreparedRenderer> preparedRenderer;
     std::thread rendererWorker;
@@ -473,7 +474,23 @@ struct App {
         VMD_TEST_ONLY(startupPhase("render_target_ready");)
         target->SetDpi(dpi, dpi);
         target->SetTransform(D2D1::Matrix3x2F::Translation(0, -top));
-        return SUCCEEDED(target->CreateSolidColorBrush(rgb(0), &brush));
+        HRESULT brushResult;
+#ifdef VMD_TESTING
+        if (failDeviceBrush) {
+            failDeviceBrush = false;
+            brushResult = E_OUTOFMEMORY;
+        } else
+#endif
+            brushResult = target->CreateSolidColorBrush(rgb(0), &brush);
+        if (FAILED(brushResult)) {
+            target.Reset();
+            VMD_TEST_ONLY(if (!metricsFile.empty()) {
+                std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+                out << "{\"brush_creation_failure\":true,\"target_released\":true}\n";
+            })
+            return false;
+        }
+        return true;
     }
     void prepareHardware() {
         if (!stagedRenderer || rendererStarted || closing || closeRequested)
@@ -1933,33 +1950,38 @@ struct App {
              done = std::make_shared<std::atomic_bool>(false);
         auto gen = generation;
         HWND destination = hwnd;
-        workers.push_back({std::thread([path, gen, destination, cancel, done] {
-                               auto result = std::make_unique<LoadedDocument>();
-                               result->generation = gen;
-                               try {
-                                   result->document = std::make_shared<Document>(load(path, cancel.get()));
-                               } catch (const std::exception &e) {
-                                   result->error = fromUtf8(e.what());
-                                   if (!cancel->load()) {
-                                       try {
-                                           result->document =
-                                               std::make_shared<Document>(loadSource(path, cancel.get()));
-                                           result->document->plainSource = true;
-                                           result->document->blocks = sourceBlocks(result->document->source);
-                                           for (auto &block : result->document->blocks)
-                                               block.kind = Kind::Paragraph;
-                                       } catch (...) {
-                                       }
-                                   }
-                               }
-                               if (!cancel->load()) {
-                                   auto pointer = result.release();
-                                   if (!PostMessageW(destination, Loaded, 0, (LPARAM)pointer))
-                                       delete pointer;
-                               }
-                               done->store(true);
-                           }),
-                           cancel, done});
+        workers.reserve(workers.size() + 1);
+        auto result = std::make_unique<LoadedDocument>();
+        result->error = L"The document could not be loaded.";
+        workers.push_back(
+            {std::thread([path, gen, destination, cancel, done, result = std::move(result)]() mutable {
+                 result->generation = gen;
+                 try {
+                     result->document = std::make_shared<Document>(load(path, cancel.get()));
+                 } catch (const std::exception &e) {
+                     try {
+                         result->error = fromUtf8(e.what());
+                     } catch (...) {
+                     }
+                     if (!cancel->load()) {
+                         try {
+                             result->document = std::make_shared<Document>(loadSource(path, cancel.get()));
+                             result->document->plainSource = true;
+                             result->document->blocks = sourceBlocks(result->document->source);
+                             for (auto &block : result->document->blocks)
+                                 block.kind = Kind::Paragraph;
+                         } catch (...) {
+                         }
+                     }
+                 }
+                 if (!cancel->load()) {
+                     auto pointer = result.release();
+                     if (!PostMessageW(destination, Loaded, 0, (LPARAM)pointer))
+                         delete pointer;
+                 }
+                 done->store(true);
+             }),
+             cancel, done});
     }
     void loaded(std::unique_ptr<LoadedDocument> r) {
         if (r->generation != generation)
@@ -1973,6 +1995,7 @@ struct App {
             return;
         }
         VMD_TEST_ONLY(startupPhase("document_delivered");)
+        images->cancelPending();
         doc = std::move(r->document);
         source = false;
         rawBlocks.clear();
@@ -2510,14 +2533,16 @@ In the **three-dot menu**:
         HWND destination = hwnd;
         auto documentGen = generation;
         reap();
+        workers.reserve(workers.size() + 1);
+        auto result = std::make_unique<SearchResult>(
+            SearchResult{gen, documentGen, raw, -1, (uint32_t)q.size(), step, start, backwards, countGen});
         workers.push_back({std::thread([document, raw, q, start, gen, cancel, done, destination, documentGen,
-                                        backwards, step, countGen] {
+                                        backwards, step, countGen, result = std::move(result)]() mutable {
                                auto &s = raw || document->plainSource ? document->source : document->text;
                                int found = findMatch(s, q, start, backwards, *cancel);
                                if (!cancel->load()) {
-                                   auto r = new SearchResult{gen,   documentGen,        raw,
-                                                             found, (uint32_t)q.size(), step,
-                                                             start, backwards,          countGen};
+                                   result->found = found;
+                                   auto r = result.release();
                                    if (!PostMessageW(destination, WM_APP + 3, 0, (LPARAM)r))
                                        delete r;
                                }
@@ -2562,19 +2587,22 @@ In the **three-dot menu**:
         auto gen = countGeneration, documentGen = generation;
         bool raw = source;
         HWND destination = hwnd;
-        workers.push_back(
-            {std::thread([document, q, cancel, done, gen, documentGen, raw, destination, start, backwards] {
-                 SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                 auto &s = raw || document->plainSource ? document->source : document->text;
-                 auto count = countMatches(s, q, start, *cancel);
-                 if (!cancel->load()) {
-                     auto r = new CountResult{gen, documentGen, raw, count, backwards};
-                     if (!PostMessageW(destination, WM_APP + 5, 0, (LPARAM)r))
-                         delete r;
-                 }
-                 done->store(true);
-             }),
-             cancel, done});
+        workers.reserve(workers.size() + 1);
+        auto result = std::make_unique<CountResult>(CountResult{gen, documentGen, raw, {}, backwards});
+        workers.push_back({std::thread([document, q, cancel, done, gen, documentGen, raw, destination, start,
+                                        backwards, result = std::move(result)]() mutable {
+                               SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                               auto &s = raw || document->plainSource ? document->source : document->text;
+                               auto count = countMatches(s, q, start, *cancel);
+                               if (!cancel->load()) {
+                                   result->count = count;
+                                   auto r = result.release();
+                                   if (!PostMessageW(destination, WM_APP + 5, 0, (LPARAM)r))
+                                       delete r;
+                               }
+                               done->store(true);
+                           }),
+                           cancel, done});
     }
     void countResult(std::unique_ptr<CountResult> r) {
         if (r->gen != countGeneration || r->documentGen != generation || r->source != source || !countCancel)
@@ -4171,6 +4199,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             app.stagedRenderer = true;
         else if (a == L"--test-renderer-fail-preparation")
             app.failRendererPreparation = true;
+        else if (a == L"--test-renderer-fail-brush")
+            app.failDeviceBrush = true;
         else if (a == L"--test-renderer-fail-first-frame")
             app.failRendererFirstFrame = true;
         else if (a == L"--scroll-benchmark" && i + 1 < argc) {

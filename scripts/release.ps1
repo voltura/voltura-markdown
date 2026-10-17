@@ -138,7 +138,7 @@ $manifest = [ordered]@{
     assets = @($identity)
 }
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $directory 'release-manifest.json') -Encoding utf8
-$details = @('', '## Download verification', '', '| Download | Bytes | SHA-256 | Publisher signature |', '| --- | ---: | --- | --- |')
+$details = @('', ('Source revision: ' + $revision), '', '## Download verification', '', '| Download | Bytes | SHA-256 | Publisher signature |', '| --- | ---: | --- | --- |')
 foreach ($asset in $identity) {
     $status = if ($asset.trust -eq 'Unsigned') { 'Unsigned' } elseif ($asset.trust -eq 'SelfSigned') { 'Self-signed; timestamped' } else { "Valid; $($asset.signer); timestamped" }
     $details += "| ``$($asset.name)`` | $($asset.bytes) | ``$($asset.sha256)`` | $status |"

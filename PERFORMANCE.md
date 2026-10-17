@@ -2,6 +2,21 @@
 
 Local x64 MSVC Release measurements, 2026-10-17. Intel Core Ultra 9 185H, 22 logical processors, 63.5 GiB usable RAM; Windows 11 Pro build 26300, 3840×2160 at 225% scaling.
 
+## 1.1.5 regression checks
+
+Three launches per fixture with ordinary filesystem caching, after the reliability fixes:
+
+| Input | Median process launch to first-content metric | Peak viewer working set |
+| --- | ---: | ---: |
+| 1 KiB | 97 ms | 86.7 MiB |
+| 1 MiB | 120 ms | 98.1 MiB |
+| 10 MiB | 325 ms | 203.2 MiB |
+| 100 MiB stress | 2.57 s | 1,300.6 MiB |
+
+These are local warm/cache-dependent samples, not new reboot or physical-display measurements. Results are retained in `build/bench/release-1.1.5.json`. Search on the 10 MiB fixture presented its first match in 4.2 ms and completed the count of 72,818 matches in 52 ms.
+
+A malformed 800 KB HTML entity fixture improved from roughly 8 seconds to 7 ms of parsing; a 1.6 MB variant completed in 19 ms. Tiny SVG dash fixtures now fail without blocking shutdown. SVG CSS, transform and dash regression checks also passed with MSVC AddressSanitizer. Earlier measurements below retain their original renderer and cache conditions.
+
 ## Startup and memory
 
 Three separate launches per generated document, with ordinary Windows filesystem caching:

@@ -7,6 +7,7 @@
 #include <iostream>
 #include <psapi.h>
 #include <stdexcept>
+#include <thread>
 using namespace vm;
 void require(bool condition, const char *message) {
     if (!condition)
@@ -286,6 +287,37 @@ int wmain(int argc, wchar_t **argv) {
         require(legacy.text.find(L"line\nbreak") != legacy.text.npos, "hard break");
         require(entity(L"&#x1F600; &NotEqualTilde; &bogus;") == L"😀 ≂̸ &bogus;",
                 "numeric and two-codepoint entities");
+        auto entityStart = std::chrono::steady_clock::now();
+        std::wstring ampersands(800000, L'&');
+        auto htmlEntities = parse(L"<div>\n" + ampersands + L"&amp;\n</div>\n");
+        require(htmlEntities.text.find(ampersands + L"&") != std::wstring::npos,
+                "malformed entities preserve text and subsequent valid entities");
+        require(std::chrono::steady_clock::now() - entityStart < std::chrono::seconds(3),
+                "entity decoding remains linear for long HTML lines");
+        bool entityCancelled = false;
+        try {
+            entity(ampersands, &cancel);
+        } catch (const std::runtime_error &) {
+            entityCancelled = true;
+        }
+        require(entityCancelled, "entity preprocessing obeys cancellation");
+        std::wstring validEntities = L"x";
+        validEntities.reserve(4000001);
+        for (int i = 0; i < 1000000; ++i)
+            validEntities += L"&lt;";
+        std::atomic_bool duringDecode = false;
+        std::thread stopDecode([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            duringDecode.store(true);
+        });
+        bool interruptedEntities = false;
+        try {
+            entity(validEntities, &duringDecode);
+        } catch (const std::runtime_error &) {
+            interruptedEntities = true;
+        }
+        stopDecode.join();
+        require(interruptedEntities, "valid entity token jumps cannot skip cancellation checkpoints");
         std::cout << "PASS: adapter, styles, HTML subset, tables, extensions, Unicode, encodings, source, "
                      "cancellation, bounded blocks\n";
         return 0;

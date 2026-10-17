@@ -75,12 +75,19 @@ static void codepoint(std::wstring &s, unsigned c) {
         s.push_back(wchar_t(0xdc00 + (c & 1023)));
     }
 }
-std::wstring entity(std::wstring_view s) {
+std::wstring entity(std::wstring_view s, const std::atomic_bool *cancel) {
     std::wstring out;
+    size_t nextCheck = 0;
     for (size_t i = 0; i < s.size();) {
+        if (i >= nextCheck) {
+            if (cancel && cancel->load())
+                throw std::runtime_error("Cancelled");
+            nextCheck = i + 4096;
+        }
         if (s[i] == L'&') {
-            auto end = s.find(L';', i);
-            if (end != s.npos && end - i < 40) {
+            auto offset = s.substr(i, 40).find(L';');
+            if (offset != s.npos) {
+                auto end = i + offset;
                 auto token = s.substr(i, end - i + 1);
                 if (token.size() > 3 && token[1] == L'#') {
                     std::wstring n(token.substr(2, token.size() - 3));
@@ -137,7 +144,7 @@ struct Parser {
     bool inCode = false, inImage = false, inHtml = false, separateRun = false;
     unsigned heading = 0;
     std::wstring attr(const MD_ATTRIBUTE &a) {
-        return entity(fromUtf8({a.text, a.size}));
+        return entity(fromUtf8({a.text, a.size}), cancel);
     }
     void check() {
         if (cancel && cancel->load())
@@ -412,7 +419,7 @@ struct Parser {
             spans.pop_back();
         }
     }
-    static std::wstring attribute(std::wstring_view tag, std::wstring_view name) {
+    std::wstring attribute(std::wstring_view tag, std::wstring_view name) {
         size_t i = 1;
         while (i < tag.size() && !iswspace(tag[i]) && tag[i] != L'>')
             ++i;
@@ -441,7 +448,7 @@ struct Parser {
             while (i < tag.size() && (q ? tag[i] != q : !iswspace(tag[i]) && tag[i] != L'>'))
                 ++i;
             if (key == name)
-                return entity(tag.substr(begin, i - begin));
+                return entity(tag.substr(begin, i - begin), cancel);
             if (q && i < tag.size())
                 ++i;
         }
@@ -451,7 +458,7 @@ struct Parser {
         return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' || c == L'\f';
     }
     void htmlText(std::wstring_view text) {
-        auto decoded = entity(text);
+        auto decoded = entity(text, cancel);
         if (inCode) {
             append(decoded);
             return;
@@ -661,7 +668,7 @@ struct Parser {
         }
         auto s = fromUtf8({p, n});
         if (t == MD_TEXT_ENTITY)
-            append(entity(s));
+            append(entity(s, cancel));
         else if (t == MD_TEXT_HTML)
             html(s);
         else if (t == MD_TEXT_NORMAL) {

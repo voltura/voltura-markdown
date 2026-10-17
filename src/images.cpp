@@ -127,6 +127,11 @@ Image decodeImage(std::vector<unsigned char> bytes) {
                                                                 nsvgDelete);
         require(image && image->width > 0 && image->height > 0 && std::isfinite(image->width) &&
                 std::isfinite(image->height));
+        for (auto shape = image->shapes; shape; shape = shape->next) {
+            require(std::isfinite(shape->strokeDashOffset));
+            for (int i = 0; i < shape->strokeDashCount; ++i)
+                require(std::isfinite(shape->strokeDashArray[i]) && shape->strokeDashArray[i] >= 0);
+        }
         float scale = std::min(1.f, 2048.f / std::max(image->width, image->height));
         out.width = std::max(1u, (unsigned)(image->width * scale));
         out.height = std::max(1u, (unsigned)(image->height * scale));
@@ -136,6 +141,7 @@ Image decodeImage(std::vector<unsigned char> bytes) {
         require(raster != nullptr);
         nsvgRasterize(raster.get(), image.get(), 0, 0, scale, out.pixels.data(), out.width, out.height,
                       out.width * 4);
+        require(!raster->failed);
         for (size_t i = 0; i < out.pixels.size(); i += 4) {
             auto r = out.pixels[i], b = out.pixels[i + 2], a = out.pixels[i + 3];
             out.pixels[i] = (b * a + 127) / 255;
@@ -178,10 +184,28 @@ Image decodeImage(std::vector<unsigned char> bytes) {
 }
 } // namespace
 Images::Images(HWND h) : window(h) {}
+#ifdef VMD_TESTING
+Images::Images(HWND h, std::function<Image(const std::wstring &, const std::atomic_bool &)> loader)
+    : window(h), testLoader(std::move(loader)) {}
+#endif
+void Images::cancelPending() {
+    auto next = std::make_shared<std::atomic_bool>(false);
+    std::lock_guard lock(mutex);
+    generationCancel->store(true);
+    generationCancel = std::move(next);
+    jobs.clear();
+    for (auto it = cache.begin(); it != cache.end();) {
+        if (!it->second->ready && !it->second->failed)
+            it = cache.erase(it);
+        else
+            ++it;
+    }
+}
 Images::~Images() {
     {
         std::lock_guard lock(mutex);
         stopping = true;
+        generationCancel->store(true);
         jobs.clear();
     }
     cv.notify_all();
@@ -191,7 +215,7 @@ Images::~Images() {
 void Images::run() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     for (;;) {
-        std::pair<std::wstring, std::shared_ptr<Image>> job;
+        Job job;
         {
             std::unique_lock lock(mutex);
             cv.wait(lock, [&] { return stopping || !jobs.empty(); });
@@ -202,9 +226,16 @@ void Images::run() {
         }
         Image result;
         try {
-            auto bytes = readImage(job.first, stopping);
-            require(!stopping.load());
-            result = decodeImage(std::move(bytes));
+#ifdef VMD_TESTING
+            if (testLoader)
+                result = testLoader(job.key, *job.cancel);
+            else
+#endif
+            {
+                auto bytes = readImage(job.key, *job.cancel);
+                require(!job.cancel->load());
+                result = decodeImage(std::move(bytes));
+            }
         } catch (...) {
             result.failed = true;
         }
@@ -212,17 +243,22 @@ void Images::run() {
             std::lock_guard lock(mutex);
             if (stopping.load())
                 break;
+            auto pending = cache.find(job.key);
+            if (job.cancel->load() || pending == cache.end() || pending->second != job.pending)
+                continue;
             size_t total = result.pixels.size();
             for (const auto &[key, image] : cache)
                 total += image->pixels.size();
             for (auto it = cache.begin(); it != cache.end() && total > 64 * 1024 * 1024;) {
-                if (it->first != job.first && it->second.use_count() == 1 && it->second->ready) {
+                if (it->first != job.key && it->second.use_count() == 1 && it->second->ready) {
                     total -= it->second->pixels.size();
                     it = cache.erase(it);
                 } else
                     ++it;
             }
-            cache[job.first] = std::make_shared<Image>(std::move(result));
+            // Pending images have never been returned to the UI. Publish under the
+            // same lock without another allocation on this worker's failure path.
+            *job.pending = std::move(result);
         }
         PostMessageW(window, WM_APP + 2, 0, 0);
     }
@@ -278,7 +314,7 @@ std::shared_ptr<Image> Images::get(const std::wstring &url, const std::wstring &
     }
     auto result = std::make_shared<Image>();
     cache.emplace(key, result);
-    jobs.emplace_back(key, result);
+    jobs.push_back({key, result, generationCancel});
     cv.notify_one();
     return {};
 }

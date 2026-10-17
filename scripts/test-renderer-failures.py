@@ -18,6 +18,35 @@ scroll_document.write_text(
     encoding="utf-8",
 )
 summary = []
+brush_metrics = folder / "brush-metrics.jsonl"
+brush_checks = folder / "brush-checks.jsonl"
+subprocess.run(
+    [
+        str(root / "build/Release/vmd-test.exe"),
+        str(root / "tests/showcase.md"),
+        "--test-renderer-fail-brush",
+        "--metrics",
+        str(brush_metrics),
+        "--verify-ui",
+        str(brush_checks),
+        "--no-preferences",
+        "--exit-after",
+        "35000",
+    ],
+    check=True,
+    timeout=40,
+)
+brush_frames = [json.loads(line) for line in brush_metrics.read_text().splitlines()]
+brush_results = [json.loads(line) for line in brush_checks.read_text().splitlines()]
+if not any(row.get("brush_creation_failure") and row.get("target_released") for row in brush_frames):
+    raise RuntimeError("Brush allocation failure was not exercised")
+if not any("first_content_ms" in row for row in brush_frames) or any(
+    row.get("passed") is False for row in brush_results
+):
+    raise RuntimeError("Rendering did not recover after brush allocation failure")
+if not brush_results or brush_results[-1].get("check") != "escape_closes_normal_window":
+    raise RuntimeError("Brush failure UI checks did not finish")
+print(json.dumps({"failure": "brush", "passed": True}))
 for failure in ("preparation", "first-frame"):
     for mode in ("ui", "scroll"):
         name = failure + "-" + mode

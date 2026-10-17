@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.5 — 2026-10-17
+
+- Prevents malformed SVG style recursion and bounds stroke-dash expansion to avoid crashes and hangs.
+- Handles incomplete SVG CSS declarations and malformed/singular transforms without invalid memory reads.
+- Makes HTML entity decoding linear and cancellable, including long malformed input.
+- Rejects invalid decoded local link filenames before launching another reader window.
+- Cancels obsolete queued image requests on document changes and rejects stale results.
+- Recovers from drawing-brush creation failure without retaining a partially initialized renderer.
+- Allocates worker storage and result payloads before launching document/search threads and publishes image results without another allocation.
+- Aligns product-page version labels and installer filenames with the selected release tag.
+
 ## 1.1.4 — 2026-10-17
 
 - Prevents scrollbar flicker when changing zoom.
@@ -58,4 +69,4 @@
 - Background loading, bounded layout/image caches, Unicode boundary handling, and cancellable search.
 - MIT-licensed application, documentation, and current artwork.
 
-See [release notes](docs/releases/1.1.4.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
+See [release notes](docs/releases/1.1.5.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.

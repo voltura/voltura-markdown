@@ -535,7 +535,7 @@ static void nsvg__xformInverse(float* inv, float* t)
 {
 	double invdet, det = (double)t[0] * t[3] - (double)t[2] * t[1];
 	if (det > -1e-6 && det < 1e-6) {
-		nsvg__xformIdentity(t);
+		nsvg__xformIdentity(inv);
 		return;
 	}
 	invdet = 1.0 / det;
@@ -1616,6 +1616,7 @@ static int nsvg__parseTranslate(float* xform, const char* str)
 	int na = 0;
 	int len = nsvg__parseTransformArgs(str, args, 2, &na);
 	if (na == 1) args[1] = 0.0;
+	if (na < 1) return len;
 
 	nsvg__xformSetTranslation(t, args[0], args[1]);
 	memcpy(xform, t, sizeof(float)*6);
@@ -1629,6 +1630,7 @@ static int nsvg__parseScale(float* xform, const char* str)
 	float t[6];
 	int len = nsvg__parseTransformArgs(str, args, 2, &na);
 	if (na == 1) args[1] = args[0];
+	if (na < 1) return len;
 	nsvg__xformSetScale(t, args[0], args[1]);
 	memcpy(xform, t, sizeof(float)*6);
 	return len;
@@ -1640,6 +1642,7 @@ static int nsvg__parseSkewX(float* xform, const char* str)
 	int na = 0;
 	float t[6];
 	int len = nsvg__parseTransformArgs(str, args, 1, &na);
+	if (na != 1) return len;
 	nsvg__xformSetSkewX(t, args[0]/180.0f*NSVG_PI);
 	memcpy(xform, t, sizeof(float)*6);
 	return len;
@@ -1651,6 +1654,7 @@ static int nsvg__parseSkewY(float* xform, const char* str)
 	int na = 0;
 	float t[6];
 	int len = nsvg__parseTransformArgs(str, args, 1, &na);
+	if (na != 1) return len;
 	nsvg__xformSetSkewY(t, args[0]/180.0f*NSVG_PI);
 	memcpy(xform, t, sizeof(float)*6);
 	return len;
@@ -1663,6 +1667,7 @@ static int nsvg__parseRotate(float* xform, const char* str)
 	float m[6];
 	float t[6];
 	int len = nsvg__parseTransformArgs(str, args, 3, &na);
+	if (na != 1 && na != 3) return len;
 	if (na == 1)
 		args[1] = args[2] = 0.0f;
 	nsvg__xformIdentity(m);
@@ -1692,6 +1697,8 @@ static void nsvg__parseTransform(float* xform, const char* str)
 	nsvg__xformIdentity(xform);
 	while (*str)
 	{
+		// Voltura: ignore malformed transforms without uninitialized values.
+		nsvg__xformIdentity(t);
 		if (strncmp(str, "matrix", 6) == 0)
 			len = nsvg__parseMatrix(t, str);
 		else if (strncmp(str, "translate", 9) == 0)
@@ -1944,25 +1951,28 @@ static int nsvg__parseNameValue(NSVGparser* p, const char* start, const char* en
 
 	str = start;
 	while (str < end && *str != ':') ++str;
+	if (str == end) return 0;
 
-	val = str;
+	val = str + 1;
 
 	// Right Trim
-	while (str > start &&  (*str == ':' || nsvg__isspace(*str))) --str;
-	++str;
+	while (str > start && nsvg__isspace(str[-1])) --str;
 
 	n = (int)(str - start);
 	if (n > 511) n = 511;
 	if (n) memcpy(name, start, n);
 	name[n] = 0;
 
-	while (val < end && (*val == ':' || nsvg__isspace(*val))) ++val;
+	while (val < end && nsvg__isspace(*val)) ++val;
 
 	n = (int)(end - val);
 	if (n > 511) n = 511;
 	if (n) memcpy(value, val, n);
 	value[n] = 0;
 
+	// Voltura: CSS declarations must not recursively dispatch structural attributes.
+	if (strcmp(name, "class") == 0 || strcmp(name, "style") == 0 || strcmp(name, "id") == 0)
+		return 0;
 	return nsvg__parseAttr(p, name, value);
 }
 
@@ -1979,10 +1989,9 @@ static void nsvg__parseStyle(NSVGparser* p, const char* str)
 		end = str;
 
 		// Right Trim
-		while (end > start &&  (*end == ';' || nsvg__isspace(*end))) --end;
-		++end;
+		while (end > start && nsvg__isspace(end[-1])) --end;
 
-		nsvg__parseNameValue(p, start, end);
+		if (end > start) nsvg__parseNameValue(p, start, end);
 		if (*str) ++str;
 	}
 }
