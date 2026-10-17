@@ -6,7 +6,24 @@ Local x64 MSVC Release measurements, 2026-10-17. Intel Core Ultra 9 185H, 22 log
 
 The existing notice title, explanation, dimensions, and delayed background association probe are retained. Copy path reads the executable location and writes clipboard text only on explicit activation; feedback stays inside the button. Association tests cover Unicode/spaces in a renamed executable path, success/failure feedback, tab order, dismissal, synchronous focus preservation, and unchanged registration/defaults. A test-only clipboard sink leaves the user's clipboard untouched; it validates the requested text and UI behavior, not an actual system clipboard write. Dark/light notice captures were inspected.
 
-Five-launch warm/cache-dependent medians were 82 → 103 ms for 1 KiB and 312 → 339 ms for 10 MiB (`build/bench/copy-path-before.json`, `build/bench/copy-path-after-idle.json`). The later sample spent more time in render-target initialization and, for the large fixture, parsing; neither path changed in this patch. These samples do not establish performance equivalence. The 10 MiB first search match painted in 3.9 ms, navigation in 2.4 ms, and counting 72,818 matches completed in 46 ms. Native/package tests, both UI exit paths, 652 CommonMark cases, formatting, and the isolated installer lifecycle passed.
+The controlled 1.1.6/1.1.7 comparison found no consistent startup or document-loading regression from Copy path. It supersedes the earlier sequential five-launch samples for assessing the version difference; their apparent 21–27 ms startup increase did not reproduce under paired testing.
+
+Both exact release tags were compiled as instrumented x64 Release test builds with the same MSVC/CMake toolchain. Both used the default staged renderer, disabled preferences, and identical document bytes and paths. After two excluded warm-up launches per version/document, each document received 24 adjacent launch pairs with balanced AB/BA version order and shuffled document order: 192 measured launches in total. Only one viewer ran at a time, with 100 ms between process exit and the next launch.
+
+| Document | 1.1.6 median startup | 1.1.7 median startup | Paired mean difference, 1.1.7 minus 1.1.6 (95% CI) |
+| --- | ---: | ---: | ---: |
+| 1 KiB | 124.1 ms | 123.2 ms | +2.2 ms (−5.4 to +10.1) |
+| 1 MiB | 126.4 ms | 123.9 ms | −3.5 ms (−11.3 to +5.1) |
+| 10 MiB | 367.4 ms | 345.4 ms | −7.5 ms (−23.2 to +6.4) |
+| Voltura Air `docs/protocol.md` | 121.7 ms | 127.2 ms | +1.7 ms (−6.3 to +9.1) |
+
+Startup measures process creation to a complete first-content metric record, polled at 1 ms. The difference column is the mean of within-pair differences, not the difference between the two medians. Confidence intervals use 10,000 paired bootstrap resamples; no measured samples were removed. All startup intervals include zero. Separately measured file reading, parsing, and document-open-to-first-painted-content timings also had paired mean-difference intervals containing zero.
+
+These results show no statistically distinguishable regression in this local run, not proof of identical performance. Small differences remain possible within the intervals. This was an ordinary warm-cache test without a reboot or cache flush, using instrumented test executables rather than the signed production downloads; it does not establish cold-start behavior or results on other machines. Detailed results, raw samples, executable/fixture hashes, and source commit IDs are retained under the ignored `build/compare-1.1.6-1.1.7/paired-run/` directory (`REPORT.md`, `summary.json`, `samples.jsonl`, and `manifest.json`).
+
+For historical context, the earlier sequential five-launch medians were 82 → 103 ms for 1 KiB and 312 → 339 ms for 10 MiB (`build/bench/copy-path-before.json`, `build/bench/copy-path-after-idle.json`). Those unpaired samples were taken at different times and do not establish that Copy path caused a slowdown.
+
+The separate 10 MiB search check painted its first match in 3.9 ms, navigation in 2.4 ms, and counted 72,818 matches in 46 ms. Native/package tests, both UI exit paths, 652 CommonMark cases, formatting, and the isolated installer lifecycle passed.
 
 ## 1.1.6 layout regression checks
 
