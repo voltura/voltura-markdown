@@ -13,7 +13,7 @@ python -m http.server 8080 --bind 127.0.0.1 --directory build/pages
 
 Open `http://127.0.0.1:8080`; Ctrl+C stops the server. Output lives in ignored `build/pages`. Repository/release links become usable once those destinations are actually published.
 
-`-ReleaseTag` points downloads directly at that tag, including a prerelease. Omit it to use GitHub's latest **stable** release. The installer filename uses the version from `CMakeLists.txt`; ensure the chosen release contains both matching assets. Update the first-release availability message in `site/index.html` only after downloads exist.
+`-ReleaseTag` points downloads directly at that tag, including a prerelease. Omit it to use the stable `v<version>` tag matching `CMakeLists.txt`. Pin both downloads to the page's release so cached pages never combine an older installer filename with a newer release. Ensure the chosen release contains both matching assets. Update the first-release availability message in `site/index.html` only after downloads exist.
 
 ## Publish explicitly
 
@@ -27,7 +27,7 @@ The repository must already exist. Install Git/GitHub CLI and configure authenti
 .\scripts\publish-pages.ps1 -Repository voltura/voltura-markdown -ReleaseTag v1.0.0-preview.2 -Publish
 ```
 
-`-Publish` uses an isolated checkout under `build/pages-publish`, preserves existing `gh-pages` history and `CNAME`, pushes without force, then configures [branch-based Pages](https://docs.github.com/en/rest/pages/pages) at `gh-pages:/`. It never switches the main checkout's branch. No project GitHub Actions workflow is required. A concurrent push is rejected normally; review and rerun rather than force-pushing.
+`-Publish` sends the generated files through GitHub's Git database API, preserves existing `gh-pages` history and `CNAME`, updates the remote ref without force, then configures [branch-based Pages](https://docs.github.com/en/rest/pages/pages) at `gh-pages:/`. It never creates another local checkout or switches the primary source away from `main`. No project GitHub Actions workflow is required. A concurrent branch update is rejected normally; review and rerun rather than force-publishing.
 
 If Pages settings fail after the branch push, inspect the error and **Settings → Pages**. Verify the public URL and both downloads once deployment completes.
 

@@ -2,6 +2,12 @@
 
 Required: Windows x64, the [build toolchain](BUILDING.md), Python, NSIS 3, and GitHub CLI for publication. Close the reader and run from the repository root.
 
+## Keep source synchronized
+
+Use the primary checkout on `main`; do not use worktrees. Before editing, run `scripts/sync-source.ps1` to fetch and fast-forward a clean checkout. If local edits or commits prevent synchronization, preserve and reconcile them first. Fetching updates remote-tracking history but does not itself update checked-out files.
+
+Before publishing, commit reviewed changes on `main`, push normally, then run `scripts/sync-source.ps1 -CheckOnly`. Publication requires local `HEAD` to match `origin/main` and the selected GitHub repository to match `origin`. The release script checks this before building and again before publication, so a stale checkout cannot silently create a new release. Finish by fetching and confirming local `main`, `origin/main`, and the release tag agree.
+
 ## Prepare assets
 
 ```powershell
@@ -81,4 +87,4 @@ Use [Building](BUILDING.md) for commands and [Performance](../PERFORMANCE.md) fo
 
 Release assets contain executable packages and metadata only: exclude PDBs, tests, benchmarks, and build trees. Use the [notes template](RELEASE-NOTES-TEMPLATE.md) for concise download/use instructions. All preparation, signing, and publication run locally; GitHub Actions is not required.
 
-Stable publication also rebuilds and publishes the product page locally. Download links use GitHub's latest release route and the current versioned installer filename. Publish each stable version through this script so the page and installer remain synchronized.
+Stable publication also rebuilds and publishes the product page locally. Both download links are pinned to the matching release tag, including the versioned installer filename, so cached pages keep working after later releases. Publish each stable version through this script so the page and installer remain synchronized.

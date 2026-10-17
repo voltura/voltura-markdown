@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.1 — 2026-10-17
+## 1.1.4 — 2026-10-17
 
 - Prevents scrollbar flicker when changing zoom.
 - Avoids horizontal scrolling into empty centering margins and uses the arrow cursor over scrollbars.
@@ -8,6 +8,20 @@
 - Leaves two text lines of context above search matches where space permits, and fixes the search field's right edge.
 - Excludes test options, verification routines, failure injection, and timing instrumentation from the production executable.
 - Prevents the Windows beep when Enter or Shift+Enter navigates search results.
+
+## 1.1.3 — 2026-10-17
+
+- Detects when .md files point to Voltura Markdown at another location and offers to register the current copy and open Windows Default apps. Windows still confirms the final default choice.
+- Defers association checks until after the first content is painted and runs shell work in the background, preserving fast software-first startup and responsive reading.
+- Keeps uncertain associations quiet and supports dismissal, keyboard access, retry after registration failure, and closing while a check is stalled.
+
+## 1.1.2 — 2026-10-17
+
+- Uses markdown.voltura.se for the About link, executable metadata, installer website, and signing website URL.
+- Moves the product site to its HTTPS custom domain while retaining the published domain on future updates.
+
+## 1.1.1 — 2026-10-17
+
 - Starts in a normal window when launched without a document.
 - Opens the app's Default apps settings directly on supported Windows versions, with Windows confirmation for .md files.
 - Clearer installer welcome and completion text.
@@ -44,4 +58,4 @@
 - Background loading, bounded layout/image caches, Unicode boundary handling, and cancellable search.
 - MIT-licensed application, documentation, and current artwork.
 
-See [release notes](docs/releases/1.1.1.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
+See [release notes](docs/releases/1.1.4.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.

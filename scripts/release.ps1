@@ -17,6 +17,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+if ($Publish) {
+    & (Join-Path $PSScriptRoot 'sync-source.ps1') -CheckOnly
+}
 $project = Get-Content -LiteralPath (Join-Path $repo 'CMakeLists.txt') -Raw
 if ($project -notmatch 'project\(VolturaMarkdown VERSION (\d+\.\d+\.\d+)') { throw 'Project version missing.' }
 $releaseVersion = $Matches[1]
@@ -67,6 +70,10 @@ if ($Publish) {
     if ($revision -notmatch '^[a-fA-F0-9]{40}$') { throw 'Publishing requires a committed Git checkout.' }
     $changes = & $git.Source -C $repo status --porcelain
     if ($LASTEXITCODE -or $changes) { throw 'Publishing requires a clean Git working tree.' }
+    $originUrl = & $git.Source -C $repo remote get-url origin
+    if ($LASTEXITCODE -or $originUrl -notin @("https://github.com/$Repository.git", "https://github.com/$Repository", "git@github.com:$Repository.git")) {
+        throw 'The selected release repository must match origin.'
+    }
     $gh = Get-Command gh.exe -ErrorAction Stop
     & $gh.Source auth status
     if ($LASTEXITCODE) { throw 'Sign in to GitHub CLI before publishing.' }
@@ -142,6 +149,7 @@ $preparedNotes = Join-Path $directory 'RELEASE-NOTES.md'
 Write-Host "Prepared $tag in $directory"
 Write-Host $(if ($CertificateThumbprint) { 'Both executables are signed and timestamped.' } else { 'Both executables are UNSIGNED.' })
 if ($Publish) {
+    & (Join-Path $PSScriptRoot 'sync-source.ps1') -CheckOnly
     $currentHead = & $git.Source -C $repo rev-parse --verify HEAD
     $changes = & $git.Source -C $repo status --porcelain
     if ($LASTEXITCODE -or $currentHead -ne $revision -or $changes) {

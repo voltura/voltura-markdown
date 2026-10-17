@@ -20,49 +20,54 @@ foreach ($tool in @('git', 'gh')) {
         throw "$tool is required for publication."
     }
 }
-function Invoke-Git {
-    param([string[]]$Arguments)
-    & git @Arguments
-    if ($LASTEXITCODE) { throw "Git command failed: $($Arguments -join ' ')" }
-}
 function Invoke-Gh {
     param([string[]]$Arguments)
     & gh @Arguments
     if ($LASTEXITCODE) { throw "GitHub command failed: $($Arguments -join ' ')" }
 }
+function Invoke-JsonApi {
+    param([string]$Method, [string]$Endpoint, [object]$Body)
+    $requestFile = Join-Path $repo ('build/pages-request-' + [Guid]::NewGuid().ToString('N') + '.json')
+    [IO.File]::WriteAllText($requestFile, ($Body | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+    $response = Invoke-Gh -Arguments @('api', '--method', $Method, $Endpoint, '--input', $requestFile)
+    return (($response | Out-String) | ConvertFrom-Json)
+}
 
-# Only explicit -Publish reaches authenticated network operations.
+# Publish generated files through GitHub's Git database API; never create a local checkout or switch main.
 Invoke-Gh -Arguments @('auth', 'status')
-$remoteUrl = "https://github.com/$Repository.git"
-$checkout = Join-Path $repo ('build\pages-publish\' + [Guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $checkout -Force | Out-Null
-Invoke-Git -Arguments @('init', $checkout)
-Invoke-Git -Arguments @('-C', $checkout, 'var', 'GIT_AUTHOR_IDENT') | Out-Null
-Invoke-Git -Arguments @('-C', $checkout, 'remote', 'add', 'origin', $remoteUrl)
-$customDomain = $null
-$existing = @(Invoke-Git -Arguments @('-C', $checkout, 'ls-remote', '--heads', 'origin', 'refs/heads/gh-pages'))
-if ($existing.Count -gt 0) {
-    Invoke-Git -Arguments @('-C', $checkout, 'fetch', '--depth', '1', 'origin', 'gh-pages')
-    Invoke-Git -Arguments @('-C', $checkout, 'checkout', '-b', 'gh-pages', 'FETCH_HEAD')
-    $domainFile = Join-Path $checkout 'CNAME'
-    $customDomain = if (Test-Path -LiteralPath $domainFile) { [IO.File]::ReadAllText($domainFile) } else { $null }
-    # Work only in this fresh generated checkout. Remove tracked page content while preserving .git.
-    Invoke-Git -Arguments @('-C', $checkout, 'rm', '-r', '--ignore-unmatch', '--', '.')
-} else {
-    Invoke-Git -Arguments @('-C', $checkout, 'checkout', '--orphan', 'gh-pages')
+$gitApi = "repos/$Repository/git"
+$refs = (Invoke-Gh -Arguments @('api', "$gitApi/matching-refs/heads/gh-pages") | Out-String) | ConvertFrom-Json
+$currentRef = @($refs | Where-Object { $_.ref -eq 'refs/heads/gh-pages' })
+$parent = if ($currentRef.Count) { $currentRef[0].object.sha } else { $null }
+$entries = @()
+$previousTree = $null
+if ($parent) {
+    $commit = (Invoke-Gh -Arguments @('api', "$gitApi/commits/$parent") | Out-String) | ConvertFrom-Json
+    $previousTree = $commit.tree.sha
+    $tree = (Invoke-Gh -Arguments @('api', "$gitApi/trees/$previousTree") | Out-String) | ConvertFrom-Json
+    foreach ($entry in @($tree.tree | Where-Object { $_.path -eq 'CNAME' })) {
+        $entries += @{ path = 'CNAME'; mode = $entry.mode; type = $entry.type; sha = $entry.sha }
+    }
 }
-$built = Join-Path $repo 'build\pages'
-Get-ChildItem -LiteralPath $built -Force | Copy-Item -Destination $checkout -Recurse -Force
-if ($customDomain) {
-    [IO.File]::WriteAllText((Join-Path $checkout 'CNAME'), $customDomain, [Text.UTF8Encoding]::new($false))
+$built = Join-Path $repo 'build/pages'
+foreach ($file in Get-ChildItem -LiteralPath $built -File -Recurse) {
+    $relative = [IO.Path]::GetRelativePath($built, $file.FullName).Replace('\', '/')
+    $blob = Invoke-JsonApi -Method POST -Endpoint "$gitApi/blobs" -Body @{
+        encoding = 'base64'
+        content = [Convert]::ToBase64String([IO.File]::ReadAllBytes($file.FullName))
+    }
+    $entries += @{ path = $relative; mode = '100644'; type = 'blob'; sha = $blob.sha }
 }
-Invoke-Git -Arguments @('-C', $checkout, 'add', '--all')
-& git -C $checkout diff --cached --quiet
-if ($LASTEXITCODE -eq 1) {
-    Invoke-Git -Arguments @('-C', $checkout, 'commit', '-m', 'Publish Voltura Markdown product site')
-    Invoke-Git -Arguments @('-C', $checkout, 'push', 'origin', 'HEAD:refs/heads/gh-pages')
-} elseif ($LASTEXITCODE -ne 0) {
-    throw 'Could not inspect the staged Pages changes.'
+$newTree = Invoke-JsonApi -Method POST -Endpoint "$gitApi/trees" -Body @{ tree = @($entries) }
+if ($newTree.sha -ne $previousTree) {
+    $body = @{ message = 'Publish Voltura Markdown product site'; tree = $newTree.sha; parents = @() }
+    if ($parent) { $body.parents = @($parent) }
+    $commit = Invoke-JsonApi -Method POST -Endpoint "$gitApi/commits" -Body $body
+    if ($parent) {
+        Invoke-JsonApi -Method PATCH -Endpoint "$gitApi/refs/heads/gh-pages" -Body @{ sha = $commit.sha; force = $false } | Out-Null
+    } else {
+        Invoke-JsonApi -Method POST -Endpoint "$gitApi/refs" -Body @{ ref = 'refs/heads/gh-pages'; sha = $commit.sha } | Out-Null
+    }
 } else {
     Write-Host 'Published page content is already current.'
 }
@@ -88,6 +93,6 @@ if (($repositoryInfo | Out-String).Trim() -eq 'true') {
         }
     }
 }
-Write-Host 'gh-pages pushed and branch-based GitHub Pages configured.'
+Write-Host 'Generated gh-pages files published and branch-based GitHub Pages configured.'
 Write-Host "Publication status: https://github.com/$Repository/settings/pages"
-Write-Host "Isolated checkout retained for inspection: $checkout"
+Write-Host 'Primary source checkout remains on main; no local Pages checkout was created.'
