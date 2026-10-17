@@ -47,8 +47,8 @@ VIAddVersionKey /LANG=1033 "Comments" "Developer: Joakim Skoglund; Website: http
 !define MUI_WELCOMEFINISHPAGE_BITMAP_STRETCH FitControl
 !define MUI_UNWELCOMEFINISHPAGE_BITMAP "..\assets\installer-banner.bmp"
 !define MUI_UNWELCOMEFINISHPAGE_BITMAP_STRETCH FitControl
-!define MUI_WELCOMEPAGE_TITLE "Welcome to Voltura Markdown ${VERSION} Setup"
-!define MUI_WELCOMEPAGE_TEXT "A fast, quiet place to read Markdown.$\r$\n$\r$\nRead formatted documents or original source, search, copy text, and switch between light and dark themes.$\r$\n$\r$\nSetup installs for your Windows account. Your default apps stay unchanged. You can register Markdown support later from the viewer's menu.$\r$\n$\r$\nClose Voltura Markdown before installing an update."
+!define MUI_WELCOMEPAGE_TITLE "Install Voltura Markdown ${VERSION}"
+!define MUI_WELCOMEPAGE_TEXT "View formatted Markdown documents or their original source. Search within documents, copy text, and switch between light and dark themes.$\r$\n$\r$\nVoltura Markdown installs for your Windows account only.$\r$\n$\r$\nClose Voltura Markdown before installing an update."
 !define MUI_PAGE_CUSTOMFUNCTION_SHOW SmoothWelcomeArtwork
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
@@ -60,7 +60,7 @@ VIAddVersionKey /LANG=1033 "Comments" "Developer: Joakim Skoglund; Website: http
 !define MUI_FINISHPAGE_SHOWREADME_TEXT "Choose as default Markdown reader"
 !define MUI_FINISHPAGE_SHOWREADME_NOTCHECKED
 !define MUI_FINISHPAGE_SHOWREADME_FUNCTION ConfigureDefaults
-!define MUI_FINISHPAGE_TEXT "Voltura Markdown is ready.$\r$\n$\r$\nTo use it as your default Markdown reader, select the option below. Windows Settings will open so you can confirm your choice."
+!define MUI_FINISHPAGE_TEXT "Voltura Markdown is installed.$\r$\nUse the default reader option to open Windows settings and choose Voltura Markdown for .md files."
 !define MUI_PAGE_CUSTOMFUNCTION_SHOW SmoothFinishArtwork
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM

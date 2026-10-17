@@ -13,7 +13,7 @@ Visit the [product website](https://voltura.github.io/voltura-markdown/) or open
 | **`vmd.exe`** | Portable reader. Download, keep in a suitable folder, and run. |
 | **`VolturaMarkdown-Setup-<version>-win-x64.exe`** | Per-user installation with a Start menu shortcut and Windows uninstall entry. |
 
-**1.1.0** includes self-signed, timestamped executables. GitHub's source archives do not contain a built app; download one of the executable assets above.
+**1.1.1** includes self-signed, timestamped executables. GitHub's source archives do not contain a built app; download one of the executable assets above.
 
 Setup requires no administrator access. Its optional **Choose as default Markdown reader** checkbox opens Windows Default apps so you can make the final choice.
 
@@ -25,7 +25,7 @@ Double-click the app, use **Ctrl+O**, or drop a `.md` file onto its window. You 
 .\vmd.exe "C:\Documents\example.md"
 ```
 
-The reader starts fullscreen. **F11** switches window modes. **Escape** closes directly when launched with a file path, including from Explorer; otherwise it leaves fullscreen or closes a normal window. Search and Help/About are dismissed first. The fullscreen **X** exits directly. Press **F1** for Help.
+The reader starts in a normal window without a document, and fullscreen when launched with a document (unless **Start fullscreen** is disabled). **F11** switches window modes. **Escape** closes directly when launched with a file path, including from Explorer; otherwise it leaves fullscreen or closes a normal window. Search and Help/About are dismissed first. The fullscreen **X** exits directly. Press **F1** for Help.
 
 To update, close the reader and replace the portable executable, or run the newer Setup. Documents and preferences are retained.
 
@@ -43,7 +43,7 @@ The portable reader needs no companion DLLs, browser engine, .NET, or Visual C++
 ## Documentation
 
 - [User guide](docs/USER-GUIDE.md) · [Supported formats and limits](docs/COMPATIBILITY.md)
-- [Release notes](docs/releases/1.1.0.md) · [Changelog](CHANGELOG.md)
+- [Release notes](docs/releases/1.1.1.md) · [Changelog](CHANGELOG.md)
 - [Folder and document map](docs/REPOSITORY.md) · [Architecture](docs/ARCHITECTURE.md)
 - [Build and verify](docs/BUILDING.md) · [Code style](docs/CODE-STYLE.md) · [Performance](PERFORMANCE.md)
 - [Local releases and signing](docs/RELEASING.md) · [Product website](docs/PAGES.md)

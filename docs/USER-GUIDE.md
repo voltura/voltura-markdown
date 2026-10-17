@@ -10,7 +10,7 @@ Run `vmd.exe`, press **Ctrl+O**, or drop a Markdown file onto the window. Each l
 .\vmd.exe "C:\Documents\example.md"
 ```
 
-The reader starts fullscreen. Use **F11** to switch window modes. **Escape** dismisses search or Help/About first. When launched with a file path (including from Explorer), it then closes directly, even in fullscreen. Without a file argument, it leaves fullscreen or closes a normal window. The fullscreen **X** and **Alt+F4** close immediately.
+The reader starts in a normal window without a document, and fullscreen when launched with a document (unless **Start fullscreen** is disabled). Use **F11** to switch window modes. **Escape** dismisses search or Help/About first. When launched with a file path (including from Explorer), it then closes directly, even in fullscreen. Without a file argument, it leaves fullscreen or closes a normal window. The fullscreen **X** and **Alt+F4** close immediately.
 
 ## Controls
 
@@ -52,7 +52,7 @@ The portable download is just `vmd.exe`. To update, close it and replace the fil
 
 Setup installs for your account under `%LOCALAPPDATA%\Programs\Voltura Markdown`. Run newer Setup to update; use Windows **Installed apps** to uninstall. Documents and preferences are retained.
 
-To use the reader for `.md` files, select Setup's optional **Choose as default Markdown reader**, or choose **Register for .md files** in the app. Both open Windows Default apps for your final selection. Keep a portable copy at a stable path and register again if you move it. **Unregister application** removes its registration.
+To use the reader for `.md` files, select Setup's optional **Choose as default Markdown reader**, or choose **Register for .md files** in the app. Both open the app's page in Windows Default apps where supported; otherwise, find **Voltura Markdown** in Default apps. Confirm it for **.md** files. No administrator rights are required. Keep a portable copy at a stable path and register again if you move it. **Unregister application** removes its registration.
 
 ## Troubleshooting
 

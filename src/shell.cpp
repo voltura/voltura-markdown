@@ -231,11 +231,16 @@ std::wstring registerApplication(bool remove, bool integrateWithShell, bool *reg
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
         openDefaultSettings();
     }
-    return L"Voltura Markdown is registered. Choose it for .md files in Windows Default apps. Keep the "
-           L"executable at this location, or register it again after moving it.";
+    return L"Voltura Markdown is registered. Windows opens this app's default settings where "
+           L"supported; otherwise, find Voltura Markdown in Default apps. Confirm it for .md files. "
+           L"Keep the executable at this location, or register it again after moving it.";
 }
 void openDefaultSettings() {
-    ShellExecuteW(nullptr, L"open", L"ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
+    auto result =
+        ShellExecuteW(nullptr, L"open", L"ms-settings:defaultapps?registeredAppUser=Voltura%20Markdown",
+                      nullptr, nullptr, SW_SHOWNORMAL);
+    if ((INT_PTR)result <= 32)
+        ShellExecuteW(nullptr, L"open", L"ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
 }
 std::filesystem::path markdownLinkPath(std::wstring_view link, const std::filesystem::path &base) {
     auto fragment = link.find(L'#');
@@ -272,7 +277,7 @@ bool openLink(const std::wstring &link, const std::wstring &base) {
     return false;
 }
 std::wstring licenses() {
-    std::wstring text = L"# Voltura Markdown\n\n**Version 1.1.0**\n\n"
+    std::wstring text = L"# Voltura Markdown\n\n**Version 1.1.1**\n\n"
                         L"A fast, read-only Markdown reader for Windows.\n\n"
                         L"## Created by\n\n- **Developer:** Joakim Skoglund\n"
                         L"- **Company:** Voltura AB\n- **Website:** [voltura.se](https://voltura.se/)\n\n"

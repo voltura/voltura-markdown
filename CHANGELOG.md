@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1 — 2026-10-17
+
+- Starts in a normal window when launched without a document.
+- Opens the app's Default apps settings directly on supported Windows versions, with Windows confirmation for .md files.
+- Clearer installer welcome and completion text.
+
 ## 1.1.0 — 2026-10-17
 
 - Faster first-page display using software rendering while hardware rendering prepares in the background.
@@ -32,4 +38,4 @@
 - Background loading, bounded layout/image caches, Unicode boundary handling, and cancellable search.
 - MIT-licensed application, documentation, and current artwork.
 
-See [release notes](docs/releases/1.1.0.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
+See [release notes](docs/releases/1.1.1.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.

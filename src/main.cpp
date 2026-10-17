@@ -1912,7 +1912,7 @@ Open the **three-dot menu** for these options:
 
 1. Keep the app in its permanent location.
 2. Choose **Register for .md files…** from the three-dot menu.
-3. In Windows Default apps, select **Voltura Markdown** for **.md**.
+3. Windows opens this app's default settings where supported; otherwise, find **Voltura Markdown** in Default apps. Confirm it for **.md** files.
 
 Setup also offers **Choose as default Markdown reader**. You confirm the final choice in Windows.
 
@@ -1920,7 +1920,7 @@ Setup also offers **Choose as default Markdown reader**. You confirm the final c
 
 In the **three-dot menu**:
 
-- **Start fullscreen:** choose how future windows open.
+- **Start fullscreen:** choose how future windows open when launched with a document. Without a document, the app starts in a normal window.
 - **Use Windows theme:** follow your system's light / dark setting.
 )md");
     }
@@ -3407,7 +3407,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     app.startupPhase("window_created");
     if (!path.empty())
         app.open(path);
-    if (app.prefs.startFullscreen)
+    if (app.launchedWithFile && app.prefs.startFullscreen)
         app.toggleFullscreen();
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
