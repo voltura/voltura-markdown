@@ -14,6 +14,9 @@
 #include <dwrite.h>
 #include <dwrite_1.h>
 #include <fstream>
+#ifdef VMD_TESTING
+#include <iomanip>
+#endif
 #include <list>
 #include <memory>
 #include <psapi.h>
@@ -227,7 +230,7 @@ struct App {
     };
     std::shared_ptr<AssociationResult> associationResult;
     HWND associationPanel = nullptr;
-    std::array<HWND, 2> associationButtons{};
+    std::array<HWND, 3> associationButtons{};
     std::wstring associationError;
 #ifdef VMD_TESTING
     std::wstring testAssociation;
@@ -1443,7 +1446,8 @@ struct App {
         SetWindowPos(associationPanel, nullptr, origin.x, origin.y, panelWidth, panelHeight,
                      SWP_NOZORDER | SWP_NOACTIVATE);
         MoveWindow(associationButtons[0], (int)(16 * s), buttonY, (int)(170 * s), (int)(32 * s), TRUE);
-        MoveWindow(associationButtons[1], (int)(196 * s), buttonY, (int)(86 * s), (int)(32 * s), TRUE);
+        MoveWindow(associationButtons[1], (int)(194 * s), buttonY, (int)(94 * s), (int)(32 * s), TRUE);
+        MoveWindow(associationButtons[2], (int)(296 * s), buttonY, (int)(86 * s), (int)(32 * s), TRUE);
         InvalidateRect(associationPanel, nullptr, FALSE);
     }
     static LRESULT CALLBACK associationProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1464,6 +1468,12 @@ struct App {
         }
         if (msg == WM_COMMAND) {
             app->command(LOWORD(wp));
+            return 0;
+        }
+        if (msg == WM_TIMER && wp == 1) {
+            KillTimer(window, 1);
+            SetWindowTextW(app->associationButtons[1], L"Copy path");
+            InvalidateRect(app->associationButtons[1], nullptr, FALSE);
             return 0;
         }
         if (msg == WM_PAINT) {
@@ -1505,6 +1515,7 @@ struct App {
         return DefWindowProcW(window, msg, wp, lp);
     }
     void showAssociation() {
+        VMD_TEST_ONLY(auto previousFocus = GetFocus();)
         WNDCLASSEXW c{sizeof(c)};
         c.lpfnWndProc = associationProc;
         c.hInstance = GetModuleHandleW(nullptr);
@@ -1516,18 +1527,22 @@ struct App {
                             WS_POPUP | WS_CLIPCHILDREN, 0, 0, 1, 1, hwnd, nullptr, c.hInstance, this);
         if (!associationPanel)
             return;
-        const wchar_t *names[] = {L"Open Default apps", L"Dismiss"};
+        const wchar_t *names[] = {L"Open Default apps", L"Copy path", L"Dismiss"};
+        const int ids[] = {150, 152, 151};
         for (size_t i = 0; i < associationButtons.size(); ++i) {
             associationButtons[i] =
                 CreateWindowExW(0, L"BUTTON", names[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0,
-                                0, 1, 1, associationPanel, (HMENU)(INT_PTR)(150 + i), nullptr, nullptr);
+                                0, 1, 1, associationPanel, (HMENU)(INT_PTR)ids[i], nullptr, nullptr);
             SetWindowSubclass(associationButtons[i], childProc, 1, (DWORD_PTR)this);
         }
         positionAssociation();
         ShowWindow(associationPanel, SW_SHOWNOACTIVATE);
+        VMD_TEST_ONLY(associationTrace(previousFocus == GetFocus() ? "notice_focus_preserved"
+                                                                   : "notice_focus_changed");)
         VMD_TEST_ONLY(associationTrace("notice_shown");)
     }
     void dismissAssociation() {
+        KillTimer(associationPanel, 1);
         if (associationPanel && IsChild(associationPanel, GetFocus()))
             SetFocus(hwnd);
         ShowWindow(associationPanel, SW_HIDE);
@@ -2250,6 +2265,32 @@ struct App {
         case 151:
             dismissAssociation();
             break;
+        case 152: {
+            if (!IsWindowVisible(associationPanel))
+                break;
+            bool copied = false;
+            try {
+                std::wstring path(32768, L'\0');
+                auto length = GetModuleFileNameW(nullptr, path.data(), (DWORD)path.size());
+                if (length && length < path.size()) {
+                    path.resize(length);
+#ifdef VMD_TESTING
+                    if (!testAssociation.empty()) {
+                        copied = testAssociation != L"copy-failure";
+                        std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+                        out << "{\"copied_executable\":" << std::quoted(toUtf8(path)) << "}\n";
+                    } else
+#endif
+                        copied = copyText(hwnd, path);
+                }
+            } catch (const std::exception &) {
+                // Optional clipboard work must leave the open document usable.
+            }
+            SetWindowTextW(associationButtons[1], copied ? L"Copied" : L"Copy failed");
+            InvalidateRect(associationButtons[1], nullptr, FALSE);
+            SetTimer(associationPanel, 1, 2000, nullptr);
+            break;
+        }
         case 130:
         case 131:
         case 132:
@@ -2951,7 +2992,7 @@ In the **three-dot menu**:
             bg = dark ? RGB(46, 59, 78) : RGB(230, 237, 250);
         if (item.itemState & ODS_SELECTED)
             bg = dark ? RGB(63, 82, 112) : RGB(209, 223, 248);
-        bool associationButton = item.CtlID == 150 || item.CtlID == 151;
+        bool associationButton = item.CtlID >= 150 && item.CtlID <= 152;
         auto background = CreateSolidBrush(item.CtlID >= 140 && item.CtlID <= 142 ? RGB(255, 0, 255)
                                            : associationButton ? (dark ? RGB(28, 34, 45) : RGB(255, 255, 255))
                                            : dark              ? RGB(16, 19, 25)
@@ -2982,7 +3023,8 @@ In the **three-dot menu**:
         ob = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
         switch (item.CtlID) {
         case 150:
-        case 151: {
+        case 151:
+        case 152: {
             wchar_t label[64]{};
             GetWindowTextW(item.hwndItem, label, 64);
             auto font = SelectObject(dc, uiFont);

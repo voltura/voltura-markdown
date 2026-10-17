@@ -2,6 +2,12 @@
 
 Local x64 MSVC Release measurements, 2026-10-17. Intel Core Ultra 9 185H, 22 logical processors, 63.5 GiB usable RAM; Windows 11 Pro build 26300, 3840×2160 at 225% scaling.
 
+## 1.1.7 association notice checks
+
+The existing notice title, explanation, dimensions, and delayed background association probe are retained. Copy path reads the executable location and writes clipboard text only on explicit activation; feedback stays inside the button. Association tests cover Unicode/spaces in a renamed executable path, success/failure feedback, tab order, dismissal, synchronous focus preservation, and unchanged registration/defaults. A test-only clipboard sink leaves the user's clipboard untouched; it validates the requested text and UI behavior, not an actual system clipboard write. Dark/light notice captures were inspected.
+
+Five-launch warm/cache-dependent medians were 82 → 103 ms for 1 KiB and 312 → 339 ms for 10 MiB (`build/bench/copy-path-before.json`, `build/bench/copy-path-after-idle.json`). The later sample spent more time in render-target initialization and, for the large fixture, parsing; neither path changed in this patch. These samples do not establish performance equivalence. The 10 MiB first search match painted in 3.9 ms, navigation in 2.4 ms, and counting 72,818 matches completed in 46 ms. Native/package tests, both UI exit paths, 652 CommonMark cases, formatting, and the isolated installer lifecycle passed.
+
 ## 1.1.6 layout regression checks
 
 Native geometry checks first reproduced nested-table border/background misalignment, ignored image indentation, unscaled placeholder offsets, and uneven/gapped backgrounds between bounded code sections. The corrected checks pass at 50%, 100%, 200%, and 300% document zoom. Wide-code padding and horizontal scrolling also pass. Actual native-window captures at 300% were inspected for quoted tables, loaded and missing images, and wide code in dark/light themes; these are local screenshots, not a new physical-monitor/DPI certification.

@@ -5,6 +5,7 @@ from ctypes import wintypes as w
 import json
 import importlib.util
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -28,6 +29,8 @@ u.IsWindowEnabled.argtypes = [w.HWND]
 u.PostMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
 u.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
 u.SendMessageW.restype = w.LPARAM
+u.GetWindowTextW.argtypes = [w.HWND, w.LPWSTR, c.c_int]
+u.GetWindowRect.argtypes = [w.HWND, c.POINTER(w.RECT)]
 
 
 class GuiInfo(c.Structure):
@@ -47,6 +50,18 @@ def focus(hwnd):
     thread = u.GetWindowThreadProcessId(hwnd, None)
     assert u.GetGUIThreadInfo(thread, c.byref(info))
     return info.focus
+
+
+def label(hwnd):
+    text = c.create_unicode_buffer(128)
+    u.GetWindowTextW(hwnd, text, len(text))
+    return text.value
+
+
+def bounds(hwnd):
+    rect = w.RECT()
+    assert u.GetWindowRect(hwnd, c.byref(rect))
+    return (rect.left, rect.top, rect.right, rect.bottom)
 
 
 def window_for(pid, class_name="VolturaMarkdownWindow"):
@@ -104,9 +119,15 @@ def registry_snapshot():
 
 before = registry_snapshot()
 summary = []
-for mode in ("mismatch", "unknown", "slow", "defer", "empty", "production"):
+for mode in ("mismatch", "copy-failure", "unknown", "slow", "defer", "empty", "production"):
     metric = folder / (mode + ".jsonl")
-    args = [str(root / "build/Release/vmd-test.exe"), "--no-preferences", "--metrics", str(metric)]
+    executable = root / "build/Release/vmd-test.exe"
+    if mode == "mismatch":
+        relocated = folder / "Portable copy Å" / "reader renamed.exe"
+        relocated.parent.mkdir()
+        shutil.copy2(executable, relocated)
+        executable = relocated
+    args = [str(executable), "--no-preferences", "--metrics", str(metric)]
     if mode != "empty":
         args.append(str(root / "tests/showcase.md"))
     if mode != "production":
@@ -119,7 +140,9 @@ for mode in ("mismatch", "unknown", "slow", "defer", "empty", "production"):
             return []
         # A row may still be in flight while reading the append-only log.
         return [
-            json.loads(line) for line in metric.read_text().splitlines(keepends=True) if line.endswith("\n")
+            json.loads(line)
+            for line in metric.read_text(encoding="utf-8").splitlines(keepends=True)
+            if line.endswith("\n")
         ]
 
     def event(name):
@@ -128,7 +151,6 @@ for mode in ("mismatch", "unknown", "slow", "defer", "empty", "production"):
     try:
         hwnd = wait_for(lambda: window_for(process.pid), process)
         delayed = wait_for(lambda: event("delay_started"), process)
-        original_focus = focus(hwnd)
         if mode != "empty":
             ready = next(row for row in rows() if "first_content_ms" in row)
             assert ready["first_content_ms"] <= delayed["elapsed_ms"]
@@ -158,9 +180,11 @@ for mode in ("mismatch", "unknown", "slow", "defer", "empty", "production"):
                 wait_for(lambda: event("notice_shown"), process)
                 panel = window_for(process.pid, "VolturaMarkdownAssociation")
                 assert panel and u.IsWindowVisible(panel)
-                assert focus(hwnd) == original_focus, "Notice stole keyboard focus"
-                action, dismiss = u.GetDlgItem(panel, 150), u.GetDlgItem(panel, 151)
-                # Tab must reach both buttons through the existing application tab loop.
+                # Measure focus across notice creation inside the viewer, not across
+                # the three-second delay when desktop focus can legitimately change.
+                assert event("notice_focus_preserved"), "Notice stole keyboard focus"
+                action, copy, dismiss = (u.GetDlgItem(panel, n) for n in (150, 152, 151))
+                # Tab must reach all buttons through the existing application tab loop.
                 u.PostMessageW(hwnd, 0x100, 9, 0)
                 time.sleep(0.05)
                 for _ in range(20):
@@ -171,7 +195,20 @@ for mode in ("mismatch", "unknown", "slow", "defer", "empty", "production"):
                     time.sleep(0.03)
                 assert focus(hwnd) == action, "Notice action is unreachable by Tab"
                 u.PostMessageW(action, 0x100, 9, 0)
+                wait_for(lambda: focus(hwnd) == copy, process)
+                original_bounds = bounds(panel)
+                # Test-only clipboard sink keeps the user's clipboard untouched.
+                u.PostMessageW(copy, 0x100, 13, 0)
+                expected = "Copy failed" if mode == "copy-failure" else "Copied"
+                wait_for(lambda: label(copy) == expected, process)
+                copied = next(row["copied_executable"] for row in rows() if "copied_executable" in row)
+                assert copied == str(executable.resolve()), "Must copy the running executable, not document"
+                assert bounds(panel) == original_bounds, "Copy feedback expanded the notice"
+                assert not event("registration_started"), "Copy must not register or open Settings"
+                assert focus(hwnd) == copy and u.IsWindowVisible(panel)
+                u.PostMessageW(copy, 0x100, 9, 0)
                 wait_for(lambda: focus(hwnd) == dismiss, process)
+                wait_for(lambda: label(copy) == "Copy path", process)
                 for theme in ("alternate", "original"):
                     u.SendMessageW(hwnd, 0x111, 103, 0)
                     if mode == "mismatch" and importlib.util.find_spec("PIL"):

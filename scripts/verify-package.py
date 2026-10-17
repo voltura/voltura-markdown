@@ -31,6 +31,7 @@ test_markers = (
     "failure_injection",
     "brush_creation_failure",
     "formatted_default",
+    "copied_executable",
     "search_match_keeps_two_rows_of_context_at_each_zoom",
 )
 for marker in test_markers:
@@ -78,8 +79,8 @@ expected = {
     "ProductName": "Voltura Markdown",
     "FileDescription": "Voltura Markdown",
     "OriginalFilename": "vmd.exe",
-    "FileVersion": "1.1.6",
-    "ProductVersion": "1.1.6",
+    "FileVersion": "1.1.7",
+    "ProductVersion": "1.1.7",
 }
 for key, value in expected.items():
     pointer = c.c_void_p()

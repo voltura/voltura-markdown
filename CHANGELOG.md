@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.7 — 2026-10-17
+
+- Adds Copy path to the existing default-app notice, copying the running executable location.
+- Shows brief Copied or Copy failed feedback inside the button without expanding the notice or interrupting reading.
+- Preserves the notice wording and the Open Default apps and Dismiss actions.
+
 ## 1.1.6 — 2026-10-17
 
 - Keeps wide code backgrounds aligned with text and right-hand padding at high zoom.
@@ -76,4 +82,4 @@
 - Background loading, bounded layout/image caches, Unicode boundary handling, and cancellable search.
 - MIT-licensed application, documentation, and current artwork.
 
-See [release notes](docs/releases/1.1.6.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
+See [release notes](docs/releases/1.1.7.md) for downloads and [compatibility](docs/COMPATIBILITY.md) for limits.
