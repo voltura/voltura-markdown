@@ -111,6 +111,7 @@ struct App {
     };
     bool stagedRenderer = false, rendererStarted = false, hardwareActive = false;
     bool closeRequested = false, promotionPending = false;
+    bool failRendererPreparation = false, failRendererFirstFrame = false, fallbackAwaitingFrame = false;
     std::shared_ptr<PreparedRenderer> preparedRenderer;
     std::thread rendererWorker;
     double rendererPromotionMs = 0;
@@ -423,13 +424,16 @@ struct App {
         GetClientRect(canvas, &bounds);
         auto size = D2D1::SizeU(std::max(1L, bounds.right), std::max(1L, bounds.bottom));
         HWND destination = canvas;
+        bool failPreparation = failRendererPreparation;
         // The factory is private to this worker until the release/acquire handoff.
         // No drawing occurs here; the software frame remains visible throughout preparation.
-        rendererWorker = std::thread([prepared, destination, size] {
+        rendererWorker = std::thread([prepared, destination, size, failPreparation] {
             auto began = std::chrono::steady_clock::now();
             HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             prepared->result =
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, prepared->factory.GetAddressOf());
+            if (failPreparation)
+                prepared->result = E_FAIL;
             if (SUCCEEDED(prepared->result))
                 prepared->result = prepared->factory->CreateHwndRenderTarget(
                     D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_HARDWARE),
@@ -461,7 +465,11 @@ struct App {
             << ",\"prepare_ms\":" << preparedRenderer->prepareMs
             << ",\"ui_promotion_ms\":" << rendererPromotionMs << ",\"since_start_ms\":"
             << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count()
-            << ",\"hresult\":" << result << ",\"viewport_matches\":"
+            << ",\"hresult\":" << result << ",\"failure_injection\":\""
+            << (failRendererPreparation  ? "preparation"
+                : failRendererFirstFrame ? "first_frame"
+                                         : "none")
+            << "\",\"viewport_matches\":"
             << (targetDpiX == dpi && targetDpiY == dpi && pixels.width == (UINT32)bounds.right &&
                         pixels.height == (UINT32)bounds.bottom
                     ? "true"
@@ -492,6 +500,8 @@ struct App {
         if (FAILED(result)) {
             recordPromotion(false, result);
             preparedRenderer.reset();
+            fallbackAwaitingFrame = true;
+            invalidate();
             if (exitOnContent)
                 SetTimer(hwnd, 9, 100, nullptr);
             return;
@@ -1014,6 +1024,9 @@ struct App {
         }
         drawScrollbars(colors);
         HRESULT hr = target->EndDraw();
+        // Exercise the recovery from an EndDraw device-loss result without requiring a real GPU reset.
+        if (promotionPending && failRendererFirstFrame)
+            hr = D2DERR_RECREATE_TARGET;
         bool retryPaint = hr == D2DERR_RECREATE_TARGET;
         if (hr == D2DERR_RECREATE_TARGET) {
             target.Reset();
@@ -1042,6 +1055,7 @@ struct App {
                 }
                 clearLayouts();
                 retryPaint = true;
+                fallbackAwaitingFrame = true;
             } else {
                 softwareBrush.Reset();
                 softwareTarget.Reset();
@@ -1057,6 +1071,13 @@ struct App {
             recordMetric();
             if (exitOnContent && !stagedRenderer)
                 SetTimer(hwnd, 9, 100, nullptr);
+        }
+        if (fallbackAwaitingFrame && paintedDocument && SUCCEEDED(hr) && !hardwareActive) {
+            fallbackAwaitingFrame = false;
+            if (!metricsFile.empty()) {
+                std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+                out << "{\"software_fallback_frame\":true,\"blocks\":" << doc->blocks.size() << "}\n";
+            }
         }
         EndPaint(canvas, &ps);
         if (retryPaint)
@@ -3332,6 +3353,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             app.benchmarkAnimations = true;
         else if (a == L"--staged-renderer")
             app.stagedRenderer = true;
+        else if (a == L"--test-renderer-fail-preparation")
+            app.failRendererPreparation = true;
+        else if (a == L"--test-renderer-fail-first-frame")
+            app.failRendererFirstFrame = true;
         else if (a == L"--scroll-benchmark" && i + 1 < argc) {
             app.scrollBenchmark = true;
             app.verifyFile = args[++i];

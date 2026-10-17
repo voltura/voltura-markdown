@@ -13,6 +13,9 @@ options.add_argument("--runs", type=int, default=3)
 options.add_argument("--sizes", type=int, nargs="+", default=[1024, 1024**2, 10 * 1024**2, 100 * 1024**2])
 options.add_argument("--output", default="results.json")
 options.add_argument(
+    "--staged-renderer", action="store_true", help="Test software-first experimental rendering"
+)
+options.add_argument(
     "--startup-only",
     action="store_true",
     help="Launch GUI before any parser run; skips parser/pathological cases",
@@ -49,6 +52,7 @@ for size in args.sizes:
                 "20000",
                 "--no-preferences",
             ]
+            + (["--staged-renderer"] if args.staged_renderer else [])
         )
         try:
             while not metric.exists():
@@ -69,7 +73,13 @@ for size in args.sizes:
                     process.wait(timeout=5)
         if not metric.exists():
             raise RuntimeError(f"No first content metric for {size}")
-        sample = json.loads(metric.read_text().splitlines()[0])
+        records = [json.loads(line) for line in metric.read_text().splitlines()]
+        sample = next(row for row in records if "first_content_ms" in row)
+        if args.staged_renderer:
+            promotion = next((row for row in records if "renderer_promotion" in row), None)
+            if not promotion or not promotion["renderer_promotion"]:
+                raise RuntimeError(f"Hardware promotion failed: {records}")
+            sample["renderer_promotion"] = promotion
         sample["process_to_metric_ms"] = process_to_metric_ms
         gui.append(sample)
         if not args.startup_only:

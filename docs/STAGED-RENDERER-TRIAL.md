@@ -39,16 +39,23 @@ Raw results: `build/renderer-ab-1792202151003682700/results.json`.
 - Resize/DPI change during preparation passed; the promoted target matched the current viewport and DPI.
 - Staged 10 MiB forced animated scrolling: 727 paint samples, 0.658 ms mean / 0.931 ms p95 CPU paint time.
 
-The scroll result measures CPU painting, not display-level frame pacing. No claim of flicker-free switching is made from these automated checks. Visual review, display tracing of the transition, cold starts, and injected graphics-device failures remain unverified.
+The user reported no visible flicker during manual review. That observation is separate from automated checks. Display tracing of the transition and cold starts remain unverified.
+
+## Failure recovery
+
+`scripts/test-renderer-failures.py` injects preparation failure and a first hardware-frame device-loss result. Each case must record the failure, then a successful software-rendered document frame. The full UI interaction harness and forced animated scrolling run after each failure.
+
+All four cases passed, including search, selection, zoom, themes, fullscreen, simulated DPI changes, scrolling and closing. The first-frame test substitutes `D2DERR_RECREATE_TARGET` after `EndDraw`; it validates the recovery branch without resetting the physical graphics device. Real driver resets and display-level frame pacing remain unverified.
 
 ## Repeat the checks
 
 ```powershell
 python scripts/benchmark-renderer.py build/bench/1024.md build/bench/10485760.md --runs 7
 python scripts/test-renderer-transition.py
+python scripts/test-renderer-failures.py
 .\scripts\test-display.ps1 -StagedRenderer
 .\scripts\test-display.ps1 -StagedRenderer -CloseFullscreen
 .\scripts\test-display.ps1 -StagedRenderer -Scroll -Animate -Document build/bench/10485760.md
 ```
 
-The benchmark expects existing documents. Its JSONL records distinguish first content, background preparation and first hardware presentation. The trial scripts write only under `build/` and do not change associations or Windows display settings.
+The benchmark expects existing documents. Its JSONL records distinguish first content, background preparation and the first successful hardware paint. The trial scripts write only under `build/` and do not change associations or Windows display settings.
