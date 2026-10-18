@@ -2,7 +2,7 @@
 
 [Project overview](../README.md) · [Repository/document map](REPOSITORY.md) · [Build and checks](BUILDING.md)
 
-The reader is a native Windows process with one window per invocation. Its priorities are fast first content, responsive input, a small executable, and a read-only document model. There is no browser engine or editable document widget tree.
+The reader is a native Windows process with one window per invocation. Its priorities are fast first content, responsive input, and a small executable. Reading uses an immutable document model; optional source editing uses a separate draft and lazily loaded Windows Rich Edit control. There is no browser engine.
 
 ## Source ownership
 
@@ -11,6 +11,9 @@ The reader is a native Windows process with one window per invocation. Its prior
 | [main.cpp](../src/main.cpp) | Application/window lifecycle, DirectWrite layouts, Direct2D canvas, selection/search, scrolling, themes, toolbar/menu, Help/About navigation | Reading interactions, controls, layout, painting, fullscreen, DPI |
 | [search.h](../src/search.h) | Shared ordinal case-insensitive search and constant-memory counting | Matching, wrapping, cancellation and total-count consistency |
 | [document.h](../src/document.h) / [document.cpp](../src/document.cpp) | Encodings, MD4C adapter, formatted text, blocks/runs/cells, source segmentation, safe HTML subset | Syntax, text/anchor model, encoding handling, parser bounds |
+| [edit.h](../src/edit.h) / [edit.cpp](../src/edit.cpp) | Markdown text operations, encoding-aware atomic saves, Markdown-aware validation | Insertions, source fidelity, conflict detection, warnings |
+| [editor.h](../src/editor.h) / [editor.cpp](../src/editor.cpp) | Lazy native editor, toolbar/dialogs, draft state and background work | Editing interactions, undo, preview, validation scheduling |
+| [editor-tools.h](../src/editor-tools.h) / [editor-tools.cpp](../src/editor-tools.cpp) | Outline, bounded syntax helpers, tables, replacements, recovery, managed assets, HTML and native print | On-demand editing tools; no reader startup work |
 | [images.h](../src/images.h) / [images.cpp](../src/images.cpp) | Background image queue/cache, local/HTTPS reads, WIC and NanoSVG decoding | Image formats, fetch/decode limits, caching |
 | [shell.h](../src/shell.h) / [shell.cpp](../src/shell.cpp) | Preferences, links, registration, clipboard/file actions, external app chooser, license text | Windows integration and persisted options |
 | [empty-state.h](../src/empty-state.h) / [empty-state.cpp](../src/empty-state.cpp) | Static native vector illustration | Empty-view artwork and matching icon source |
@@ -62,4 +65,8 @@ The shell boundary owns optional per-user registration, file clipboard data, sup
 | Runtime/resources/icon/version | [package verifier](../scripts/verify-package.py), [artwork notes](../assets/ICON-NOTES.md), clean Windows execution |
 | Startup/layout/memory | [benchmark runner](../scripts/benchmark.py), [performance methodology](../PERFORMANCE.md), actual cold/warm conditions |
 
-See the [code style guide](CODE-STYLE.md) before editing. Keep new functionality in the existing owner when it remains cohesive; extract a dedicated module when complexity justifies it, without adding layers solely for file-count symmetry. Preserve the no-edit contract and measure performance-sensitive changes.
+Editor initialization, parsing, validation, and saving do not run during reader startup. Typing marks a revision without copying the full source on each keystroke; a 400 ms timer captures a snapshot for cancellable background parsing and validation. Revision checks reject stale results. Preview reuses the renderer and leaves the native source/undo buffer alive. Optional live preview publishes completed draft revisions without changing typing focus, with side-by-side panes at 1000 logical pixels and stacked panes below that width. The renderer uses the preview pane width and maps pointer input from that pane; the main header retains the window width. Saving disables draft editing while a worker validates, checks the disk baseline, writes/flushed a sibling temporary file, rechecks the baseline, and replaces the destination. Abandoning a dirty session is centralized in the window lifecycle; update-driven restarts veto dirty drafts rather than storing draft text in restart snapshots.
+
+Known native edits accumulate a changed interval, allowing snapshot capture to read only that interval. Undo, overtype, and uncertain mutations fall back to full capture. Visible source highlighting is bounded and suspends formatting undo records. Outline/fence maps come from background snapshots. Recovery has a separate periodic worker so continuous typing still checkpoints; retired recovery writers are drained before normal close. Image copying, replacement, export, and external-change probes use revision-checked background jobs. Print cancellation uses CancelDC with synchronized HDC ownership. None of these workers run during reader startup.
+
+See the [code style guide](CODE-STYLE.md) before editing. Keep new functionality in the existing owner when it remains cohesive; extract a dedicated module when complexity justifies it, without adding layers solely for file-count symmetry. Preserve read-mode behavior and measure performance-sensitive changes.

@@ -1,5 +1,7 @@
 # Local releases and signing
 
+Stable automatic updates use the existing executable assets and `SHA256SUMS.txt`. Both executables must retain their expected product/version metadata and the current publisher certificate; unsigned or differently signed assets are rejected. See [automatic updates](UPDATES.md) for staging, shutdown behavior, and isolated validation.
+
 Required: Windows x64, the [build toolchain](BUILDING.md), Python, NSIS 3, and GitHub CLI for publication. Close the reader and run from the repository root.
 
 ## Keep source synchronized

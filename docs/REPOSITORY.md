@@ -40,7 +40,7 @@ Keep one owner per topic. README covers download/start; the separate website exp
 
 - Review tracked files for private paths, documents, logs, and credentials.
 - Retain MIT and dependency/fixture notices.
-- Description: **Fast, portable, read-only Markdown viewer for Windows.**
+- Description: **Fast, portable Markdown reader with optional source editing for Windows.**
 - Topics: `markdown`, `windows`, `cpp20`, `win32`, `direct2d`, `portable`.
 - Configure issues and private vulnerability reporting to match SECURITY.md.
 - Complete the [release checklist](RELEASING.md) before publishing binaries.

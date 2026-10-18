@@ -9,6 +9,10 @@ import subprocess
 import time
 import uuid
 
+from test_desktop import isolate
+
+isolate()
+
 root = pathlib.Path(__file__).resolve().parents[1]
 options = argparse.ArgumentParser(description=__doc__)
 options.add_argument("--document", type=pathlib.Path, default=root / "tests/showcase.md")

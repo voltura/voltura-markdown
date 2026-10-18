@@ -8,6 +8,10 @@ import statistics
 import sys
 import time
 
+from test_desktop import isolate
+
+isolate()
+
 options = argparse.ArgumentParser(description=__doc__)
 options.add_argument("--runs", type=int, default=3)
 options.add_argument("--sizes", type=int, nargs="+", default=[1024, 1024**2, 10 * 1024**2, 100 * 1024**2])

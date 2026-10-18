@@ -15,6 +15,9 @@ Unicode true
 !ifndef SHORTCUT_NAME
     !define SHORTCUT_NAME "Voltura Markdown"
 !endif
+!ifndef APP_BINARY
+    !define APP_BINARY "..\dist\vmd.exe"
+!endif
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_KEY}"
 
 Name "Voltura Markdown"
@@ -27,7 +30,17 @@ ManifestSupportedOS all
 SetCompressor /SOLID lzma
 SetCompressorDictSize 32
 SetDatablockOptimize on
+Var AutomaticUpdate
+Var UpdateCancelName
+Var SetupMutex
+!ifdef TEST_INSTALL_DIRECTORY
+!if "${PRODUCT_KEY}" == "VolturaMarkdown"
+!error "Test installation directory requires an isolated PRODUCT_KEY"
+!endif
+InstallDir "${TEST_INSTALL_DIRECTORY}"
+!else
 InstallDir "$LOCALAPPDATA\Programs\Voltura Markdown"
+!endif
 InstallDirRegKey HKCU "${UNINSTALL_KEY}" "InstallLocation"
 
 VIProductVersion "${VERSION}.0"
@@ -48,7 +61,7 @@ VIAddVersionKey /LANG=1033 "Comments" "Developer: Joakim Skoglund; Website: http
 !define MUI_UNWELCOMEFINISHPAGE_BITMAP "..\assets\installer-banner.bmp"
 !define MUI_UNWELCOMEFINISHPAGE_BITMAP_STRETCH FitControl
 !define MUI_WELCOMEPAGE_TITLE "Install Voltura Markdown ${VERSION}"
-!define MUI_WELCOMEPAGE_TEXT "View formatted Markdown documents or their original source. Search within documents, copy text, and switch between light and dark themes.$\r$\n$\r$\nVoltura Markdown installs for your Windows account only.$\r$\n$\r$\nClose Voltura Markdown before installing an update."
+!define MUI_WELCOMEPAGE_TEXT "A fast Markdown reader and editor.$\r$\n$\r$\nInstalls for your Windows account."
 !define MUI_PAGE_CUSTOMFUNCTION_SHOW SmoothWelcomeArtwork
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
@@ -81,6 +94,61 @@ Function .onInit
     ${EndIf}
     SetRegView 64
     SetShellVarContext current
+    ; Serialize manual and automatic Setup processes before either can stage replacement files.
+    System::Call 'kernel32::SetLastError(i 0)'
+    System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Local\${PRODUCT_KEY}-Setup") p.r0 ?e'
+    Pop $1
+    StrCpy $SetupMutex $0
+    ${If} $0 == 0
+    ${OrIf} $1 == 183
+        SetErrorLevel 1
+        Abort
+    ${EndIf}
+    StrCpy $AutomaticUpdate 0
+    ${GetParameters} $0
+    ClearErrors
+    ${GetOptions} $0 "/AUTOMATICUPDATE" $1
+    ${IfNot} ${Errors}
+        StrCpy $AutomaticUpdate 1
+        IfSilent +3
+            SetErrorLevel 1
+            Abort
+        ; Automatic updates must remain attached to their existing per-user installation.
+        ReadRegStr $0 HKCU "${UNINSTALL_KEY}" "InstallLocation"
+        ${If} $0 != $INSTDIR
+            SetErrorLevel 1
+            Abort
+        ${EndIf}
+        ${GetParameters} $0
+        ClearErrors
+        ${GetOptions} $0 "/UPDATECANCEL=" $UpdateCancelName
+        ${If} ${Errors}
+            SetErrorLevel 1
+            Abort
+        ${EndIf}
+        Call CheckAutomaticUpdateAllowed
+    ${EndIf}
+FunctionEnd
+
+Function CheckAutomaticUpdateAllowed
+    ${If} $AutomaticUpdate == 1
+        System::Call 'user32::GetSystemMetrics(i 0x2000) i.r0'
+        ${If} $0 != 0
+            SetErrorLevel 1
+            Abort
+        ${EndIf}
+        System::Call 'kernel32::OpenEventW(i 0x100000, i 0, w "$UpdateCancelName") p.r1'
+        ${If} $1 == 0
+            SetErrorLevel 1
+            Abort
+        ${EndIf}
+        System::Call 'kernel32::WaitForSingleObject(p r1, i 0) i.r0'
+        System::Call 'kernel32::CloseHandle(p r1)'
+        ${If} $0 != 258
+            SetErrorLevel 1
+            Abort
+        ${EndIf}
+    ${EndIf}
 FunctionEnd
 
 Function un.onInit
@@ -101,7 +169,50 @@ FunctionEnd
 Section "Install"
     SetOutPath "$INSTDIR"
     SetOverwrite on
-    File "..\dist\vmd.exe"
+    ; Stage first: a locked executable or interrupted extraction must preserve the old reader.
+    File /oname=vmd.update-new.exe "${APP_BINARY}"
+    Call CheckAutomaticUpdateAllowed
+    IfFileExists "$INSTDIR\vmd.update-old.exe" 0 +4
+        Delete "$INSTDIR\vmd.update-new.exe"
+        SetErrorLevel 1
+        Abort
+    IfFileExists "$INSTDIR\vmd.exe" 0 replace_reader
+        ${If} $AutomaticUpdate == 0
+            InitPluginsDir
+            SetOutPath "$PLUGINSDIR"
+            File /oname=manual-update.exe "${APP_BINARY}"
+            SetOutPath "$INSTDIR"
+            ClearErrors
+            ExecWait '"$PLUGINSDIR\manual-update.exe" --manual-update "$INSTDIR\vmd.exe" "$INSTDIR\vmd.update-new.exe"' $0
+            ${If} ${Errors}
+            ${OrIf} $0 != 0
+                Delete "$INSTDIR\vmd.update-new.exe"
+                SetErrorLevel 1
+                Abort
+            ${EndIf}
+            IfFileExists "$INSTDIR\vmd.update-new.exe" +2 0
+                Goto reader_replaced
+        ${EndIf}
+        System::Call 'kernel32::ReplaceFileW(w "$INSTDIR\vmd.exe", w "$INSTDIR\vmd.update-new.exe", w "$INSTDIR\vmd.update-old.exe", i 0, p 0, p 0) i.r0'
+        ${If} $0 == 0
+            IfFileExists "$INSTDIR\vmd.exe" +2 0
+                Rename "$INSTDIR\vmd.update-old.exe" "$INSTDIR\vmd.exe"
+            Delete "$INSTDIR\vmd.update-new.exe"
+            SetErrorLevel 1
+            Abort
+        ${EndIf}
+        Goto reader_replaced
+    replace_reader:
+    ClearErrors
+    Rename "$INSTDIR\vmd.update-new.exe" "$INSTDIR\vmd.exe"
+    ${If} ${Errors}
+        Rename "$INSTDIR\vmd.update-old.exe" "$INSTDIR\vmd.exe"
+        Delete "$INSTDIR\vmd.update-new.exe"
+        SetErrorLevel 1
+        Abort
+    ${EndIf}
+    reader_replaced:
+    Delete "$INSTDIR\vmd.update-old.exe"
     File "..\LICENSE"
     File "..\THIRD-PARTY-NOTICES.md"
     SetOutPath "$INSTDIR\licenses"

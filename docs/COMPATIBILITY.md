@@ -12,7 +12,7 @@ The pinned MD4C parser targets CommonMark 0.31.2, with tables, task lists, strik
 
 The native renderer supports headings, inline formatting, quotes, lists, code, links, rules, tables, footnotes, and images. Safe HTML includes basic inline formatting and themed `<kbd>` keyboard keys, headings, paragraphs/divisions, line breaks, anchors, images, tables, nested lists, quotes, rules, preformatted text, and expanded details/summary. Harmless structural wrappers preserve their content; unsupported constructs remain readable in the formatted document. Scripts and CSS are not executed.
 
-Editing, printing, syntax highlighting, arbitrary HTML layouts, Mermaid, and mathematical typesetting are outside this version.
+Optional source editing includes insertion/table helpers, formatted live preview, Find/Replace, heading navigation, bounded source/code highlighting, recovery snapshots, managed images, validation, and explicit Save/Save As. HTML export and native printing (including Windows PDF printers) are available on demand. Highlighting uses common lexical tokens rather than a complete language service. Formatted-document editing, arbitrary HTML layouts, Mermaid, and mathematical typesetting are outside this version. Files containing null characters remain available for reading but cannot enter edit mode safely.
 
 ## Images and links
 

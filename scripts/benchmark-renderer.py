@@ -7,6 +7,10 @@ import statistics
 import subprocess
 import time
 
+from test_desktop import isolate
+
+isolate()
+
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("documents", type=pathlib.Path, nargs="+")
 parser.add_argument("--runs", type=int, default=7)

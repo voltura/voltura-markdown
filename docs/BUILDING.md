@@ -29,6 +29,23 @@ CTest covers the adapter and native integrations. `commonmark.py` checks the pin
 
 Use unique log filenames because UI logs append. Generated captures, logs, benchmark fixtures, and intermediates belong under `build/`, which is ignored. Avoid including private documents in fixtures or reports.
 
+### GUI tests while you work
+
+The Python GUI tests and benchmarks, `test-display.ps1`, and `test-updates.ps1` run on a private Windows desktop by default. Their viewer windows can load, enter fullscreen, and scroll without appearing on your working desktop or taking its keyboard focus. No elevation or desktop switching is needed. Output and exit codes return to the calling terminal. Isolation failures stop the run; they never fall back to opening windows on your working desktop. A Windows job object terminates test-owned descendants when the runner exits or is stopped. This isolates windows, not files, registry state, CPU, or GPU usage.
+
+Use `--interactive` with a Python harness or `-Interactive` with a PowerShell harness when you want to see its windows. For example:
+
+```powershell
+python scripts/test-startup.py --interactive
+.\scripts\test-display.ps1 -Interactive
+# Wrap another GUI command, including its descendants:
+python scripts/test_desktop.py -- .\build\Release\vmd-test.exe .\tests\showcase.md --no-preferences --exit-after 3000
+# Verify isolation and cleanup without opening visible viewer windows:
+python scripts/test-desktop-runner.py
+```
+
+The private desktop exercises native window behavior and CPU paint measurements. It does not establish visible presentation timing, physical monitor/DPI behavior, or visual acceptance. Use interactive runs for those checks and record which desktop was used when comparing performance. `-TraceDisplay` requires `-Interactive`. The regular build's CTest checks remain separate from these GUI harnesses; direct executable launches remain visible.
+
 For icon regeneration, follow [artwork notes](../assets/ICON-NOTES.md). For publishing gates, follow [release procedure](RELEASING.md).
 
 ## Formatting and source navigation
@@ -63,6 +80,8 @@ The association test covers delayed detection, loading deferral, keyboard access
 
 ```powershell
 python scripts/test-startup.py
+python scripts/test-editing.py --capture
+python scripts/test-editor-export.py
 python scripts/test-association.py
 python scripts/test-search.py --document PERFORMANCE.md --query ms --capture
 .\scripts\test-display.ps1
@@ -76,7 +95,7 @@ The UI test simulates DPI changes without changing Windows display settings. It 
 For display-level tracing, download the standalone [PresentMon 2.6.0 console executable](https://github.com/GameTechDev/PresentMon/releases/tag/v2.6.0) into `build/tools/PresentMon.exe`. From an elevated PowerShell session, run:
 
 ```powershell
-.\scripts\test-display.ps1 -Scroll -TraceDisplay -Document .\build\bench\10485760.md
+.\scripts\test-display.ps1 -Interactive -Scroll -TraceDisplay -Document .\build\bench\10485760.md
 ```
 
 The resulting CSV contains only the test process's frames. Trace collection is a developer tool and adds nothing to the distributed app. Successful collection alone does not establish a frame-rate target; inspect displayed frames and frame intervals.

@@ -2,7 +2,7 @@
 
 <!-- Replace placeholders and remove this comment. The local release script appends asset sizes, hashes, signature states, and source revision. Remove Preview only after stable-release gates pass. -->
 
-A compact, read-only Markdown reader for Windows 10/11 x64.
+A compact Markdown reader with optional source editing for Windows 10/11 x64.
 
 ## Download
 

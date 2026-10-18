@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0 — 2026-10-18
+
+- Adds optional Markdown editing, new files, encoding-preserving Save/Save As, validation, and live preview.
+- Adds formatting and image helpers, table editing, Find/Replace, heading navigation, smart lists, source highlighting, and synchronized preview scrolling.
+- Adds background crash recovery, managed clipboard/drop images, HTML export, and native print/PDF.
+- Adds opt-in stable updates with signature verification and restores unchanged open documents after manual updates.
+- Keeps editor components off reader startup and uses bounded highlighting and incremental source capture for responsive editing.
+
 ## 1.1.8 — 2026-10-17
 
 - Adds + and - keyboard shortcuts for zoom, including the numeric keypad, while preserving normal typing in Find.

@@ -1,8 +1,11 @@
 #include "document.h"
+#include "editor.h"
 #include "empty-state.h"
 #include "images.h"
+#include "restart.h"
 #include "search.h"
 #include "shell.h"
+#include "updates.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -14,6 +17,7 @@
 #include <dwrite.h>
 #include <dwrite_1.h>
 #include <fstream>
+#include <functional>
 #ifdef VMD_TESTING
 #include <iomanip>
 #endif
@@ -105,6 +109,8 @@ struct LoadedDocument {
     uint64_t generation;
     std::shared_ptr<Document> document;
     std::wstring error;
+    bool restoreUnchanged = false;
+    bool offerCreate = false, missing = false;
 };
 struct Worker {
     std::thread thread;
@@ -179,13 +185,18 @@ struct App {
     ULONGLONG zoomUntil = 0, zoomFadeStarted = 0;
     float zoomFadeDuration = 150;
     Preferences prefs;
+    Updates updates;
+    bool updateTimerStarted = false, sessionEnding = false;
     bool dark = false, source = false, fullscreen = false, showControls = true, dragging = false,
          searching = false, loading = false;
     bool closing = false, searchMatch = false, launchedWithFile = false;
 #ifdef VMD_TESTING
     bool selfTest = false;
+    bool testAutomaticUpdates = false;
+    std::filesystem::path updateFixture;
 #endif
     float dpi = 96, zoom = 1, width = 900, height = 700, horizontal = 0, maxWidth = 0;
+    float chromeWidth = 900, canvasLeft = 0;
     bool zoomLayoutPending = false;
     unsigned viewportUpdates = 0;
     int scrollDrag = 0;
@@ -200,6 +211,75 @@ struct App {
     uint32_t anchor = 0, caret = 0;
     uint64_t generation = 0, tick = 0;
     std::shared_ptr<Document> doc;
+    std::unique_ptr<Editor> editor;
+    std::shared_ptr<Document> editOriginal;
+    std::function<void()> afterEditSave;
+    bool leaveEdit(std::function<void()> action) {
+        if (!editor)
+            return true;
+        auto choice = editor->leave();
+        if (choice == Editor::Leave::Saving)
+            afterEditSave = std::move(action);
+        if (choice != Editor::Leave::Allow)
+            return false;
+        if (informationView)
+            closeInformation();
+        editor.reset();
+        doc = std::move(editOriginal);
+        source = false;
+        anchor = caret = 0;
+        searchMatch = false;
+        ++generation;
+        rawBlocks.clear();
+        cancelSearch();
+        resetLayout(false);
+        positions();
+        ShowWindow(canvas, SW_SHOWNA);
+        SetWindowTextW(hwnd, doc && !doc->path.empty()
+                                 ? (doc->path.filename().wstring() + L" — Voltura Markdown").c_str()
+                                 : L"Voltura Markdown");
+        invalidate();
+        return true;
+    }
+    void finishEdit() {
+        if (leaveEdit([this] { finishEdit(); }))
+            SetFocus(hwnd);
+    }
+    void beginEdit(bool create = false, std::filesystem::path createPath = {}) {
+        if (loading)
+            return;
+        if (create && !leaveEdit([this, createPath] { beginEdit(true, createPath); }))
+            return;
+        if (editor) {
+            if (informationView)
+                closeInformation();
+            if (editor->isPreview())
+                editor->togglePreview();
+            editor->setVisible(true);
+            editor->focus();
+            return;
+        }
+        if (informationView)
+            closeInformation();
+        if (!create && (!doc || doc->plainSource))
+            return;
+        if (create) {
+            doc = std::make_shared<Document>(parse(L""));
+            doc->path = std::move(createPath);
+            source = false;
+            rawBlocks.clear();
+            resetLayout(false);
+        }
+        cancelSearch();
+        searching = false;
+        ShowWindow(search, SW_HIDE);
+        editOriginal = doc;
+        editor = std::make_unique<Editor>(hwnd, *doc, dark, (unsigned)dpi, create);
+        visibility(true);
+        KillTimer(hwnd, 2);
+        positions();
+        editor->focus();
+    }
     std::deque<Block> rawBlocks;
     Heights heights;
     std::unordered_map<size_t, Layout> cache;
@@ -257,6 +337,7 @@ struct App {
     uint64_t toolbarBeforeScroll = 0, toolbarBeforeReload = 0;
     uint64_t spinnerPaints = 0, spinnerBeforeReload = 0;
     bool verificationReload = false;
+    bool editorPreviewAwaitingPaint = false;
     uint64_t verificationCountGeneration = 0;
     bool checksPassed = true;
     std::vector<double> paintTimes;
@@ -278,6 +359,63 @@ struct App {
         double withinBlock;
     };
     std::unique_ptr<SavedView> informationView;
+    std::optional<RestartView> restartView;
+    std::filesystem::path restartFile;
+#ifdef VMD_TESTING
+    std::filesystem::path restartReport;
+    bool restartMatched = false;
+    void reportRestart(const char *suffix) {
+        if (restartReport.empty())
+            return;
+        std::ofstream out(restartReport.wstring() + fromUtf8(suffix));
+        size_t index = heights.values.empty() ? 0 : heights.find(scroll);
+        out << std::setprecision(17) << index << ' '
+            << (heights.values.empty() ? 0 : scroll - heights.before(index)) << ' ' << horizontal << ' '
+            << zoom << ' ' << source << ' ' << fullscreen << ' ' << width << ' ' << height << ' '
+            << restartMatched << '\n';
+    }
+#endif
+    void prepareRestart() {
+        if (informationView)
+            closeInformation();
+        stopScrolling();
+        RestartView view;
+        if (loading)
+            view.document = std::filesystem::absolute(pendingPath);
+        else if (doc && !doc->path.empty()) {
+            view.document = std::filesystem::absolute(doc->path);
+            view.digest = restartDigest(doc->source);
+        }
+        view.block = heights.values.empty() ? 0 : heights.find(scroll);
+        view.within = heights.values.empty() ? 0 : scroll - heights.before((size_t)view.block);
+        view.horizontal = horizontal;
+        view.zoom = zoom;
+        view.source = source;
+        view.fullscreen = fullscreen;
+        view.placement = saved;
+        if (!fullscreen)
+            GetWindowPlacement(hwnd, &view.placement);
+        restartFile = saveRestartView(view);
+        if (!restartFile.empty()) {
+            auto command = L"--restore-update \"" + restartFile.wstring() + L"\"";
+#ifdef VMD_TESTING
+            if (!restartReport.empty()) {
+                reportRestart(".before");
+                command += L" --test-restart-report \"" + restartReport.wstring() + L"\"";
+                wchar_t desktop[256]{};
+                DWORD bytes = 0;
+                if (GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, desktop,
+                                              sizeof(desktop), &bytes))
+                    command += L" --test-restart-desktop \"" + std::wstring(desktop) + L"\"";
+            }
+#endif
+            if (FAILED(RegisterApplicationRestart(command.c_str(),
+                                                  RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT))) {
+                DeleteFileW(restartFile.c_str());
+                restartFile.clear();
+            }
+        }
+    }
     bool menuOpen = false;
     POINT lastPointer{};
     bool pointerKnown = false;
@@ -326,7 +464,7 @@ struct App {
     void invalidateHeader() {
         RECT r;
         GetClientRect(hwnd, &r);
-        r.bottom = (LONG)(top * scale());
+        r.bottom = (LONG)(78 * scale());
         InvalidateRect(hwnd, &r, FALSE);
     }
     void paintHeader() {
@@ -372,6 +510,9 @@ struct App {
             }
         }
         std::wstring title = doc ? doc->path.filename().wstring() : L"";
+        if (editor && !informationView)
+            title = (editor->path().empty() ? L"Untitled" : editor->path().filename().wstring()) +
+                    std::wstring(editor->modified() ? L" *" : L"");
         if (showControls && !searching && loading) {
 #ifdef VMD_TESTING
             if (!verifyFile.empty())
@@ -396,8 +537,8 @@ struct App {
                 DeleteObject(dot);
             }
             SelectObject(dc, oldPen);
-        } else if (showControls && !searching && width > 600) {
-            RECT label{(LONG)(28 * scale()), (LONG)(26 * scale()), (LONG)((width - 320) * scale()),
+        } else if (showControls && !searching && chromeWidth > 600) {
+            RECT label{(LONG)(28 * scale()), (LONG)(26 * scale()), (LONG)((chromeWidth - 320) * scale()),
                        (LONG)(54 * scale())};
             DrawTextW(dc, title.c_str(), (int)title.size(), &label,
                       DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
@@ -427,7 +568,7 @@ struct App {
         if (msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT) {
             POINT point;
             if (GetCursorPos(&point) && ScreenToClient(a->hwnd, &point)) {
-                SetCursor(a->documentCursor(point.x / a->scale(), point.y / a->scale()));
+                SetCursor(a->documentCursor(point.x / a->scale() - a->canvasLeft, point.y / a->scale()));
                 return TRUE;
             }
         }
@@ -435,7 +576,7 @@ struct App {
             return a->message(msg, wp, lp);
         if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_LBUTTONDBLCLK || msg == WM_MOUSEMOVE) {
             int y = GET_Y_LPARAM(lp) + (int)(a->top * a->scale());
-            return a->message(msg, wp, MAKELPARAM(GET_X_LPARAM(lp), y));
+            return a->message(msg, wp, MAKELPARAM(GET_X_LPARAM(lp) + (int)(a->canvasLeft * a->scale()), y));
         }
         if (msg == WM_CAPTURECHANGED)
             return a->message(msg, wp, lp);
@@ -630,6 +771,8 @@ struct App {
     }
     void requestClose() {
         if (closing)
+            return;
+        if (!leaveEdit([this] { requestClose(); }))
             return;
         // Keep the HWND alive while the worker prepares its target, without blocking the UI thread.
         if (rendererWorker.joinable() && !preparedRenderer->ready.load(std::memory_order_acquire)) {
@@ -986,6 +1129,8 @@ struct App {
             scroll = scrollTarget;
             stopScrolling();
             bars();
+            if (editor && editor->isLive())
+                editor->previewScroll(scroll / std::max(1., heights.total() - (height - top - bottom)));
             invalidate();
             return;
         }
@@ -1005,6 +1150,8 @@ struct App {
         scrollTick = now;
         scrollTarget = std::clamp(scrollTarget, 0., std::max(0., heights.total() - (height - top - bottom)));
         scroll += (scrollTarget - scroll) * (1 - std::exp(-std::min(dt, .1) / .032));
+        if (editor && editor->isLive())
+            editor->previewScroll(scroll / std::max(1., heights.total() - (height - top - bottom)));
         if (std::abs(scrollTarget - scroll) < .2) {
             scroll = scrollTarget;
             stopScrolling();
@@ -1199,6 +1346,19 @@ struct App {
             hr = D2DERR_RECREATE_TARGET;
 #endif
         bool retryPaint = hr == D2DERR_RECREATE_TARGET;
+#ifdef VMD_TESTING
+        if (editorPreviewAwaitingPaint && editor && (editor->isPreview() || editor->isLive()) &&
+            paintedDocument && SUCCEEDED(hr)) {
+            editorPreviewAwaitingPaint = false;
+            if (!metricsFile.empty()) {
+                std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+                out << "{\"edit_preview_painted\":true,\"source\":" << source
+                    << ",\"first_kind\":" << (int)doc->blocks.front().kind
+                    << ",\"source_units\":" << doc->source.size() << ",\"live\":" << editor->isLive()
+                    << ",\"source_focus\":" << editor->sourceFocused() << "}\n";
+            }
+        }
+#endif
         if (hr == D2DERR_RECREATE_TARGET) {
             target.Reset();
             brush.Reset();
@@ -1244,6 +1404,7 @@ struct App {
         if (paintedDocument && SUCCEEDED(hr) && !firstPaint) {
             firstPaint = true;
             VMD_TEST_ONLY(recordMetric();)
+            VMD_TEST_ONLY(if (!restartFile.empty()) reportRestart(".after");)
 #ifdef VMD_TESTING
             if (exitOnContent && !stagedRenderer)
                 SetTimer(hwnd, 9, 100, nullptr);
@@ -1278,6 +1439,10 @@ struct App {
         }
         // No shell work, worker, or notice controls exist on the path to first content.
         if (SUCCEEDED(hr) && !loading && (firstPaint || !doc || blocks().empty())) {
+            if (prefs.automaticUpdates && !updateTimerStarted && !sessionEnding) {
+                updateTimerStarted = true;
+                SetTimer(hwnd, 18, 5000, nullptr);
+            }
             associationReadyGeneration = generation;
             if (associationPhase == AssociationPhase::WaitingForPaint) {
                 associationPhase = AssociationPhase::Posted;
@@ -1433,7 +1598,7 @@ struct App {
         if (!associationPanel)
             return;
         auto s = scale();
-        int panelWidth = (int)(std::min(540.f, width - 40) * s);
+        int panelWidth = (int)(std::min(540.f, chromeWidth - 40) * s);
         auto dc = GetDC(associationPanel);
         auto old = SelectObject(dc, uiFont);
         int textHeight = associationTextHeight(dc, panelWidth);
@@ -1648,7 +1813,7 @@ struct App {
     void positionZoomOverlay() {
         if (!zoomPanel)
             return;
-        POINT origin{(LONG)((width - 158) * scale()), (LONG)((height - 52) * scale())};
+        POINT origin{(LONG)((canvasLeft + width - 158) * scale()), (LONG)((height - 52) * scale())};
         ClientToScreen(hwnd, &origin);
         SetWindowPos(zoomPanel, nullptr, origin.x, origin.y, (int)(134 * scale()), (int)(34 * scale()),
                      SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1669,7 +1834,10 @@ struct App {
         RECT r;
         GetClientRect(hwnd, &r);
         width = std::max(1.f, r.right / scale() - 12);
+        chromeWidth = width;
+        canvasLeft = 0;
         height = std::max(1.f, r.bottom / scale() - 12);
+        top = 78;
         float start = width - (fullscreen ? 7 : 6) * 38 - 20;
         for (int i = 0; i < 7; ++i)
             MoveWindow(buttons[i], (int)((start + i * 38) * scale()), (int)(20 * scale()),
@@ -1679,6 +1847,23 @@ struct App {
         if (canvas)
             MoveWindow(canvas, 0, (int)(top * scale()), r.right,
                        std::max<LONG>(1, r.bottom - (int)(top * scale())), FALSE);
+        if (editor && !informationView) {
+            editor->position((int)(78 * scale()));
+            bool visible = editor->isPreview() || editor->isLive();
+            ShowWindow(canvas, visible ? SW_SHOWNA : SW_HIDE);
+            if (visible) {
+                auto bounds = editor->previewBounds((int)(78 * scale()));
+                canvasLeft = bounds.left / scale();
+                top = bounds.top / scale();
+                width = std::max(1.f, (bounds.right - bounds.left) / scale() - 12);
+                SetWindowPos(canvas, HWND_TOP, bounds.left, bounds.top,
+                             std::max(1L, bounds.right - bounds.left),
+                             std::max(1L, bounds.bottom - bounds.top), SWP_NOACTIVATE);
+            }
+        }
+        if (target)
+            target->SetTransform(D2D1::Matrix3x2F::Translation(0, -top));
+        positionZoomOverlay();
         invalidateHeader();
         positionSearch();
         if (backButton)
@@ -1686,7 +1871,7 @@ struct App {
                        (int)(34 * scale()), TRUE);
     }
     float searchBoxWidth() const {
-        return std::max(100.f, width - (fullscreen ? 7 : 6) * 38 - 20 - 48);
+        return std::max(100.f, chromeWidth - (fullscreen ? 7 : 6) * 38 - 20 - 48);
     }
     float searchCountWidth() const {
         return std::min(searchBoxWidth() * .55f,
@@ -1754,6 +1939,8 @@ struct App {
     }
     void theme() {
         dark = prefs.theme < 0 ? systemDark() : prefs.theme == 1;
+        if (editor)
+            editor->theme(dark, (unsigned)dpi);
         themeTooltip();
         BOOL use = dark;
         DwmSetWindowAttribute(hwnd, 20, &use, sizeof(use));
@@ -1776,6 +1963,8 @@ struct App {
         invalidate();
     }
     void refreshDpiAssets() {
+        if (editor)
+            editor->theme(dark, (unsigned)dpi);
         auto nextFont = CreateFontW(-(int)(14 * dpi / 96.f), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                     CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
@@ -1813,6 +2002,11 @@ struct App {
         VMD_TEST_ONLY(startupPhase("graphics_factories_ready");)
 #ifdef VMD_TESTING
         prefs = selfTest ? Preferences{} : readPreferences();
+        if (testAutomaticUpdates) {
+            prefs.automaticUpdates = true;
+            if (!updateFixture.empty())
+                updates.fixture(updateFixture);
+        }
 #else
         prefs = readPreferences();
 #endif
@@ -1986,7 +2180,9 @@ struct App {
                 ++i;
         }
     }
-    void open(std::filesystem::path path) {
+    void open(std::filesystem::path path, bool offerCreate = false) {
+        if (!leaveEdit([this, path] { open(path); }))
+            return;
         cancelSearch();
         if (informationView)
             closeInformation();
@@ -2010,36 +2206,53 @@ struct App {
         HWND destination = hwnd;
         workers.reserve(workers.size() + 1);
         auto result = std::make_unique<LoadedDocument>();
+        result->offerCreate = offerCreate;
+        auto restore = restartView;
         result->error = L"The document could not be loaded.";
-        workers.push_back(
-            {std::thread([path, gen, destination, cancel, done, result = std::move(result)]() mutable {
-                 result->generation = gen;
-                 try {
-                     result->document = std::make_shared<Document>(load(path, cancel.get()));
-                 } catch (const std::exception &e) {
-                     try {
-                         result->error = fromUtf8(e.what());
-                     } catch (...) {
-                     }
-                     if (!cancel->load()) {
-                         try {
-                             result->document = std::make_shared<Document>(loadSource(path, cancel.get()));
-                             result->document->plainSource = true;
-                             result->document->blocks = sourceBlocks(result->document->source);
-                             for (auto &block : result->document->blocks)
-                                 block.kind = Kind::Paragraph;
-                         } catch (...) {
-                         }
-                     }
-                 }
-                 if (!cancel->load()) {
-                     auto pointer = result.release();
-                     if (!PostMessageW(destination, Loaded, 0, (LPARAM)pointer))
-                         delete pointer;
-                 }
-                 done->store(true);
-             }),
-             cancel, done});
+        workers.push_back({std::thread([path, gen, destination, cancel, done, restore,
+                                        result = std::move(result)]() mutable {
+                               result->generation = gen;
+                               try {
+                                   result->document = std::make_shared<Document>(load(path, cancel.get()));
+                               } catch (const std::exception &e) {
+                                   try {
+                                       result->error = fromUtf8(e.what());
+                                   } catch (...) {
+                                   }
+                                   if (!cancel->load()) {
+                                       try {
+                                           result->document =
+                                               std::make_shared<Document>(loadSource(path, cancel.get()));
+                                           result->document->plainSource = true;
+                                           result->document->blocks = sourceBlocks(result->document->source);
+                                           for (auto &block : result->document->blocks)
+                                               block.kind = Kind::Paragraph;
+                                       } catch (...) {
+                                       }
+                                   }
+                               }
+                               if (restore && result->document && !cancel->load()) {
+                                   try {
+                                       result->restoreUnchanged =
+                                           restartDigest(result->document->source) == restore->digest;
+                                   } catch (...) {
+                                   }
+                               }
+                               if (!result->document && result->offerCreate) {
+                                   auto attributes = GetFileAttributesW(path.c_str());
+                                   auto error = GetLastError();
+                                   result->missing =
+                                       attributes == INVALID_FILE_ATTRIBUTES &&
+                                       (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND);
+                               }
+                               if (!cancel->load()) {
+                                   auto pointer = result.release();
+                                   if (!PostMessageW(destination, Loaded, 0, (LPARAM)pointer))
+                                       delete pointer;
+                               }
+                               done->store(true);
+                           }),
+                           cancel, done});
     }
     void loaded(std::unique_ptr<LoadedDocument> r) {
         if (r->generation != generation)
@@ -2048,6 +2261,22 @@ struct App {
         KillTimer(hwnd, 5);
         invalidateHeader();
         if (!r->document) {
+            if (r->offerCreate && r->missing) {
+                auto message = L"This file does not exist:\n\n" + pendingPath.wstring() +
+                               L"\n\nCreate a new Markdown document here?";
+                if (MessageBoxW(hwnd, message.c_str(), L"Create Markdown file", MB_YESNO | MB_ICONQUESTION) ==
+                    IDYES) {
+                    beginEdit(true, pendingPath);
+                } else {
+                    launchedWithFile = false;
+                    if (fullscreen)
+                        toggleFullscreen();
+                }
+                notice.clear();
+                invalidate();
+                return;
+            }
+            VMD_TEST_ONLY(if (!restartFile.empty()) reportRestart(".after");)
             notice = r->error;
             invalidate();
             return;
@@ -2062,6 +2291,26 @@ struct App {
         notice.clear();
         SetWindowTextW(hwnd, (doc->path.filename().wstring() + L" — Voltura Markdown").c_str());
         resetLayout(false);
+        if (restartView) {
+            auto view = *restartView;
+            restartView.reset();
+            if (r->restoreUnchanged) {
+                VMD_TEST_ONLY(restartMatched = true;)
+                source = view.source;
+                if (source)
+                    rawBlocks = sourceBlocks(doc->source);
+                zoom = view.zoom;
+                updateZoomControls();
+                resetLayout(false);
+                if (view.block < blocks().size() && device()) {
+                    auto &current = layout((size_t)view.block);
+                    scroll =
+                        heights.before((size_t)view.block) + std::min(view.within, (double)current.height);
+                }
+                horizontal = view.horizontal;
+                bars();
+            }
+        }
         invalidateHeader();
         if (searching)
             find(false);
@@ -2079,6 +2328,10 @@ struct App {
 #endif
     }
     void toggleSource() {
+        if (editor && !informationView) {
+            editor->togglePreview();
+            return;
+        }
         if (!doc)
             return;
         cancelSearch();
@@ -2147,7 +2400,13 @@ struct App {
     }
     HMENU createMenu() {
         bool hasFile = doc && !doc->path.empty() && !loading;
-        menuRows = {{130, L"Copy file", false, hasFile},
+        menuRows = {{160, L"New Markdown\tCtrl+N", false, !loading},
+                    {161, L"Edit Markdown\tCtrl+E", false, !loading && doc && !doc->plainSource},
+                    {162, L"Save\tCtrl+S", false, editor != nullptr},
+                    {163, L"Save As…\tCtrl+Shift+S", false, editor != nullptr},
+                    {164, L"Finish editing", false, editor != nullptr},
+                    {0, L"", true},
+                    {130, L"Copy file", false, hasFile},
                     {131, L"Copy file name", false, hasFile},
                     {132, L"Copy full path", false, hasFile},
                     {133, L"Open file directory", false, hasFile},
@@ -2157,6 +2416,7 @@ struct App {
                     {121, L"Unregister application"},
                     {0, L"", true},
                     {124, L"Start fullscreen", false, true, prefs.startFullscreen},
+                    {126, L"Automatic updates", false, true, prefs.automaticUpdates},
                     {122, L"Use Windows theme", false, true, prefs.theme < 0},
                     {125, L"Help (F1)", false, !loading},
                     {123, L"About / open-source licenses", false, !loading}};
@@ -2265,6 +2525,23 @@ struct App {
             command(id);
     }
     void command(int id) {
+        if (id == 160) {
+            beginEdit(true);
+            return;
+        }
+        if (id == 161) {
+            beginEdit();
+            return;
+        }
+        if (id == 162 || id == 163) {
+            if (editor)
+                editor->save(id == 163);
+            return;
+        }
+        if (id == 164) {
+            finishEdit();
+            return;
+        }
         switch (id) {
         case 150:
             if (associationResult || !IsWindowVisible(associationPanel))
@@ -2383,6 +2660,19 @@ struct App {
         case 124:
             prefs.startFullscreen = !prefs.startFullscreen;
             break;
+        case 126:
+            prefs.automaticUpdates = !prefs.automaticUpdates;
+            if (!prefs.automaticUpdates) {
+                KillTimer(hwnd, 18);
+                updateTimerStarted = false;
+                updates.cancel();
+            } else
+                invalidate(); // Schedule only after a successful content/empty-window paint.
+#ifdef VMD_TESTING
+            if (!selfTest)
+#endif
+                saveAutomaticUpdates(prefs.automaticUpdates);
+            break;
         case 122:
             prefs.theme = -1;
             theme();
@@ -2402,7 +2692,25 @@ struct App {
     void showHelp() {
         showInformation(L"Help", LR"md(# Using Voltura Markdown
 
-Open and read Markdown files. Select and copy text; the viewer does not edit or save documents.
+Read Markdown files, or choose Edit Markdown (Ctrl+E) to edit source. Ctrl+N creates a new draft; Ctrl+S saves explicitly. A missing full file path supplied at startup offers to create a draft there.
+
+## Edit mode
+
+- **Heading, Bold, Italic, Underline, Link, Code, List, Image, Insert:** insert Markdown around a selection or use editable placeholders. Insert includes tables, images, lists, quotes, code, and rules.
+- **Live:** show source and formatted preview together, updating after a typing pause. Wide windows use side-by-side panes; narrow windows stack them.
+- **Code:** wrap selected text in a fenced code block, or insert a selected placeholder.
+- **Image (Ctrl+Shift+I):** enter alt text and a file path or HTTPS URL, browse local images, or insert a placeholder to fill in later.
+- **More edit shortcuts:** Ctrl+Shift+1–6 for headings; Ctrl+Shift+0 for normal text; Ctrl+Shift+7/8/9 for numbered/bulleted/task lists; Ctrl+Shift+C/K for code block/inline code; Ctrl+Shift+Q/X for quote/strikethrough; Ctrl+Shift+L for live preview. Undo/Redo are also in Insert.
+- **Table:** choose body rows and columns; the header row is added automatically.
+- **Preview / Source (Ctrl+Shift+V):** preview the unsaved draft and return without losing undo history.
+- **Ctrl+B / Ctrl+I / Ctrl+U / Ctrl+K:** bold, italic, underline, or insert a link. Underline uses supported `<u>` HTML tags. Ctrl+Z/Ctrl+Y undo/redo; Ctrl+F finds source text.
+- **Save (Ctrl+S) / Save As (Ctrl+Shift+S):** write explicitly. Unsaved changes have an asterisk; leaving asks to save, discard, or cancel.
+- **Warnings:** live checks after a typing pause identify unclosed fences, missing local files, and broken heading links. Select a warning to jump to source. Warnings allow saving; remote targets are not checked.
+- **Escape:** return from preview, then finish editing. Tab inserts a tab in source; Ctrl+Tab moves to the toolbar. Editor buttons stay visible in fullscreen.
+- **Find/Replace (Ctrl+H), Outline (Ctrl+Shift+O):** replace source text or jump to a heading. Enter continues lists; Shift+Tab outdents selected lines.
+- **Insert tools:** edit existing tables, copy images into an assets folder, paste clipboard images, link to a heading, toggle source highlighting or synchronized scrolling, export HTML, and print/PDF. Save a new document before copying images. Ctrl+click a preview heading to jump to source.
+- **Recover draft:** restore a background crash checkpoint as an unsaved document. Checkpoints never overwrite the original file. Explicit save or discard clears obsolete checkpoints.
+- Files changed elsewhere require an explicit overwrite choice; Insert includes Reload from disk. Updates wait while modified drafts are open. Use Cancel pending action to stop a background image, replacement, or export operation.
 
 Use the **back arrow** or <kbd>Escape</kbd> to return to your reading position.
 
@@ -2471,6 +2779,8 @@ In the **three-dot menu**:
 
 - **Start fullscreen:** choose how future windows open when launched with a document. Without a document, the app starts in a normal window.
 - **Use Windows theme:** follow your system's light / dark setting.
+- **Automatic updates:** download updates and install on close. Off by default.
+- **Manual updates:** open windows return to their documents and reading positions.
 )md");
     }
     void showInformation(const wchar_t *title, const std::wstring &content) {
@@ -2479,6 +2789,8 @@ In the **three-dot menu**:
         auto information = std::make_shared<Document>(parse(content));
         if (informationView)
             closeInformation();
+        if (editor)
+            editor->setVisible(false);
         size_t index = heights.values.empty() ? 0 : heights.find(scroll);
         double within = heights.values.empty() ? 0 : scroll - heights.before(index);
         informationView = std::make_unique<SavedView>(SavedView{
@@ -2488,6 +2800,8 @@ In the **three-dot menu**:
         KillTimer(hwnd, 3);
         ShowWindow(search, SW_HIDE);
         doc = std::move(information);
+        positions();
+        ShowWindow(canvas, SW_SHOWNA);
         source = false;
         rawBlocks.clear();
         anchor = caret = 0;
@@ -2510,6 +2824,11 @@ In the **three-dot menu**:
         ShowWindow(search, SW_HIDE);
         ShowWindow(backButton, SW_HIDE);
         doc = std::move(savedView->document);
+        if (editor && (editor->isPreview() || editor->isLive()) && editor->previewDocument())
+            doc = editor->previewDocument();
+        if (editor)
+            editor->setVisible(true);
+        positions();
         rawBlocks = std::move(savedView->raw);
         source = savedView->source;
         zoom = savedView->zoom;
@@ -2533,8 +2852,16 @@ In the **three-dot menu**:
         invalidateHeader();
         invalidate();
         SetFocus(hwnd);
+        if (editor) {
+            editor->setVisible(true);
+            editor->focus();
+        }
     }
     void showSearch() {
+        if (editor && !informationView) {
+            editor->find();
+            return;
+        }
         searching = true;
         if (informationView)
             ShowWindow(backButton, SW_HIDE);
@@ -2839,6 +3166,16 @@ In the **three-dot menu**:
     }
     void key(WPARAM key) {
         bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+        if (ctrl && key == 'N') {
+            beginEdit(true);
+            return;
+        }
+        if (ctrl && key == 'E') {
+            beginEdit();
+            return;
+        }
+        if (editor && !informationView && editor->key(key))
+            return;
         if (key == VK_F1) {
             showHelp();
             return;
@@ -3171,7 +3508,12 @@ In the **three-dot menu**:
             }
             {
                 auto popup = createMenu();
-                check(GetMenuItemCount(popup) == 13, "file_operations_menu_items");
+                check(GetMenuItemCount(popup) == 20, "file_operations_menu_items");
+                auto automatic = std::find_if(menuRows.begin(), menuRows.end(),
+                                              [](const MenuRow &row) { return row.id == 126; });
+                check(automatic != menuRows.end() && automatic->text == L"Automatic updates" &&
+                          !automatic->checked,
+                      "automatic_updates_default_unchecked");
                 bool rowsValid = true;
                 for (auto &row : menuRows) {
                     MEASUREITEMSTRUCT measure{};
@@ -3183,6 +3525,16 @@ In the **three-dot menu**:
                 }
                 check(rowsValid, "menu_dpi_measurements_and_enabled_file_actions");
                 DestroyMenu(popup);
+                command(126);
+                popup = createMenu();
+                automatic = std::find_if(menuRows.begin(), menuRows.end(),
+                                         [](const MenuRow &row) { return row.id == 126; });
+                check(prefs.automaticUpdates && automatic != menuRows.end() && automatic->checked,
+                      "automatic_updates_menu_toggles_on");
+                DestroyMenu(popup);
+                command(126);
+                check(!prefs.automaticUpdates && !updateTimerStarted,
+                      "automatic_updates_unticking_cancels_schedule");
                 auto current = doc;
                 doc.reset();
                 popup = createMenu();
@@ -3220,7 +3572,7 @@ In the **three-dot menu**:
                     for (UINT testDpi : {96u, 120u, 144u, 192u, 216u, 288u, 96u}) {
                         LONG x = testDpi == 144 ? -1280 : 80;
                         RECT suggested{x, 80, x + 1200, 900};
-                        auto updates = viewportUpdates;
+                        auto previousUpdates = viewportUpdates;
                         SendMessageW(hwnd, WM_DPICHANGED, MAKELONG(testDpi, testDpi), (LPARAM)&suggested);
                         RECT client, control, zoomBounds;
                         GetClientRect(hwnd, &client);
@@ -3231,7 +3583,7 @@ In the **three-dot menu**:
                         float targetX = 0, targetY = 0;
                         if (target)
                             target->GetDpi(&targetX, &targetY);
-                        check(dpi == testDpi && viewportUpdates > updates &&
+                        check(dpi == testDpi && viewportUpdates > previousUpdates &&
                                   std::abs(width - (client.right / scale() - 12)) < .01f &&
                                   control.right - control.left == (int)(34 * scale()) &&
                                   zoomPoint.x < client.right && zoomPoint.y < client.bottom &&
@@ -3552,9 +3904,61 @@ In the **three-dot menu**:
                     SendMessageW(control, WM_CHAR, L'-', 1);
                 }
                 toggleSource();
-                press(hwnd, VK_ADD);
-                check(source && std::abs(zoom - 1.1f) < .001f, "source_view_plus_zooms");
+                for (auto control : {hwnd, buttons[2], zoomButtons[0]}) {
+                    SetFocus(control);
+                    zoomBy(1);
+                    auto originalHeight = layout(0).parts.front().height;
+                    auto originalWidth = layout(0).width;
+                    for (wchar_t symbol : {L'+', L'-'}) {
+                        SHORT mapping = VkKeyScanW(symbol);
+                        if (mapping == -1 || (HIBYTE(mapping) & 6))
+                            continue;
+                        press(control, LOBYTE(mapping), false, (HIBYTE(mapping) & 1) != 0);
+                        check(source && std::abs(zoom - (symbol == L'+' ? 1.1f : 1.f)) < .001f,
+                              "source_translated_keyboard_zoom_once_with_document_or_control_focus");
+                        auto &measured = layout(0);
+                        check(symbol == L'+'
+                                  ? measured.parts.front().height > originalHeight &&
+                                        measured.width > originalWidth
+                                  : std::abs(measured.parts.front().height - originalHeight) < .01f &&
+                                        std::abs(measured.width - originalWidth) < .01f,
+                              "source_keyboard_zoom_resizes_measured_text");
+                    }
+                    press(control, VK_ADD);
+                    check(std::abs(zoom - 1.1f) < .001f, "source_keypad_plus_zooms_once");
+                    press(control, VK_SUBTRACT);
+                    check(zoom == 1.f, "source_keypad_minus_zooms_once");
+                    press(control, VK_ADD, true);
+                    check(std::abs(zoom - 1.1f) < .001f, "source_ctrl_plus_zooms_once");
+                    press(control, VK_SUBTRACT, true);
+                    check(zoom == 1.f, "source_ctrl_minus_zooms_once");
+                    zoomBy(1.2f);
+                    press(control, '0', true);
+                    check(zoom == 1.f, "source_ctrl_zero_resets_zoom");
+                }
+                zoomBy(2.9f);
+                for (int i = 0; i < 3; ++i)
+                    press(hwnd, VK_ADD);
+                check(zoom == 3.f, "source_repeated_plus_respects_upper_limit");
+                zoomBy(.6f);
+                for (int i = 0; i < 3; ++i)
+                    press(hwnd, VK_SUBTRACT);
+                check(zoom == .5f, "source_repeated_minus_respects_lower_limit");
+                zoomBy(1);
+                for (int i = 0; i < 3; ++i)
+                    press(hwnd, VK_ADD);
+                check(std::abs(zoom - 1.3f) < .001f, "source_repeated_plus_applies_one_step_per_character");
+                showSearch();
+                SetWindowTextW(search, L"");
+                press(search, VK_ADD);
+                press(search, VK_SUBTRACT);
+                wchar_t sourceSearchSymbols[8]{};
+                GetWindowTextW(search, sourceSearchSymbols, 8);
+                check(std::wstring(sourceSearchSymbols) == L"+-" && std::abs(zoom - 1.3f) < .001f,
+                      "source_find_accepts_zoom_symbols_without_zooming");
+                key(VK_ESCAPE);
                 toggleSource();
+                check(!source && std::abs(zoom - 1.3f) < .001f, "view_toggle_preserves_shared_zoom");
                 zoomBy(2.9f);
                 for (int i = 0; i < 3; ++i)
                     press(hwnd, VK_ADD);
@@ -3899,6 +4303,16 @@ In the **three-dot menu**:
                        documentCursor(width + 6, top + 10) == LoadCursorW(nullptr, IDC_ARROW)),
                   "vertical_scrollbar_uses_arrow_cursor");
             {
+                anchor = 0;
+                caret = (uint32_t)text().size();
+                beginEdit(true);
+                finishEdit();
+                check(anchor == 0 && caret == 0 && doc && doc->text.empty(),
+                      "new_draft_finish_resets_reader_selection");
+                key(VK_LEFT);
+                check(caret == 0, "shorter_document_navigation_stays_in_bounds");
+            }
+            {
                 auto samples = paintTimes;
                 std::sort(samples.begin(), samples.end());
                 double mean = 0;
@@ -3926,6 +4340,8 @@ In the **three-dot menu**:
     }
 #endif
     void close() {
+        KillTimer(hwnd, 18);
+        updates.close(prefs.automaticUpdates && !sessionEnding VMD_TEST_ONLY(&&!selfTest));
         stopScrolling();
         closing = true;
         KillTimer(hwnd, 16);
@@ -4064,6 +4480,81 @@ In the **three-dot menu**:
             }
             command(LOWORD(wp));
             return 0;
+        case EditorChanged:
+            invalidateHeader();
+            return 0;
+        case EditorScroll:
+            if (editor && editor->isLive() && !informationView) {
+                stopScrolling();
+                scroll = editor->sourceFraction() * std::max(0., heights.total() - (height - top - bottom));
+                bars();
+                invalidate();
+            }
+            return 0;
+        case EditorLayout:
+            if (editor) {
+                message(WM_SIZE, SIZE_RESTORED, 0);
+                if (!editor->isPreview())
+                    editor->focus();
+            }
+            return 0;
+        case EditorPreview:
+            if (editor && (editor->isPreview() || editor->isLive()) && !informationView &&
+                editor->previewDocument()) {
+                cancelSearch();
+                ++generation;
+                images->cancelPending();
+                doc = editor->previewDocument();
+                source = false;
+                VMD_TEST_ONLY(editorPreviewAwaitingPaint = true;)
+                rawBlocks.clear();
+                anchor = caret = 0;
+                message(WM_SIZE, SIZE_RESTORED, 0);
+                resetLayout(editor->isLive());
+                invalidate();
+                if (!editor->isLive())
+                    SetFocus(hwnd);
+            }
+            return 0;
+        case EditorSaved:
+            if (editor && !wp) {
+                editOriginal = editor->previewDocument();
+                if (informationView) {
+                    informationView->document = editOriginal;
+                    informationView->raw.clear();
+                    informationView->source = false;
+                    informationView->anchor = informationView->caret = 0;
+                } else {
+                    cancelSearch();
+                    ++generation;
+                    doc = editOriginal;
+                    source = false;
+                    rawBlocks.clear();
+                    anchor = caret = 0;
+                    searchMatch = false;
+                    resetLayout(editor->isPreview() || editor->isLive());
+                    invalidate();
+                }
+#ifdef VMD_TESTING
+                if (!metricsFile.empty()) {
+                    auto savedDocument = informationView ? informationView->document : doc;
+                    std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+                    out << "{\"edit_saved_path_matches\":"
+                        << (savedDocument && savedDocument->path == editor->path()) << "}\n";
+                }
+#endif
+            }
+            if (afterEditSave) {
+                auto action = std::move(afterEditSave);
+                afterEditSave = {};
+                if (!wp)
+                    action();
+            }
+            invalidateHeader();
+            return 0;
+        case EditorFinish:
+            finishEdit();
+            return 0;
         case Loaded:
             loaded(std::unique_ptr<LoadedDocument>((LoadedDocument *)lp));
             return 0;
@@ -4085,6 +4576,24 @@ In the **three-dot menu**:
             return 0;
         }
         case WM_TIMER:
+            if (wp == 18) {
+                if (prefs.automaticUpdates && !sessionEnding && !closing) {
+#ifdef VMD_TESTING
+                    if (!metricsFile.empty()) {
+                        std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+                        out << "{\"update_check_ms\":"
+                            << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                         started)
+                                   .count()
+                            << "}\n";
+                    }
+#endif
+                    updates.check();
+                    SetTimer(hwnd, 18, 60 * 60 * 1000, nullptr);
+                } else
+                    KillTimer(hwnd, 18);
+                return 0;
+            }
             if (wp == 16) {
                 KillTimer(hwnd, 16);
                 if (associationPhase == AssociationPhase::Delay) {
@@ -4111,7 +4620,7 @@ In the **three-dot menu**:
             if (wp == 1)
                 timer();
             else if (wp == 2) {
-                if (fullscreen && !loading && !menuOpen && !dragging && !searching &&
+                if (!editor && fullscreen && !loading && !menuOpen && !dragging && !searching &&
                     !pointerOverControls() &&
                     (GetFocus() == hwnd || (!IsChild(hwnd, GetFocus()) && !IsChild(zoomPanel, GetFocus())))) {
                     visibility(false);
@@ -4279,7 +4788,7 @@ In the **three-dot menu**:
             return 0;
         }
         case WM_LBUTTONDOWN: {
-            float x = GET_X_LPARAM(lp) / scale(), y = GET_Y_LPARAM(lp) / scale();
+            float x = GET_X_LPARAM(lp) / scale() - canvasLeft, y = GET_Y_LPARAM(lp) / scale();
             SetFocus(hwnd);
             stopScrolling();
             if (scrollbarAt(x, y) == 1) {
@@ -4287,6 +4796,9 @@ In the **three-dot menu**:
                 if (y < r.top || y > r.bottom) {
                     scroll += (y < r.top ? -1 : 1) * (height - top - bottom);
                     bars();
+                    if (editor && editor->isLive())
+                        editor->previewScroll(scroll /
+                                              std::max(1., heights.total() - (height - top - bottom)));
                 } else {
                     scrollDrag = 1;
                     dragStart = y;
@@ -4319,6 +4831,17 @@ In the **three-dot menu**:
                 return 0;
             if (doc) {
                 caret = hit(x, y);
+                if ((wp & MK_CONTROL) && editor && editor->isLive() && doc == editor->previewDocument()) {
+                    auto block = blockAtPosition(doc->blocks, caret);
+                    if (block < doc->blocks.size() && doc->blocks[block].kind == Kind::Heading) {
+                        size_t heading = 0;
+                        for (size_t i = 0; i < block; ++i)
+                            if (doc->blocks[i].kind == Kind::Heading)
+                                ++heading;
+                        editor->sourceAtHeading(heading);
+                        return 0;
+                    }
+                }
                 if (!(wp & MK_SHIFT))
                     anchor = caret;
                 searchMatch = false;
@@ -4336,7 +4859,7 @@ In the **three-dot menu**:
                     visibility(true);
                 SetTimer(hwnd, 2, 1800, nullptr);
             }
-            float x = GET_X_LPARAM(lp) / scale(), y = GET_Y_LPARAM(lp) / scale();
+            float x = GET_X_LPARAM(lp) / scale() - canvasLeft, y = GET_Y_LPARAM(lp) / scale();
             // Captured mouse movement does not reliably generate WM_SETCURSOR.
             SetCursor(documentCursor(x, y));
             if (scrollDrag == 1) {
@@ -4345,6 +4868,8 @@ In the **three-dot menu**:
                                           std::max(0., heights.total() - (height - top - bottom)) /
                                           std::max(1.f, height - top - bottom - (r.bottom - r.top));
                 bars();
+                if (editor && editor->isLive())
+                    editor->previewScroll(scroll / std::max(1., heights.total() - (height - top - bottom)));
                 invalidate();
             } else if (scrollDrag == 2) {
                 auto r = horizontalThumb();
@@ -4377,7 +4902,7 @@ In the **three-dot menu**:
             return 0;
         case WM_LBUTTONDBLCLK:
             if (doc) {
-                caret = hit(GET_X_LPARAM(lp) / scale(), GET_Y_LPARAM(lp) / scale());
+                caret = hit(GET_X_LPARAM(lp) / scale() - canvasLeft, GET_Y_LPARAM(lp) / scale());
                 anchor = caret;
                 auto &s = text();
                 while (anchor && iswalnum(s[anchor - 1]))
@@ -4399,9 +4924,39 @@ In the **three-dot menu**:
             DragQueryFileW(drop, 0, path.data(), n + 1);
             path.resize(n);
             DragFinish(drop);
+            if (editor && !informationView && editor->addImage(path))
+                return 0;
             open(path);
             return 0;
         }
+        case WM_QUERYENDSESSION:
+            if (editor && (editor->modified() || editor->busy()))
+                return FALSE;
+            if ((lp & ENDSESSION_CLOSEAPP) && !(lp & ENDSESSION_LOGOFF)) {
+                try {
+                    prepareRestart();
+                } catch (...) {
+                    return FALSE; // Keep this reader open if its state cannot be preserved.
+                }
+                if (restartFile.empty())
+                    return FALSE;
+            }
+            sessionEnding = true; // A cancelled shutdown still suppresses installation for this run.
+            KillTimer(hwnd, 18);
+            updates.sessionEnd();
+            return TRUE;
+        case WM_ENDSESSION:
+            sessionEnding = true;
+            KillTimer(hwnd, 18);
+            updates.sessionEnd();
+            if (!wp && !restartFile.empty()) {
+                UnregisterApplicationRestart();
+                DeleteFileW(restartFile.c_str());
+                restartFile.clear();
+            }
+            if (wp)
+                requestClose();
+            return 0;
         case WM_CLOSE:
             requestClose();
             return 0;
@@ -4433,11 +4988,40 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 } // namespace
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
+    int argc = 0;
+    auto args = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!args)
+        return 1;
+#ifdef VMD_TESTING
+    // Restart Manager chooses the interactive desktop. Tests move back before creating any HWND.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::wstring_view(args[i]) == L"--test-restart-desktop") {
+            HDESK desktop = OpenDesktopW(args[i + 1], 0, FALSE, GENERIC_ALL);
+            if (!desktop || !SetThreadDesktop(desktop)) {
+                LocalFree(args);
+                return 1;
+            }
+            break;
+        }
+    }
+#endif
+    int manualResult = manualUpdateHelper(argc, args);
+    if (manualResult >= 0) {
+        LocalFree(args);
+        return manualResult;
+    }
+    int helperResult = updateHelper(argc, args);
+    if (helperResult >= 0) {
+        LocalFree(args);
+        return helperResult;
+    }
+    if (!updateReaderMayStart()) {
+        LocalFree(args);
+        return 0;
+    }
     App app;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     InitCommonControls();
-    int argc = 0;
-    auto args = CommandLineToArgvW(GetCommandLineW(), &argc);
     std::filesystem::path path;
 #ifdef VMD_TESTING
     UINT exitAfter = 0;
@@ -4447,8 +5031,27 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         std::wstring a = args[i];
         if (a == L"--configure-defaults")
             configureDefaults = true;
+        else if (a == L"--restore-update" && i + 1 < argc) {
+            auto snapshot = std::filesystem::path(args[++i]);
+            app.restartView = readRestartView(snapshot);
+            if (app.restartView)
+                path = app.restartView->document;
+            app.restartFile = snapshot;
+        }
 #ifdef VMD_TESTING
-        else if (a == L"--test-association" && i + 1 < argc) {
+        else if (a == L"--test-restart-desktop" && i + 1 < argc)
+            ++i;
+        else if (a == L"--test-restart-report" && i + 1 < argc) {
+            app.restartReport = args[++i];
+            app.selfTest = true;
+        } else if (a == L"--test-automatic-updates") {
+            app.testAutomaticUpdates = true;
+            app.selfTest = true;
+        } else if (a == L"--test-update-fixture" && i + 1 < argc) {
+            app.testAutomaticUpdates = true;
+            app.selfTest = true;
+            app.updateFixture = args[++i];
+        } else if (a == L"--test-association" && i + 1 < argc) {
             app.testAssociation = args[++i];
             app.selfTest = true;
         } else if (a == L"--verify-close-fullscreen")
@@ -4514,12 +5117,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         return 1;
     }
     VMD_TEST_ONLY(app.startupPhase("window_created");)
+    if (app.restartView)
+        SetWindowPlacement(hwnd, &app.restartView->placement);
     if (!path.empty())
-        app.open(path);
-    if (app.launchedWithFile && app.prefs.startFullscreen)
+        app.open(path, path.is_absolute() && !app.restartView);
+    if (app.restartView ? app.restartView->fullscreen : app.launchedWithFile && app.prefs.startFullscreen)
         app.toggleFullscreen();
-    ShowWindow(hwnd, show);
+    ShowWindow(hwnd, app.restartView ? app.restartView->placement.showCmd : show);
     UpdateWindow(hwnd);
+    VMD_TEST_ONLY(if (path.empty() && app.restartView) app.reportRestart(".after");)
     VMD_TEST_ONLY(app.startupPhase("window_shown");)
 #ifdef VMD_TESTING
     if (!app.metricsFile.empty()) {
@@ -4531,7 +5137,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
 #endif
     MSG message;
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && GetFocus() != hwnd) {
+        if (app.editor && app.editor->dialogMessage(message))
+            continue;
+        if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && app.editor && !app.informationView) {
+            if (app.editor->tab(GetKeyState(VK_SHIFT) < 0))
+                continue;
+        } else if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && GetFocus() != hwnd) {
             HWND next = app.nextTabControl(GetFocus(), GetKeyState(VK_SHIFT) < 0);
             if (next)
                 SetFocus(next);

@@ -7,6 +7,10 @@ import pathlib
 import subprocess
 import time
 
+from test_desktop import isolate
+
+isolate()
+
 root = pathlib.Path(__file__).resolve().parents[1]
 folder = root / "build" / ("renderer-transition-" + str(time.time_ns()))
 folder.mkdir(parents=True)

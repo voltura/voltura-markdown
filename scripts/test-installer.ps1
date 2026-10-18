@@ -27,6 +27,14 @@ $preferencesBefore = if (Test-Path -LiteralPath $preferences) {
 if ($LASTEXITCODE) { throw 'Smoke-test installer build failed.' }
 
 try {
+    $setupGate = [Threading.Mutex]::new($false, "Local\$productKey-Setup")
+    try {
+        $blocked = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru -WindowStyle Hidden
+        if ($blocked.ExitCode -eq 0 -or (Test-Path -LiteralPath $registryPath) -or (Test-Path -LiteralPath (Join-Path $installDir 'vmd.exe'))) {
+            throw 'Concurrent Setup was not rejected before modifying the installation.'
+        }
+    }
+    finally { $setupGate.Dispose() }
     $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru -WindowStyle Hidden
     if ($process.ExitCode) { throw "Install failed: $($process.ExitCode)" }
     $installed = Join-Path $installDir 'vmd.exe'
@@ -48,6 +56,13 @@ try {
         $process = Start-Process -FilePath (Join-Path $installDir 'Uninstall.exe') -ArgumentList @('/S', "_?=$installDir") -Wait -PassThru -WindowStyle Hidden
         if ($process.ExitCode -eq 0 -or !(Test-Path -LiteralPath $installed) -or !(Test-Path -LiteralPath $registryPath) -or !(Test-Path -LiteralPath $shortcut)) {
             throw 'Locked-file uninstall did not fail safely.'
+        }
+        $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru -WindowStyle Hidden
+        if ($process.ExitCode -eq 0 -or (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ne $expected) {
+            throw 'Locked-file upgrade did not preserve the original executable.'
+        }
+        if ((Test-Path -LiteralPath (Join-Path $installDir 'vmd.update-new.exe')) -or (Test-Path -LiteralPath (Join-Path $installDir 'vmd.update-old.exe'))) {
+            throw 'Locked-file upgrade left replacement files behind.'
         }
     }
     finally {

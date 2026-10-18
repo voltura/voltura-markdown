@@ -138,6 +138,7 @@ Preferences readPreferences() {
     p.theme = std::clamp(p.theme, -1, 1);
     p.zoom = std::clamp(GetPrivateProfileIntW(L"reader", L"zoom", 100, path.c_str()) / 100.f, .5f, 3.f);
     p.startFullscreen = GetPrivateProfileIntW(L"reader", L"startFullscreen", 1, path.c_str()) != 0;
+    p.automaticUpdates = GetPrivateProfileIntW(L"reader", L"automaticUpdates", 0, path.c_str()) != 0;
     p.placed = GetPrivateProfileStructW(L"reader", L"placement", &p.placement, sizeof(p.placement),
                                         path.c_str()) != 0;
     if (p.placement.length != sizeof(WINDOWPLACEMENT))
@@ -145,6 +146,8 @@ Preferences readPreferences() {
     return p;
 }
 void savePreferences(const Preferences &p) {
+    // Only explicit opt-in/out writes automaticUpdates. Closing another window must not
+    // restore its stale copy of that choice.
     auto path = config();
     if (path.empty())
         return;
@@ -155,6 +158,11 @@ void savePreferences(const Preferences &p) {
     if (p.placed)
         WritePrivateProfileStructW(L"reader", L"placement", (void *)&p.placement, sizeof(p.placement),
                                    path.c_str());
+}
+void saveAutomaticUpdates(bool enabled) {
+    auto path = config();
+    if (!path.empty())
+        WritePrivateProfileStringW(L"reader", L"automaticUpdates", enabled ? L"1" : L"0", path.c_str());
 }
 bool systemDark() {
     DWORD value = 1, size = sizeof(value);
@@ -279,7 +287,8 @@ std::wstring registerApplication(bool remove, bool integrateWithShell, bool *reg
     set(prog + L"\\shell\\open\\command", nullptr, L"\"" + exe + L"\" \"%1\"");
     set(prog, L"FriendlyTypeName", L"Markdown document");
     set(app + L"\\Capabilities", L"ApplicationName", L"Voltura Markdown");
-    set(app + L"\\Capabilities", L"ApplicationDescription", L"Fast, read-only Markdown reader");
+    set(app + L"\\Capabilities", L"ApplicationDescription",
+        L"Fast Markdown reader with optional source editing");
     set(app + L"\\Capabilities", L"ApplicationIcon", exe + L",0");
     set(app + L"\\Capabilities\\FileAssociations", L".md", L"Voltura.Markdown");
     set(L"Software\\RegisteredApplications", L"Voltura Markdown", app + L"\\Capabilities");
@@ -350,8 +359,8 @@ bool openLink(const std::wstring &link, const std::wstring &base) {
 }
 std::wstring licenses() {
     std::wstring text =
-        L"# Voltura Markdown\n\n**Version 1.1.8**\n\n"
-        L"A fast, read-only Markdown reader for Windows.\n\n"
+        L"# Voltura Markdown\n\n**Version 1.2.0**\n\n"
+        L"A fast Markdown reader with optional source editing for Windows.\n\n"
         L"## Created by\n\n- **Developer:** Joakim Skoglund\n"
         L"- **Company:** Voltura AB\n- **Website:** [markdown.voltura.se](https://markdown.voltura.se/)\n\n"
         L"## Help and navigation\n\n- <kbd>F1</kbd>: open Help for controls and shortcuts.\n"

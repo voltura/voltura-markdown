@@ -5,10 +5,17 @@ param(
     [switch]$TraceDisplay,
     [switch]$CloseFullscreen,
     [switch]$StagedRenderer,
+    [switch]$Interactive,
     [string]$PresentMon = 'build/tools/PresentMon.exe'
 )
 
 $ErrorActionPreference = 'Stop'
+if (!$Interactive) {
+    if ($TraceDisplay) { throw 'Display tracing needs the visible desktop; use -Interactive -TraceDisplay.' }
+    . (Join-Path $PSScriptRoot 'invoke-test-desktop.ps1')
+    Invoke-IsolatedGuiTest -Script $PSCommandPath -Parameters $PSBoundParameters
+    return
+}
 $repo = Split-Path -Parent $PSScriptRoot
 $executable = Join-Path $repo 'build/Release/vmd-test.exe'
 $documentPath = (Resolve-Path -LiteralPath $Document).Path

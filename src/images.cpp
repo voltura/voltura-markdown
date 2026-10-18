@@ -183,6 +183,27 @@ Image decodeImage(std::vector<unsigned char> bytes) {
     return out;
 }
 } // namespace
+Image imageForExport(const std::wstring &url, const std::wstring &base, const std::atomic_bool &cancel) {
+    std::wstring key = url;
+    if (!url.starts_with(L"https://")) {
+        require(url.find(L"://") == url.npos && !url.starts_with(L"data:"));
+        std::wstring decoded(key.size() + 1, L'\0');
+        DWORD count = (DWORD)decoded.size();
+        require(SUCCEEDED(UrlUnescapeW(key.data(), decoded.data(), &count, URL_UNESCAPE_AS_UTF8)));
+        decoded.resize(count);
+        std::filesystem::path path(decoded);
+        if (path.is_relative())
+            path = std::filesystem::path(base).parent_path() / path;
+        path = std::filesystem::absolute(path).lexically_normal();
+        auto root = path.root_name().wstring();
+        require(root.size() == 2 && root[1] == L':' &&
+                GetDriveTypeW(path.root_path().c_str()) != DRIVE_REMOTE);
+        key = path.wstring();
+    }
+    auto bytes = readImage(key, cancel);
+    require(!cancel.load());
+    return decodeImage(std::move(bytes));
+}
 Images::Images(HWND h) : window(h) {}
 #ifdef VMD_TESTING
 Images::Images(HWND h, std::function<Image(const std::wstring &, const std::atomic_bool &)> loader)

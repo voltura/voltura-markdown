@@ -11,6 +11,10 @@ import sys
 import time
 import winreg
 
+from test_desktop import isolate
+
+isolate()
+
 root = pathlib.Path(__file__).resolve().parents[1]
 folder = root / "build" / ("association-checks-" + str(time.time_ns()))
 folder.mkdir(parents=True)

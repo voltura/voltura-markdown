@@ -18,6 +18,8 @@ struct Image {
     unsigned width = 0, height = 0;
     bool ready = false, failed = false;
 };
+// Explicit export jobs reuse the reader's bounded decoders, off the UI thread.
+Image imageForExport(const std::wstring &url, const std::wstring &base, const std::atomic_bool &cancel);
 class Images {
     HWND window;
     std::mutex mutex;

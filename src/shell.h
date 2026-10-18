@@ -10,9 +10,11 @@ struct Preferences {
     WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
     bool placed = false;
     bool startFullscreen = true;
+    bool automaticUpdates = false;
 };
 Preferences readPreferences();
 void savePreferences(const Preferences &p);
+void saveAutomaticUpdates(bool enabled);
 bool systemDark();
 enum class MarkdownAssociation { Matching, Mismatch, Other, Unknown };
 MarkdownAssociation classifyMarkdownAssociation(std::wstring_view progId, std::wstring_view command,

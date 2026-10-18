@@ -6,6 +6,10 @@ import pathlib
 import subprocess
 import time
 
+from test_desktop import isolate
+
+isolate()
+
 root = pathlib.Path(__file__).resolve().parents[1]
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 callback_type = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
