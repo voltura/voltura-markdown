@@ -73,7 +73,7 @@ h1 span { color: var(--accent); }
 h2 { font-size: clamp(32px, 3.7vw, 45px); line-height: 1.19; letter-spacing: -1.8px; font-weight: 650; margin-bottom: 20px; }
 .section-intro .eyebrow { margin-bottom: 18px; }
 .section-intro > p:last-child { color: var(--muted); font-size: 16px; margin-bottom: 0; }
-.features { display: grid; grid-template-columns: repeat(4, 1fr); gap: 33px; margin-top: 50px; }
+.features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 33px; margin-top: 50px; }
 .feature-icon { display: inline-flex; width: 43px; height: 43px; align-items: center; justify-content: center; background: var(--accent-soft); color: var(--accent); font-size: 25px; border-radius: 13px; margin-bottom: 18px; }
 .code-icon { font-size: 18px; font-weight: 600; }
 h3 { font-size: 17px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px; margin-bottom: 12px; }
