@@ -359,7 +359,7 @@ bool openLink(const std::wstring &link, const std::wstring &base) {
 }
 std::wstring licenses() {
     std::wstring text =
-        L"# Voltura Markdown\n\n**Version 1.2.0**\n\n"
+        L"# Voltura Markdown\n\n**Version 1.3.0**\n\n"
         L"A fast Markdown reader with optional source editing for Windows.\n\n"
         L"## Created by\n\n- **Developer:** Joakim Skoglund\n"
         L"- **Company:** Voltura AB\n- **Website:** [markdown.voltura.se](https://markdown.voltura.se/)\n\n"
@@ -368,9 +368,10 @@ std::wstring licenses() {
         L"## Open-source software\n\n"
         L"- **Voltura Markdown:** application and artwork · MIT license.\n"
         L"- **MD4C:** Markdown parser · MIT license.\n"
+        L"- **Lexbor:** HTML5 parser · Apache License 2.0.\n"
         L"- **NanoSVG:** static SVG renderer · zlib license.\n\n"
         L"The complete license notices follow.\n\n---\n\n";
-    for (int id : {4, 2, 3}) {
+    for (int id : {4, 2, 3, 5, 6}) {
         auto r = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
         if (r) {
             auto data = (const char *)LockResource(LoadResource(nullptr, r));
@@ -380,7 +381,8 @@ std::wstring licenses() {
             MultiByteToWideChar(CP_UTF8, 0, data, size, s.data(), n);
             text += id == 4   ? L"### Voltura Markdown\n\nApplication and artwork · MIT license\n\n```text\n"
                     : id == 2 ? L"### MD4C\n\nMarkdown parser · MIT license\n\n```text\n"
-                              : L"### NanoSVG\n\nStatic SVG renderer · zlib license\n\n```text\n";
+                    : id == 3 ? L"### NanoSVG\n\nStatic SVG renderer · zlib license\n\n```text\n"
+                              : L"### Lexbor\n\nHTML5 parser · Apache License 2.0\n\n```text\n";
             text += s + L"\n```\n\n";
         }
     }

@@ -43,10 +43,57 @@ void raster(const std::filesystem::path &path, REFGUID container) {
     check(frame->Commit());
     check(encoder->Commit());
 }
-int main() {
+int wmain(int argc, wchar_t **argv) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     std::filesystem::path temp;
     try {
+        // Opt-in live measurement; normal CTest runs never need network access.
+        if (argc > 2 && std::wstring_view(argv[1]) == L"--benchmark-images") {
+            Images images(nullptr);
+            for (int pass = 0; pass < 2; ++pass) {
+                auto start = std::chrono::steady_clock::now();
+                std::vector<bool> done(argc - 2);
+                int remaining = argc - 2;
+                while (remaining) {
+                    require(std::chrono::steady_clock::now() - start < std::chrono::seconds(30),
+                            "image benchmark timed out");
+                    for (int i = 2; i < argc; ++i) {
+                        if (done[i - 2])
+                            continue;
+                        auto image = images.get(argv[i], L"");
+                        if (!image)
+                            continue;
+                        require(image->ready && !image->failed, "benchmark image failed to decode");
+                        if (!pass)
+                            std::cout << "image_" << i - 2 << "_ms="
+                                      << std::chrono::duration<double, std::milli>(
+                                             std::chrono::steady_clock::now() - start)
+                                             .count()
+                                      << '\n';
+                        done[i - 2] = true;
+                        --remaining;
+                    }
+                    if (remaining)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                std::cout << (pass ? "cached_ms=" : "cold_ms=")
+                          << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                       start)
+                                 .count()
+                          << '\n';
+            }
+            return 0;
+        }
+        if (argc == 4 && std::wstring_view(argv[1]) == L"--decode-image") {
+            std::atomic_bool cancel = false;
+            auto image = imageForExport(argv[2], L"", cancel);
+            std::ofstream output(std::filesystem::path(argv[3]), std::ios::binary);
+            output.write((const char *)&image.width, sizeof(image.width));
+            output.write((const char *)&image.height, sizeof(image.height));
+            output.write((const char *)image.pixels.data(), image.pixels.size());
+            require((bool)output, "image pixel output");
+            return 0;
+        }
         // Override HKCU only in this test process: no real association or Settings UI.
         std::wstring root = L"Software\\VolturaMarkdownTest-" + std::to_wstring(GetCurrentProcessId());
         HKEY hive = nullptr;
@@ -155,6 +202,54 @@ int main() {
         std::ofstream(temp / L"dashes.svg")
             << "<svg width='200' height='200'><path d='M10 10 L100 10' stroke='black' "
                "stroke-dasharray='0 2 3' stroke-dashoffset='-2'/></svg>";
+        std::ofstream(temp / L"badge.svg")
+            << "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='20'>"
+               "<clipPath id='clip'><rect width='100' height='20' fill='red'/></clipPath>"
+               "<rect width='100' height='20' fill='#555'/>"
+               "<g fill='white' text-anchor='middle' font-family='Verdana,sans-serif' font-size='110'>"
+               "<text x='250' y='140' transform='scale(.1)' textLength='400'>visitors</text>"
+               "<g transform='scale(.1)'><text x='750' y='140' textLength='300'>123</text></g>"
+               "</g><rect width='100' height='20' fill='rgba(0,0,0,0)'/></svg>";
+        {
+            std::atomic_bool cancel = false;
+            auto badge = imageForExport(L"badge.svg", (temp / L"document.md").wstring(), cancel);
+            size_t labelPixels = 0, valuePixels = 0, redPixels = 0;
+            for (unsigned y = 0; y < badge.height; ++y)
+                for (unsigned x = 0; x < badge.width; ++x) {
+                    auto pixel = badge.pixels.data() + ((size_t)y * badge.width + x) * 4;
+                    if (pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200)
+                        (x < 50 ? labelPixels : valuePixels)++;
+                    if (pixel[2] > 200 && pixel[1] < 40)
+                        ++redPixels;
+                }
+            require(badge.width == 100 && badge.height == 20 && labelPixels > 30 && valuePixels > 20 &&
+                        redPixels == 0,
+                    "SVG badge text, anchors, nested transforms and intrinsic size");
+            std::ofstream(temp / L"entities.svg")
+                << "<svg width='120' height='20'><text y='15' font-size='14' fill='white'>A &amp; B "
+                   "&#49;</text></svg>";
+            auto entities = imageForExport(L"entities.svg", (temp / L"document.md").wstring(), cancel);
+            require(std::any_of(entities.pixels.begin(), entities.pixels.end(), [](auto c) { return c > 0; }),
+                    "SVG text entities render as glyphs");
+            std::ofstream(temp / L"embedded.svg")
+                << "<svg width='30' height='20'><image x='5' y='5' width='10' height='10' "
+                   "href='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0nMTAnIGhlaWdodD0nMTAnPjxyZWN0IHdpZHRo"
+                   "PScxMCcgaGVpZ2h0PScxMCcgZmlsbD0nI2ZmMDAwMCcvPjwvc3ZnPg=='/>"
+                   "<image href='file:///must-not-open.svg' width='20' height='20'/></svg>";
+            auto embedded = imageForExport(L"embedded.svg", (temp / L"document.md").wstring(), cancel);
+            auto pixel = embedded.pixels.data() + (10 * embedded.width + 10) * 4;
+            require(pixel[2] == 255 && pixel[0] == 0 && pixel[3] == 255 && embedded.pixels[3] == 0,
+                    "embedded base64 SVG icon renders at its placement; external resources stay ignored");
+            std::ofstream(temp / L"oversized-text.svg")
+                << "<svg width='100' height='20'><text y='15'>" << std::string(4097, 'a') << "</text></svg>";
+            bool rejected = false;
+            try {
+                imageForExport(L"oversized-text.svg", (temp / L"document.md").wstring(), cancel);
+            } catch (const std::exception &) {
+                rejected = true;
+            }
+            require(rejected, "SVG text work is bounded before font layout");
+        }
         {
             Images images(nullptr);
             for (auto name : {L"test%20image.png", L"test.jpg", L"test.gif", L"test.svg", L"classes.svg",
@@ -170,6 +265,46 @@ int main() {
                             image->pixels.size() == image->width * image->height * 4,
                         "local PNG/JPEG/GIF/SVG decode");
             }
+            auto base = (temp / L"document.md").wstring();
+            std::shared_ptr<Image> badge;
+            for (int i = 0; i < 300 && !badge; ++i) {
+                badge = images.get(L"badge.svg", base);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            require(badge && badge->ready && badge->svgSource, "badge vector source retained");
+            // Removing the file proves DPI/zoom changes reuse source without I/O.
+            std::filesystem::remove(temp / L"badge.svg");
+            for (float dpi : {96.f, 120.f, 144.f, 192.f}) {
+                for (float zoom : {.75f, 1.f, 1.5f, 2.f}) {
+                    float scale = dpi / 96 * zoom;
+                    std::shared_ptr<Image> sharp;
+                    bool pending = true;
+                    for (int i = 0; i < 300; ++i) {
+                        sharp = images.raster(badge, 100 * scale, 20 * scale, &pending);
+                        if (!pending)
+                            break;
+                        require(sharp == badge, "original badge stays available while rasterizing");
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
+                    require(!pending && sharp && sharp->ready && sharp->width >= 100 * scale &&
+                                sharp->height >= 20 * scale,
+                            "SVG raster covers Windows DPI and document zoom");
+                    require(images.raster(badge, 100 * scale, 20 * scale) == sharp,
+                            "repeat layout reuses raster cache");
+                    require(badge->width == 100 && badge->height == 20,
+                            "raster resolution never changes intrinsic layout size");
+                }
+            }
+            std::shared_ptr<Image> bounded;
+            bool pending = true;
+            for (int i = 0; i < 300 && pending; ++i) {
+                bounded = images.raster(badge, 100000, 20000, &pending);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            require(!pending && bounded->width <= 4096 && bounded->height <= 4096,
+                    "extreme SVG magnification remains bounded");
+            auto png = images.get(L"test%20image.png", base);
+            require(images.raster(png, 100, 100) == png, "raster images retain their existing decode");
             for (auto url : {L"\\\\server\\share\\image.png", L"%5C%5Cserver%5Cshare%5Cimage.png",
                              L"\\\\?\\C:\\image.png", L"//server/share/image.png"}) {
                 auto rejected = images.get(url, (temp / L"document.md").wstring());
@@ -191,37 +326,96 @@ int main() {
             require(tiny && tiny->failed, "non-progressing SVG dashes fail without hanging");
         }
         {
+            // Observe worker completion without retaining any UI image pointer.
+            // The old eviction loop only appeared once layouts released the base.
+            HWND window = CreateWindowW(L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
+                                        GetModuleHandleW(nullptr), nullptr);
+            require(window != nullptr, "image cache completion window");
+            {
+                Images images(window);
+                auto base = (temp / L"document.md").wstring();
+                std::ofstream(temp / L"large-square.svg")
+                    << "<svg width='2048' height='2048'><rect width='2048' height='2048' fill='blue'/></svg>";
+                auto completed = [&] {
+                    MSG message{};
+                    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (!PeekMessageW(&message, window, WM_APP + 2, WM_APP + 2, PM_REMOVE)) {
+                        require(std::chrono::steady_clock::now() < deadline, "SVG cache worker completes");
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                };
+                images.get(L"large-square.svg", base);
+                completed();
+                std::weak_ptr<Image> original;
+                {
+                    auto image = images.get(L"large-square.svg", base);
+                    require(image && image->ready, "large SVG base decodes");
+                    original = image;
+                }
+                std::filesystem::remove(temp / L"large-square.svg");
+                for (float size : {3840.f, 4096.f, 3072.f, 3840.f}) {
+                    bool pending = false;
+                    {
+                        auto image = images.get(L"large-square.svg", base);
+                        require(image && image == original.lock(), "large SVG never reloads its source");
+                        images.raster(image, size, size, &pending);
+                    }
+                    if (pending)
+                        completed();
+                    auto begin = std::chrono::steady_clock::now();
+                    for (unsigned repeat = 0; repeat < 100; ++repeat) {
+                        auto image = images.get(L"large-square.svg", base);
+                        require(image && image == original.lock(), "raster publication retains the URL base");
+                        auto raster = images.raster(image, size, size, &pending);
+                        require(!pending && raster && raster->ready && raster != image,
+                                "repeat large SVG layouts reuse a completed raster");
+                        require(image->pixels.size() + raster->pixels.size() + 2 * image->svgSource->size() <=
+                                    64 * 1024 * 1024,
+                                "base and enlarged raster fit the bounded image cache together");
+                        require(image->width == 2048 && image->height == 2048,
+                                "bounded raster does not change intrinsic layout size");
+                    }
+                    require(std::chrono::steady_clock::now() - begin < std::chrono::milliseconds(100),
+                            "cached large SVG layouts stay fast");
+                }
+            }
+            DestroyWindow(window);
+        }
+        for (int workerCount : {2, 6}) {
             std::atomic_int started = 0, cancelledJobs = 0;
             Images images(nullptr, [&](const std::wstring &, const std::atomic_bool &cancel) {
                 int ordinal = ++started;
-                if (ordinal <= 2) {
+                if (ordinal <= workerCount) {
                     while (!cancel.load())
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     ++cancelledJobs;
                 }
                 Image image;
                 image.width = image.height = 1;
-                image.pixels.assign(4, ordinal <= 2 ? 0 : 255);
+                image.pixels.assign(4, ordinal <= workerCount ? 0 : 255);
                 image.ready = true;
                 return image;
             });
             auto base = (temp / L"document.md").wstring();
-            images.get(L"same.png", base);
-            images.get(L"slow.png", base);
+            std::wstring prefix = workerCount == 6 ? L"https://badges.invalid/" : L"";
+            images.get(prefix + L"same.png", base);
+            for (int i = 1; i < workerCount; ++i)
+                images.get(prefix + L"slow" + std::to_wstring(i) + L".png", base);
             auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-            while (started < 2 && std::chrono::steady_clock::now() < deadline)
+            while (started < workerCount && std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            require(started == 2, "both image workers started");
+            require(started == workerCount, "local/remote image workers run concurrently");
             for (int i = 0; i < 16; ++i)
-                images.get(L"queued" + std::to_wstring(i) + L".png", base);
+                images.get(prefix + L"queued" + std::to_wstring(i) + L".png", base);
+            require(started == workerCount, "image worker concurrency remains bounded");
             images.cancelPending();
             std::shared_ptr<Image> current;
-            while ((!current || cancelledJobs < 2) && std::chrono::steady_clock::now() < deadline) {
-                current = images.get(L"same.png", base);
+            while ((!current || cancelledJobs < workerCount) && std::chrono::steady_clock::now() < deadline) {
+                current = images.get(prefix + L"same.png", base);
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            require(current && current->ready && current->pixels[0] == 255 && started == 3 &&
-                        cancelledJobs == 2,
+            require(current && current->ready && current->pixels[0] == 255 && started == workerCount + 1 &&
+                        cancelledJobs == workerCount,
                     "document change cancels obsolete queue and rejects stale same-URL results");
         }
         auto path = temp / L"Unicode åäö 日本語.md";

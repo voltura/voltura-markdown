@@ -13,7 +13,7 @@ Visit the [product website](https://markdown.voltura.se/) or open [Releases](htt
 | **`vmd.exe`** | Portable reader and editor. Download, keep in a suitable folder, and run. |
 | **`VolturaMarkdown-Setup-<version>-win-x64.exe`** | Per-user installation with a Start menu shortcut and Windows uninstall entry. |
 
-**1.2.0** includes self-signed, timestamped executables. GitHub's source archives do not contain a built app; download one of the executable assets above.
+**1.3.0** includes self-signed, timestamped executables. GitHub's source archives do not contain a built app; download one of the executable assets above.
 
 Setup requires no administrator access. Its optional **Choose as default Markdown reader** checkbox opens Windows Default apps so you can make the final choice.
 
@@ -33,22 +33,27 @@ To update, close the reader and replace the portable executable, or run the newe
 
 - Formatted Markdown and selectable, read-only source.
 - Optional edit mode, new documents, live preview, validation warnings, Save, and Save As.
+- Live preview starts beside the source in wide edit windows; compact windows keep the source/preview toggle. **View mode** returns to reading.
 - Helpers for headings 1–6, bold/italic/underline, lists, tables, links, images/placeholders, and code blocks.
 - Find/Replace, a heading outline, smart list continuation, source/code highlighting, and table row/column editing.
 - Synchronized live-preview scrolling, clipboard/image-file drops into managed assets, and local crash-recovery drafts.
 - Export formatted HTML, print, or create a PDF with a Windows PDF printer.
 - Search, copy, zoom, smooth scrolling, and DPI-aware controls.
-- Light/dark themes, including menus, tooltips, scrollbars, Help, and About.
+- Copy complete code blocks with one click, with basic syntax coloring for common language labels and inline-code backgrounds.
+- Light/dark themes, including menus, dialogs, file/print pickers, tooltips, scrollbars, Help, and About.
 - Tables, task lists, footnotes, alerts, Unicode, and local/HTTPS images.
+- HTML tables with merged cells, captions, nested tables and images; HTML image dimensions, light/dark pictures, subscripts, superscripts, and sharper SVG badges. Adjacent Markdown badges wrap together.
+- Colored links show their destination on hover. Rich HTML uses a native presentation subset; exceptionally large table bands fall back to readable child blocks.
 - Copy file/name/path, show in Explorer, and choose an external editor.
 - Optional `.md` registration through Windows Settings.
+- Opt-in stable automatic updates with publisher-signature and checksum verification. Manual updates restore unchanged open documents and reading positions.
 
 The portable reader needs no companion DLLs, browser engine, .NET, or Visual C++ redistributable. Reading stays read-only until you choose **Edit Markdown** (**Ctrl+E**). **Ctrl+N** starts a new document; **Ctrl+S** saves explicitly. A missing full file path supplied at startup offers to create a draft at that location, writing it only when you save.
 
 ## Documentation
 
 - [User guide](docs/USER-GUIDE.md) · [Supported formats and limits](docs/COMPATIBILITY.md)
-- [Release notes](docs/releases/1.2.0.md) · [Changelog](CHANGELOG.md)
+- [Release notes](docs/releases/1.3.0.md) · [Changelog](CHANGELOG.md)
 - [Folder and document map](docs/REPOSITORY.md) · [Architecture](docs/ARCHITECTURE.md)
 - [Build and verify](docs/BUILDING.md) · [Code style](docs/CODE-STYLE.md) · [Performance](PERFORMANCE.md)
 - [Local releases and signing](docs/RELEASING.md) · [Product website](docs/PAGES.md)

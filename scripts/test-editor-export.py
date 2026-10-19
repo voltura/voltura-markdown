@@ -26,5 +26,5 @@ assert data.startswith(b"%PDF-") and data.rstrip().endswith(b"%%EOF"), "Complete
 pages = len(re.findall(rb"/Type\s*/Page\b", data))
 images = len(re.findall(rb"/Subtype\s*/Image\b", data))
 assert pages >= 2, "Printing must paginate"
-assert images >= 1, "Printed image must be embedded rather than replaced by alt text"
+assert images >= 5, "Standalone, ordinary, colspan, rowspan, and nested cell images must all print"
 print(f"PASS: PDF has {pages} pages and {images} embedded image(s). Artifacts: {folder}")

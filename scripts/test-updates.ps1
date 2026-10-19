@@ -216,7 +216,7 @@ try {
     $compiler = Get-Command makensis.exe -ErrorAction SilentlyContinue
     if (!$compiler) { $compiler = Get-Command (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe') -ErrorAction Stop }
     try {
-        & $compiler.Source /WX /V2 '/DVERSION=1.2.1' "/DOUTPUT=$setupPath" "/DPRODUCT_KEY=$productKey" "/DSHORTCUT_NAME=$shortcutName" "/DAPP_BINARY=$fixture" (Join-Path $PSScriptRoot 'installer.nsi')
+        & $compiler.Source /WX /V2 '/DVERSION=1.3.1' "/DOUTPUT=$setupPath" "/DPRODUCT_KEY=$productKey" "/DSHORTCUT_NAME=$shortcutName" "/DAPP_BINARY=$fixture" (Join-Path $PSScriptRoot 'installer.nsi')
         if ($LASTEXITCODE) { throw 'Isolated update installer build failed.' }
         & (Join-Path $PSScriptRoot 'sign.ps1') -Path $setupPath -CertificateThumbprint $signing.certificateThumbprint -TimestampUrl $signing.timestampUrl -AllowSelfSigned:([bool]$signing.allowSelfSigned)
         $oldTestKey = $env:VMD_UPDATES_TEST_PRODUCT_KEY
@@ -226,7 +226,7 @@ try {
             Wait-Helper $helper $true
         } finally { $env:VMD_UPDATES_TEST_PRODUCT_KEY = $oldTestKey }
         if ((Get-FileHash -LiteralPath $installedTarget -Algorithm SHA256).Hash -ne $newHash) { throw 'Installed update differs from signed payload.' }
-        if ((Get-ItemProperty -LiteralPath $registryPath).DisplayVersion -ne '1.2.1') { throw 'Installed update registration did not advance.' }
+        if ((Get-ItemProperty -LiteralPath $registryPath).DisplayVersion -ne '1.3.1') { throw 'Installed update registration did not advance.' }
         Write-Host 'PASS: real signed silent NSIS update to existing installation.'
     } finally {
         if (Test-Path -LiteralPath (Join-Path $installDir 'Uninstall.exe')) {

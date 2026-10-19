@@ -1,6 +1,8 @@
 #include "images.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <shlwapi.h>
@@ -16,12 +18,15 @@
 #include "../third_party/nanosvg/nanosvgrast.h"
 #pragma warning(pop)
 using Microsoft::WRL::ComPtr;
+#include "svg-text.h"
 namespace vm {
 namespace {
 constexpr size_t limit = 32 * 1024 * 1024;
 struct Http {
     HINTERNET h = nullptr;
     Http(HINTERNET h = nullptr) : h(h) {}
+    Http(const Http &) = delete;
+    Http &operator=(const Http &) = delete;
     ~Http() {
         if (h)
             WinHttpCloseHandle(h);
@@ -34,15 +39,21 @@ void require(bool ok) {
     if (!ok)
         throw std::runtime_error("Image unavailable");
 }
-std::vector<unsigned char> readImage(const std::wstring &path, const std::atomic_bool &cancel) {
+std::vector<unsigned char> readImage(const std::wstring &path, const std::atomic_bool &cancel,
+                                     Http &session) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     auto active = [&] { require(!cancel.load() && std::chrono::steady_clock::now() < deadline); };
     active();
     if (path.starts_with(L"https://")) {
-        Http session(WinHttpOpen(L"VolturaMarkdown/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+        // Created lazily on the loading thread. Keeping the session alive lets
+        // WinHTTP reuse HTTPS connections for badges from the same host.
+        if (!session.h) {
+            session.h = WinHttpOpen(L"VolturaMarkdown/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+            if (session.h)
+                WinHttpSetTimeouts(session, 2000, 2000, 2000, 2000);
+        }
         require(session.h != nullptr);
-        WinHttpSetTimeouts(session, 2000, 2000, 2000, 2000);
         std::wstring url = path;
         for (int hop = 0; hop < 5; ++hop) {
             active();
@@ -117,13 +128,16 @@ std::vector<unsigned char> readImage(const std::wstring &path, const std::atomic
     require((bool)f.read((char *)b.data(), size));
     return b;
 }
-Image decodeImage(std::vector<unsigned char> bytes) {
+Image decodeImage(std::vector<unsigned char> bytes, float rasterScale = 1,
+                  std::shared_ptr<const std::vector<unsigned char>> source = {}) {
     Image out;
     std::string_view text((char *)bytes.data(), bytes.size());
     bool svg = text.find("<svg") != text.npos;
     if (svg) {
+        out.svgSource =
+            source ? std::move(source) : std::make_shared<const std::vector<unsigned char>>(bytes);
         bytes.push_back(0);
-        std::unique_ptr<NSVGimage, decltype(&nsvgDelete)> image(nsvgParse((char *)bytes.data(), "px", 96),
+        std::unique_ptr<NSVGimage, decltype(&nsvgDelete)> image(parseSvgWithText((char *)bytes.data()),
                                                                 nsvgDelete);
         require(image && image->width > 0 && image->height > 0 && std::isfinite(image->width) &&
                 std::isfinite(image->height));
@@ -132,9 +146,10 @@ Image decodeImage(std::vector<unsigned char> bytes) {
             for (int i = 0; i < shape->strokeDashCount; ++i)
                 require(std::isfinite(shape->strokeDashArray[i]) && shape->strokeDashArray[i] >= 0);
         }
-        float scale = std::min(1.f, 2048.f / std::max(image->width, image->height));
-        out.width = std::max(1u, (unsigned)(image->width * scale));
-        out.height = std::max(1u, (unsigned)(image->height * scale));
+        float baseScale = std::min(1.f, 2048.f / std::max(image->width, image->height));
+        float scale = std::min(rasterScale * baseScale, 4096.f / std::max(image->width, image->height));
+        out.width = std::max(1u, (unsigned)std::ceil(image->width * scale));
+        out.height = std::max(1u, (unsigned)std::ceil(image->height * scale));
         out.pixels.resize((size_t)out.width * out.height * 4);
         std::unique_ptr<NSVGrasterizer, decltype(&nsvgDeleteRasterizer)> raster(nsvgCreateRasterizer(),
                                                                                 nsvgDeleteRasterizer);
@@ -200,7 +215,8 @@ Image imageForExport(const std::wstring &url, const std::wstring &base, const st
                 GetDriveTypeW(path.root_path().c_str()) != DRIVE_REMOTE);
         key = path.wstring();
     }
-    auto bytes = readImage(key, cancel);
+    Http session;
+    auto bytes = readImage(key, cancel, session);
     require(!cancel.load());
     return decodeImage(std::move(bytes));
 }
@@ -235,6 +251,7 @@ Images::~Images() {
 }
 void Images::run() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    Http session;
     for (;;) {
         Job job;
         {
@@ -253,12 +270,13 @@ void Images::run() {
             else
 #endif
             {
-                auto bytes = readImage(job.key, *job.cancel);
+                auto bytes = job.svgSource ? *job.svgSource : readImage(job.key, *job.cancel, session);
                 require(!job.cancel->load());
-                result = decodeImage(std::move(bytes));
+                result = decodeImage(std::move(bytes), job.rasterScale, job.svgSource);
             }
         } catch (...) {
             result.failed = true;
+            result.svgSource = job.svgSource;
         }
         {
             std::lock_guard lock(mutex);
@@ -267,12 +285,13 @@ void Images::run() {
             auto pending = cache.find(job.key);
             if (job.cancel->load() || pending == cache.end() || pending->second != job.pending)
                 continue;
-            size_t total = result.pixels.size();
+            size_t total = result.pixels.size() + (result.svgSource ? result.svgSource->size() : 0);
             for (const auto &[key, image] : cache)
-                total += image->pixels.size();
+                total += image->pixels.size() + (image->svgSource ? image->svgSource->size() : 0);
             for (auto it = cache.begin(); it != cache.end() && total > 64 * 1024 * 1024;) {
                 if (it->first != job.key && it->second.use_count() == 1 && it->second->ready) {
-                    total -= it->second->pixels.size();
+                    total -= it->second->pixels.size() +
+                             (it->second->svgSource ? it->second->svgSource->size() : 0);
                     it = cache.erase(it);
                 } else
                     ++it;
@@ -319,12 +338,14 @@ std::shared_ptr<Image> Images::get(const std::wstring &url, const std::wstring &
     }
     if (jobs.size() >= 16)
         return {};
-    if (workers.empty())
-        for (int i = 0; i < 2; ++i)
-            workers.emplace_back([this] { run(); });
+    // Network waits should not serialize an entire row of remote badges.
+    // Local-only documents keep the existing two-worker footprint.
+    size_t workerCount = url.starts_with(L"https://") ? 6 : 2;
+    while (workers.size() < workerCount)
+        workers.emplace_back([this] { run(); });
     size_t total = 0;
     for (auto &[k, v] : cache)
-        total += v->pixels.size();
+        total += v->pixels.size() + (v->svgSource ? v->svgSource->size() : 0);
     if (total > 64 * 1024 * 1024 || cache.size() >= 128) {
         for (auto i = cache.begin(); i != cache.end();) {
             if (i->second.use_count() == 1)
@@ -338,5 +359,53 @@ std::shared_ptr<Image> Images::get(const std::wstring &url, const std::wstring &
     jobs.push_back({key, result, generationCancel});
     cv.notify_one();
     return {};
+}
+std::shared_ptr<Image> Images::raster(const std::shared_ptr<Image> &image, float pixelWidth,
+                                      float pixelHeight, bool *pending) {
+    if (pending)
+        *pending = false;
+    if (!image || !image->svgSource || !image->ready || !std::isfinite(pixelWidth) ||
+        !std::isfinite(pixelHeight) || pixelWidth <= 0 || pixelHeight <= 0)
+        return image;
+    // Small buckets avoid rerasterizing for every fractional resize step. Always
+    // round up so the destination never needs to magnify a low-resolution badge.
+    float scale = std::ceil(std::max(pixelWidth / image->width, pixelHeight / image->height) * 8) / 8;
+    scale = std::min(scale, 4096.f / std::max(image->width, image->height));
+    // Keep the URL-addressed base and one raster together under the cache's
+    // 64 MiB limit. Otherwise they evict each other on every subsequent paint.
+    double remaining = 64. * 1024 * 1024 - image->pixels.size() - 2. * image->svgSource->size();
+    double area = (double)image->width * image->height * 4;
+    float budgetScale = (float)(std::floor(std::sqrt(std::max(0., remaining) / area) * 8) / 8);
+    scale = std::min(scale, budgetScale);
+    // Ceil-rounded raster dimensions must also fit (not just their float area).
+    while (scale > 1 && std::ceil(image->width * scale) * std::ceil(image->height * scale) * 4 > remaining)
+        scale -= .125f;
+    if (scale <= 1)
+        return image;
+    auto key = L"svg:" + std::to_wstring((uintptr_t)image->svgSource.get()) + L":" + std::to_wstring(scale);
+    std::lock_guard lock(mutex);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        if (pending)
+            *pending = !it->second->ready && !it->second->failed;
+        return it->second->ready ? it->second : image;
+    }
+    if (pending)
+        *pending = true;
+    if (jobs.size() >= 16)
+        return image;
+    if (cache.size() >= 128) {
+        for (auto i = cache.begin(); i != cache.end();) {
+            if (i->second.use_count() == 1 && (i->second->ready || i->second->failed))
+                i = cache.erase(i);
+            else
+                ++i;
+        }
+    }
+    auto result = std::make_shared<Image>();
+    cache.emplace(key, result);
+    jobs.push_back({key, result, generationCancel, image->svgSource, scale, image});
+    cv.notify_one();
+    return image;
 }
 } // namespace vm

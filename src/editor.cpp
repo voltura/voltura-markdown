@@ -1,4 +1,5 @@
 #include "editor.h"
+#include "dialog-theme.h"
 #include <algorithm>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -11,6 +12,7 @@
 #include <thread>
 #include <tom.h>
 #include <wincodec.h>
+#include <windowsx.h>
 #include <wrl/client.h>
 #ifdef VMD_TESTING
 #include <chrono>
@@ -24,12 +26,12 @@ constexpr unsigned Save = 1, Preview = 2, Finish = 3, Heading = 4, BoldAction = 
                    MoreInsert = 8, Warnings = 9, Overflow = 10, UnderlineAction = 11, Live = 12, Code = 13,
                    List = 14, ImageAction = 15;
 constexpr size_t toolbarOrder[] = {0, 1, 11, 2, 3, 4, 5, 10, 6, 12, 13, 14, 7, 8};
-const wchar_t *labels[] = {L"Save",      L"Preview", L"Finish", L"Heading",  L"Bold",
-                           L"Italic",    L"Link",    L"Insert", L"Warnings", L"More…",
-                           L"Underline", L"Live",    L"Code",   L"List",     L"Image"};
+const wchar_t *labels[] = {L"Save",      L"Preview", L"View mode", L"Heading",  L"Bold",
+                           L"Italic",    L"Link",    L"Insert",    L"Warnings", L"More…",
+                           L"Underline", L"Live",    L"Code",      L"List",     L"Image"};
 const wchar_t *tips[] = {L"Save (Ctrl+S)",
                          L"Toggle source / preview (Ctrl+Shift+V)",
-                         L"Finish editing",
+                         L"Switch to view mode",
                          L"Heading level (Ctrl+Shift+1–6; Ctrl+Shift+0 for normal text)",
                          L"Bold (Ctrl+B)",
                          L"Italic (Ctrl+I)",
@@ -99,7 +101,7 @@ INT_PTR CALLBACK fieldProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp) {
             chooser.nMaxFile = 32768;
             chooser.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.gif;*.svg\0All files\0*.*\0";
             chooser.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameW(&chooser))
+            if (themedOpenFile(&chooser))
                 SetDlgItemTextW(dialog, 202, path);
             return TRUE;
         }
@@ -111,14 +113,14 @@ INT_PTR CALLBACK fieldProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp) {
                            std::stoul(s) >= 1 && std::stoul(s) <= limit;
                 };
                 if (!valid(first, 100) || !valid(second, 256)) {
-                    MessageBoxW(dialog, L"Choose 1–100 body rows and 1–256 columns.", L"Insert table",
-                                MB_OK | MB_ICONINFORMATION);
+                    themedMessageBox(dialog, L"Choose 1–100 body rows and 1–256 columns.", L"Insert table",
+                                     MB_OK | MB_ICONINFORMATION);
                     return TRUE;
                 }
             } else if (second.empty() || second.find_first_of(L"\r\n") != second.npos ||
                        first.find_first_of(L"\r\n") != first.npos) {
-                MessageBoxW(dialog, L"Enter a destination and keep each field on one line.",
-                            fields->title.c_str(), MB_OK | MB_ICONINFORMATION);
+                themedMessageBox(dialog, L"Enter a destination and keep each field on one line.",
+                                 fields->title.c_str(), MB_OK | MB_ICONINFORMATION);
                 return TRUE;
             }
             fields->first = std::move(first);
@@ -181,6 +183,7 @@ bool prompt(HWND owner, Fields &fields) {
     // The last static supplies screen readers with the selected row-count convention.
     control(0, 82, 85, 204, 16, 103, 0x82, fields.numbers ? L"A header row is added automatically." : L"");
     fields.brush = CreateSolidBrush(fields.dark ? RGB(28, 34, 45) : RGB(250, 251, 253));
+    DialogThemeScope theme;
     auto result = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), (DLGTEMPLATE *)words.data(), owner,
                                           fieldProc, (LPARAM)&fields);
     DeleteObject(fields.brush);
@@ -219,6 +222,8 @@ struct Editor::Auxiliary {
 Editor::Editor(HWND parent, const Document &document, bool isDark, unsigned scale, bool newFile)
     : owner(parent), filePath(document.path) {
     try {
+        dark = isDark;
+        dpi = scale;
         if (document.source.find(L'\0') != document.source.npos)
             throw std::runtime_error("This document contains null characters and cannot be edited safely. It "
                                      "remains available in reading mode.");
@@ -232,12 +237,13 @@ Editor::Editor(HWND parent, const Document &document, bool isDark, unsigned scal
         cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         RegisterClassW(&cls);
         panel = CreateWindowExW(0, cls.lpszClassName, L"Markdown editor",
-                                WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, 1, 1, owner,
-                                nullptr, cls.hInstance, this);
-        input = CreateWindowExW(0, MSFTEDIT_CLASS, L"Markdown source",
-                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
-                                    ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL | ES_WANTRETURN,
-                                0, 0, 1, 1, panel, (HMENU)100, cls.hInstance, nullptr);
+                                WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, 1, 1, owner, nullptr,
+                                cls.hInstance, this);
+        input =
+            CreateWindowExW(0, MSFTEDIT_CLASS, L"Markdown source",
+                            WS_CHILD | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL |
+                                ES_AUTOHSCROLL | ES_NOHIDESEL | ES_WANTRETURN | ES_DISABLENOSCROLL,
+                            0, 0, 1, 1, panel, (HMENU)100, cls.hInstance, nullptr);
         if (!panel || !input)
             throw std::runtime_error("Windows could not create the text editor.");
         SendMessageW(input, EM_SETTEXTMODE, TM_RICHTEXT | TM_MULTILEVELUNDO, 0);
@@ -246,6 +252,10 @@ Editor::Editor(HWND parent, const Document &document, bool isDark, unsigned scal
         RevokeDragDrop(input);
         DragAcceptFiles(input, TRUE);
         SetWindowSubclass(input, inputProc, 1, (DWORD_PTR)this);
+        // Native scrollbar areas are outside the visible region. The parent
+        // owns the themed tracks; Rich Edit supplies only scroll state.
+        SetWindowRgn(input, CreateRectRgn(0, 0, 0, 0), FALSE);
+        SetWindowTheme(input, L"", L"");
         tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP, 0, 0, 0,
                                   0, panel, nullptr, cls.hInstance, nullptr);
         for (size_t i = 0; i < buttons.size(); ++i) {
@@ -261,9 +271,12 @@ Editor::Editor(HWND parent, const Document &document, bool isDark, unsigned scal
             SendMessageW(tooltip, TTM_ADDTOOLW, 0, (LPARAM)&info);
         }
         warningList = CreateWindowExW(0, L"LISTBOX", L"Markdown validation warnings",
-                                      WS_CHILD | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                                      WS_CHILD | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT |
+                                          LBS_DISABLENOSCROLL,
                                       0, 0, 1, 1, panel, (HMENU)101, cls.hInstance, nullptr);
         SetWindowSubclass(warningList, inputProc, 1, (DWORD_PTR)this);
+        SetWindowRgn(warningList, CreateRectRgn(0, 0, 0, 0), FALSE);
+        SetWindowTheme(warningList, L"", L"");
         cachedText = baselineText = editText(document.source);
         resetCapture();
         updating = true;
@@ -272,6 +285,10 @@ Editor::Editor(HWND parent, const Document &document, bool isDark, unsigned scal
         SendMessageW(input, EM_EMPTYUNDOBUFFER, 0, 0);
         updating = false;
         theme(isDark, scale);
+        RECT client{};
+        GetClientRect(owner, &client);
+        live = client.right >= MulDiv(1000, dpi, 96);
+        SetWindowTextW(buttons[11], live ? L"Live: on" : L"Live");
         SetTimer(panel, 1, 40, nullptr);
         SetTimer(panel, 4, 3000, nullptr);
         findMessage = RegisterWindowMessageW(FINDMSGSTRINGW);
@@ -384,6 +401,9 @@ void Editor::theme(bool isDark, unsigned scale) {
     if (background)
         DeleteObject(background);
     background = CreateSolidBrush(dark ? RGB(16, 19, 25) : RGB(250, 251, 253));
+    dialogDark = dark;
+    if (findDialog)
+        themeDialog(findDialog, dark);
     layout();
     InvalidateRect(panel, nullptr, TRUE);
     updating = previousUpdating;
@@ -410,7 +430,12 @@ RECT Editor::previewBounds(int top) const {
 void Editor::position(int top) {
     RECT r;
     GetClientRect(owner, &r);
-    MoveWindow(panel, 0, top, r.right, preview ? headerHeight() : std::max(1L, r.bottom - top), TRUE);
+    RECT current;
+    GetWindowRect(panel, &current);
+    MapWindowPoints(nullptr, owner, (POINT *)&current, 2);
+    RECT next{0, top, r.right, top + (preview ? headerHeight() : std::max(1L, r.bottom - top))};
+    if (!EqualRect(&current, &next))
+        MoveWindow(panel, next.left, next.top, next.right, next.bottom - next.top, TRUE);
     layout();
     if (!preview && restoreScroll) {
         SendMessageW(input, EM_SETSCROLLPOS, 0, (LPARAM)&sourceScroll);
@@ -423,26 +448,45 @@ void Editor::layout() {
     RECT r;
     GetClientRect(panel, &r);
     auto px = [&](int n) { return MulDiv(n, dpi, 96); };
+    // Preview refreshes also request layout. Keep unchanged controls visible and
+    // in place so a content update cannot erase and repaint the whole toolbar.
+    auto positionControl = [&](HWND control, int left, int top, int width, int height) {
+        RECT current;
+        GetWindowRect(control, &current);
+        MapWindowPoints(nullptr, panel, (POINT *)&current, 2);
+        RECT next{left, top, left + width, top + height};
+        if (!EqualRect(&current, &next)) {
+            bool scrollable = control == input || control == warningList;
+            if (scrollable) {
+                settingScrollRegion = true;
+                SetWindowRgn(control, CreateRectRgn(0, 0, 0, 0), FALSE);
+            }
+            MoveWindow(control, left, top, width, height, TRUE);
+            if (scrollable) {
+                settingScrollRegion = false;
+                updateScrollRegion(control);
+            }
+        }
+    };
     int x = px(8), y = px(6), h = px(30), reserve = px(72);
     hiddenFrom = std::size(toolbarOrder);
-    for (auto button : buttons)
-        ShowWindow(button, SW_HIDE);
     for (size_t order = 0; order < std::size(toolbarOrder); ++order) {
         size_t i = toolbarOrder[order];
-        int width = px(i == 8 ? 130 : i == 1 || i == 3 || i == 10 ? 78 : 60);
+        int width = px(i == 8 ? 130 : i == 2 ? 100 : i == 1 || i == 3 || i == 10 ? 78 : 60);
         if (x + width > r.right - reserve) {
             hiddenFrom = order;
             break;
         }
-        MoveWindow(buttons[i], x, y, width, h, TRUE);
+        positionControl(buttons[i], x, y, width, h);
         ShowWindow(buttons[i], SW_SHOWNA);
         x += width + px(4);
     }
+    for (size_t order = hiddenFrom; order < std::size(toolbarOrder); ++order)
+        ShowWindow(buttons[toolbarOrder[order]], SW_HIDE);
     ShowWindow(buttons[9], hiddenFrom < std::size(toolbarOrder) ? SW_SHOWNA : SW_HIDE);
-    MoveWindow(buttons[9], std::min<LONG>(x, std::max(0L, r.right - reserve)), y, reserve - px(4), h, TRUE);
+    positionControl(buttons[9], std::min<LONG>(x, std::max(0L, r.right - reserve)), y, reserve - px(4), h);
     ShowWindow(warningList, expanded ? SW_SHOWNA : SW_HIDE);
-    MoveWindow(warningList, px(8), px(42), std::max(1L, r.right - px(16)), px(102), TRUE);
-    ShowWindow(input, preview ? SW_HIDE : SW_SHOWNA);
+    positionControl(warningList, px(8), px(42), std::max(1L, r.right - px(16)), px(102));
     int sourceWidth = std::max(1L, r.right - px(24));
     int sourceHeight = std::max(1L, r.bottom - headerHeight() - px(8));
     if (live) {
@@ -451,7 +495,23 @@ void Editor::layout() {
         else
             sourceHeight = std::max(1L, (r.bottom - headerHeight()) / 2 - px(8));
     }
-    MoveWindow(input, px(12), headerHeight(), sourceWidth, sourceHeight, TRUE);
+    RECT sourceBounds{};
+    GetWindowRect(input, &sourceBounds);
+    MapWindowPoints(nullptr, panel, (POINT *)&sourceBounds, 2);
+    RECT next{px(12), headerHeight(), px(12) + sourceWidth, headerHeight() + sourceHeight};
+    if (!EqualRect(&sourceBounds, &next)) {
+        settingScrollRegion = true;
+        SetWindowRgn(input, CreateRectRgn(0, 0, 0, 0), FALSE);
+        MoveWindow(input, next.left, next.top, sourceWidth, sourceHeight, FALSE);
+        settingScrollRegion = false;
+        updateScrollRegion(input);
+        RedrawWindow(input, nullptr, nullptr, RDW_INVALIDATE | RDW_NOFRAME);
+    }
+    ShowWindow(input, preview ? SW_HIDE : SW_SHOWNA);
+    updateScrollRegion(input);
+    updateScrollRegion(warningList);
+    paintScrollbars(input);
+    paintScrollbars(warningList);
 }
 void Editor::title() {
     auto name = filePath.empty() ? L"Untitled" : filePath.filename().wstring();
@@ -560,7 +620,8 @@ void Editor::check(bool forPreview) {
     auto path = linkBase();
     std::thread([result, source = std::move(source), path]() mutable {
         try {
-            result->document = std::make_shared<Document>(parse(std::move(source), &result->cancel));
+            result->document =
+                std::make_shared<Document>(parse(std::move(source), &result->cancel, 0xffffffff, true));
             result->document->path = path;
             result->headings = sourceOutline(result->document->source);
             result->fences = sourceFences(result->document->source);
@@ -590,7 +651,7 @@ void Editor::poll() {
     auto result = std::move(job);
     if (result->kind == Job::Initialize) {
         if (!result->error.empty()) {
-            MessageBoxW(owner, result->error.c_str(), L"Edit Markdown", MB_OK | MB_ICONERROR);
+            themedMessageBox(owner, result->error.c_str(), L"Edit Markdown", MB_OK | MB_ICONERROR);
             PostMessageW(owner, EditorFinish, 0, 0);
             return;
         }
@@ -692,10 +753,11 @@ void Editor::poll() {
         break;
     }
     case SaveResult::Conflict: {
-        int choice = MessageBoxW(owner,
-                                 L"The destination changed outside Voltura Markdown.\n\nYes: overwrite the "
-                                 L"current file\nNo: Save As another file\nCancel: keep editing",
-                                 L"File changed", MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON3);
+        int choice =
+            themedMessageBox(owner,
+                             L"The destination changed outside Voltura Markdown.\n\nYes: overwrite the "
+                             L"current file\nNo: Save As another file\nCancel: keep editing",
+                             L"File changed", MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON3);
         if (choice == IDYES)
             startSave(true);
         else if (choice == IDNO) {
@@ -706,18 +768,19 @@ void Editor::poll() {
         break;
     }
     case SaveResult::NeedsUtf8:
-        if (MessageBoxW(owner, L"This encoding cannot represent your changes. Save as UTF-8 instead?",
-                        L"Save Markdown", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+        if (themedMessageBox(owner, L"This encoding cannot represent your changes. Save as UTF-8 instead?",
+                             L"Save Markdown", MB_YESNO | MB_ICONQUESTION) == IDYES) {
             convertUtf8 = true;
             startSave(overwrite);
         } else
             PostMessageW(owner, EditorSaved, 1, 0);
         break;
     default:
-        MessageBoxW(owner,
-                    result->saved.error.empty() ? L"The file could not be saved. Your draft is still open."
-                                                : result->saved.error.c_str(),
-                    L"Save Markdown", MB_OK | MB_ICONERROR);
+        themedMessageBox(owner,
+                         result->saved.error.empty()
+                             ? L"The file could not be saved. Your draft is still open."
+                             : result->saved.error.c_str(),
+                         L"Save Markdown", MB_OK | MB_ICONERROR);
         PostMessageW(owner, EditorSaved, 1, 0);
         break;
     }
@@ -746,7 +809,7 @@ void Editor::startSave(bool readExpected) {
         try {
             if (path != originalPath)
                 text = rebaseLocalLinks(text, originalPath, path);
-            result->document = std::make_shared<Document>(parse(text, &result->cancel));
+            result->document = std::make_shared<Document>(parse(text, &result->cancel, 0xffffffff, true));
             result->document->path = path;
             result->headings = sourceOutline(text);
             result->fences = sourceFences(text);
@@ -765,9 +828,9 @@ void Editor::startSave(bool readExpected) {
 bool Editor::save(bool saveAs) {
     if (auxiliary && (auxiliary->kind == Auxiliary::Image || auxiliary->kind == Auxiliary::ReplaceAll ||
                       auxiliary->kind == Auxiliary::Restore)) {
-        MessageBoxW(owner,
-                    L"An editing action is still running. Save again when its changes appear in the source.",
-                    L"Save Markdown", MB_OK);
+        themedMessageBox(
+            owner, L"An editing action is still running. Save again when its changes appear in the source.",
+            L"Save Markdown", MB_OK);
         return false;
     }
     if (!ready || saving)
@@ -787,7 +850,7 @@ bool Editor::save(bool saveAs) {
         dialog.lpstrFilter = L"Markdown files\0*.md\0All files\0*.*\0";
         dialog.lpstrDefExt = L"md";
         dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        if (!GetSaveFileNameW(&dialog))
+        if (!themedSaveFile(&dialog))
             return false;
         savePath = path.data();
         overwrite = savePath != filePath;
@@ -798,14 +861,14 @@ bool Editor::save(bool saveAs) {
 }
 Editor::Leave Editor::leave() {
     if (auxiliary && auxiliary->kind == Auxiliary::Export) {
-        MessageBoxW(owner,
-                    L"The export or print job is still running. Finish this action after it completes.",
-                    L"Edit Markdown", MB_OK);
+        themedMessageBox(owner,
+                         L"The export or print job is still running. Finish this action after it completes.",
+                         L"Edit Markdown", MB_OK);
         return Leave::Cancel;
     }
     if (auxiliary && (auxiliary->kind == Auxiliary::Image || auxiliary->kind == Auxiliary::ReplaceAll ||
                       auxiliary->kind == Auxiliary::Restore)) {
-        MessageBoxW(
+        themedMessageBox(
             owner,
             L"An editing action is still running. Finish this action when its changes appear in the source.",
             L"Edit Markdown", MB_OK);
@@ -816,8 +879,8 @@ Editor::Leave Editor::leave() {
     captureText();
     if (!modified())
         return Leave::Allow;
-    int answer = MessageBoxW(owner, L"Save changes before leaving this draft?", L"Unsaved Markdown",
-                             MB_YESNOCANCEL | MB_ICONQUESTION);
+    int answer = themedMessageBox(owner, L"Save changes before leaving this draft?", L"Unsaved Markdown",
+                                  MB_YESNOCANCEL | MB_ICONQUESTION);
     if (answer == IDNO)
         return Leave::Allow;
     if (answer == IDYES && save())
@@ -888,11 +951,125 @@ void Editor::insert(Insert kind, unsigned level) {
     } else
         replace(insertMarkdown(cachedText, range.cpMin, range.cpMax, kind, level));
 }
+unsigned Editor::trackMenu(HMENU menu, UINT flags, int x, int y) {
+    // Keep strings and item data alive throughout the native menu's modal loop.
+    // Prepare only on opening a menu, never on startup or while typing.
+    std::vector<std::wstring> rows(GetMenuItemCount(menu));
+    for (UINT i = 0; i < rows.size(); ++i) {
+        MENUITEMINFOW item{sizeof(item)};
+        item.fMask = MIIM_FTYPE | MIIM_STRING;
+        GetMenuItemInfoW(menu, i, TRUE, &item);
+        rows[i].resize((size_t)item.cch + 1);
+        item.dwTypeData = rows[i].data();
+        ++item.cch;
+        GetMenuItemInfoW(menu, i, TRUE, &item);
+        rows[i].resize(item.cch);
+        item.fMask = MIIM_FTYPE | MIIM_DATA;
+        item.fType |= MFT_OWNERDRAW;
+        item.dwItemData = (ULONG_PTR)&rows[i];
+        SetMenuItemInfoW(menu, i, TRUE, &item);
+    }
+    auto brush = CreateSolidBrush(dark ? RGB(28, 34, 45) : RGB(255, 255, 255));
+    MENUINFO info{sizeof(info)};
+    info.fMask = MIM_BACKGROUND | MIM_STYLE;
+    info.hbrBack = brush;
+    info.dwStyle = MNS_NOCHECK;
+    SetMenuInfo(menu, &info);
+    auto result = TrackPopupMenu(menu, flags | TPM_RETURNCMD, x, y, 0, panel, nullptr);
+    // The caller destroys the menu; clear borrowed data before the rows go away.
+    for (UINT i = 0; i < rows.size(); ++i) {
+        MENUITEMINFOW item{sizeof(item)};
+        item.fMask = MIIM_DATA;
+        SetMenuItemInfoW(menu, i, TRUE, &item);
+    }
+    info.fMask = MIM_BACKGROUND;
+    info.hbrBack = nullptr;
+    SetMenuInfo(menu, &info);
+    DeleteObject(brush);
+    return result;
+}
+void Editor::measureMenu(MEASUREITEMSTRUCT &item) const {
+    auto &text = *reinterpret_cast<const std::wstring *>(item.itemData);
+    auto dc = GetDC(panel);
+    auto previous = SelectObject(dc, font);
+    auto tab = text.find(L'\t');
+    SIZE label{}, shortcut{};
+    GetTextExtentPoint32W(dc, text.c_str(), (int)(tab == text.npos ? text.size() : tab), &label);
+    if (tab != text.npos)
+        GetTextExtentPoint32W(dc, text.c_str() + tab + 1, (int)(text.size() - tab - 1), &shortcut);
+    SelectObject(dc, previous);
+    ReleaseDC(panel, dc);
+    item.itemWidth = label.cx + MulDiv(56, dpi, 96);
+    if (tab != text.npos)
+        item.itemWidth += shortcut.cx + MulDiv(40, dpi, 96);
+    // Empty strings are separators in the editor menus.
+    item.itemHeight = MulDiv(text.empty() ? 10 : 34, dpi, 96);
+}
+void Editor::drawMenu(const DRAWITEMSTRUCT &item) const {
+    auto &text = *reinterpret_cast<const std::wstring *>(item.itemData);
+    auto px = [this](int value) { return MulDiv(value, dpi, 96); };
+    auto dc = item.hDC;
+    auto saved = SaveDC(dc);
+    auto r = item.rcItem;
+    SetDCBrushColor(dc, dark ? RGB(28, 34, 45) : RGB(255, 255, 255));
+    FillRect(dc, &r, (HBRUSH)GetStockObject(DC_BRUSH));
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SelectObject(dc, GetStockObject(DC_PEN));
+    bool disabled = (item.itemState & (ODS_DISABLED | ODS_GRAYED)) != 0;
+    if (text.empty()) {
+        SetDCPenColor(dc, dark ? RGB(48, 58, 73) : RGB(220, 226, 235));
+        MoveToEx(dc, r.left + px(12), (r.top + r.bottom) / 2, nullptr);
+        LineTo(dc, r.right - px(12), (r.top + r.bottom) / 2);
+    } else {
+        if ((item.itemState & ODS_SELECTED) && !disabled) {
+            SelectObject(dc, GetStockObject(NULL_PEN));
+            SetDCBrushColor(dc, dark ? RGB(46, 59, 78) : RGB(230, 237, 250));
+            RoundRect(dc, r.left + px(4), r.top + px(2), r.right - px(4), r.bottom - px(2), px(8), px(8));
+            SelectObject(dc, GetStockObject(DC_PEN));
+        }
+        SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, disabled ? (dark ? RGB(108, 119, 136) : RGB(148, 157, 170))
+                                  : (dark ? RGB(229, 233, 240) : RGB(32, 41, 56)));
+        auto label = r;
+        label.left += px(34);
+        label.right -= px(16);
+        auto tab = text.find(L'\t');
+        if (tab != text.npos) {
+            auto shortcut = text.c_str() + tab + 1;
+            int length = (int)(text.size() - tab - 1);
+            SIZE size{};
+            GetTextExtentPoint32W(dc, shortcut, length, &size);
+            RECT cap{label.right - size.cx - px(16), (r.top + r.bottom - size.cy) / 2 - px(2), label.right,
+                     (r.top + r.bottom + size.cy) / 2 + px(2)};
+            SetDCBrushColor(dc, dark ? RGB(36, 44, 57) : RGB(245, 247, 250));
+            SetDCPenColor(dc, dark ? RGB(71, 83, 101) : RGB(190, 199, 212));
+            RoundRect(dc, cap.left, cap.top, cap.right, cap.bottom, px(6), px(6));
+            DrawTextW(dc, shortcut, length, &cap, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            label.right = cap.left - px(24);
+        }
+        DrawTextW(dc, text.c_str(), (int)(tab == text.npos ? text.size() : tab), &label,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        if (item.itemState & ODS_CHECKED) {
+            auto pen = CreatePen(PS_SOLID, std::max(1, px(2)), dark ? RGB(144, 185, 255) : RGB(39, 95, 199));
+            auto previous = SelectObject(dc, pen);
+            LONG x = r.left + px(14), y = (r.top + r.bottom) / 2;
+            POINT points[] = {{x, y}, {x + px(3), y + px(3)}, {x + px(9), y - px(4)}};
+            Polyline(dc, points, 3);
+            SelectObject(dc, previous);
+            DeleteObject(pen);
+        }
+    }
+    RestoreDC(dc, saved);
+}
 void Editor::popup(bool overflow) {
     HMENU menu = CreatePopupMenu();
     if (overflow) {
         for (size_t order = hiddenFrom; order < std::size(toolbarOrder); ++order) {
             auto i = toolbarOrder[order];
+            // The three direct list actions below replace the toolbar's chooser.
+            if (i + 1 == List)
+                continue;
             AppendMenuW(menu, MF_STRING, i + 1, labels[i]);
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -918,15 +1095,22 @@ void Editor::popup(bool overflow) {
                 L"Undo\tCtrl+Z");
     AppendMenuW(menu, MF_STRING | (SendMessageW(input, EM_CANREDO, 0, 0) ? 0 : MF_GRAYED), 25,
                 L"Redo\tCtrl+Y");
-    const wchar_t *items[] = {L"Table…", L"Image…",     L"Bulleted list",   L"Numbered list", L"Task list",
-                              L"Quote",  L"Code block", L"Horizontal rule", L"Strikethrough", L"Inline code"};
+    const wchar_t *items[] = {L"Table…",
+                              L"Image…",
+                              L"Bulleted list\tCtrl+Shift+8",
+                              L"Numbered list\tCtrl+Shift+7",
+                              L"Task list\tCtrl+Shift+9",
+                              L"Quote",
+                              L"Code block",
+                              L"Horizontal rule",
+                              L"Strikethrough",
+                              L"Inline code"};
     for (unsigned i = 0; i < std::size(items); ++i)
         AppendMenuW(menu, MF_STRING, 30 + i, items[i]);
     auto button = buttons[overflow ? 9 : 7];
     RECT r;
     GetWindowRect(button, &r);
-    unsigned action =
-        TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN, r.left, r.bottom, 0, panel, nullptr);
+    unsigned action = trackMenu(menu, TPM_LEFTALIGN, r.left, r.bottom);
     DestroyMenu(menu);
     if (action)
         command(action);
@@ -960,13 +1144,13 @@ void Editor::command(unsigned id) {
             dialog.nMaxFile = 32768;
             dialog.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.gif;*.svg;*.bmp;*.webp\0All files\0*.*\0";
             dialog.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameW(&dialog))
+            if (themedOpenFile(&dialog))
                 addImage(path);
             break;
         }
         case 55:
             if (!pasteImage())
-                MessageBoxW(owner, L"Copy an image or an image file first.", L"Paste image", MB_OK);
+                themedMessageBox(owner, L"Copy an image or an image file first.", L"Paste image", MB_OK);
             break;
         case 56: {
             HMENU menu = CreatePopupMenu();
@@ -977,7 +1161,7 @@ void Editor::command(unsigned id) {
                 AppendMenuW(menu, MF_STRING, i + 1, items[i]);
             POINT point;
             GetCursorPos(&point);
-            auto action = TrackPopupMenu(menu, TPM_RETURNCMD, point.x, point.y, 0, panel, nullptr);
+            auto action = trackMenu(menu, 0, point.x, point.y);
             DestroyMenu(menu);
             if (action)
                 tableAction((TableAction)(action - 1));
@@ -1001,8 +1185,8 @@ void Editor::command(unsigned id) {
                 break;
             captureText();
             if (modified() &&
-                MessageBoxW(owner, L"Discard this draft and reload the file from disk?", L"Reload Markdown",
-                            MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES)
+                themedMessageBox(owner, L"Discard this draft and reload the file from disk?",
+                                 L"Reload Markdown", MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES)
                 break;
             auto result = std::make_shared<Auxiliary>();
             result->kind = Auxiliary::Reload;
@@ -1032,8 +1216,8 @@ void Editor::command(unsigned id) {
         case 62: {
             if (!rendered || checkedRevision != revision) {
                 check();
-                MessageBoxW(owner, L"The heading list is updating. Try again after validation finishes.",
-                            L"Link to heading", MB_OK);
+                themedMessageBox(owner, L"The heading list is updating. Try again after validation finishes.",
+                                 L"Link to heading", MB_OK);
                 break;
             }
             HMENU menu = CreatePopupMenu();
@@ -1045,7 +1229,7 @@ void Editor::command(unsigned id) {
                 }
             POINT point;
             GetCursorPos(&point);
-            auto selected = TrackPopupMenu(menu, TPM_RETURNCMD, point.x, point.y, 0, panel, nullptr);
+            auto selected = trackMenu(menu, 0, point.x, point.y);
             DestroyMenu(menu);
             if (selected) {
                 captureText();
@@ -1090,7 +1274,7 @@ void Editor::command(unsigned id) {
         AppendMenuW(menu, MF_STRING, 23, L"Task list\tCtrl+Shift+9");
         RECT r;
         GetWindowRect(buttons[13], &r);
-        auto action = TrackPopupMenu(menu, TPM_RETURNCMD, r.left, r.bottom, 0, panel, nullptr);
+        auto action = trackMenu(menu, 0, r.left, r.bottom);
         DestroyMenu(menu);
         if (action)
             command(action);
@@ -1116,7 +1300,7 @@ void Editor::command(unsigned id) {
             AppendMenuW(menu, MF_STRING, 40 + i, (L"Heading " + std::to_wstring(i)).c_str());
         RECT r;
         GetWindowRect(buttons[3], &r);
-        auto action = TrackPopupMenu(menu, TPM_RETURNCMD, r.left, r.bottom, 0, panel, nullptr);
+        auto action = trackMenu(menu, 0, r.left, r.bottom);
         DestroyMenu(menu);
         if (action)
             insert(Insert::Heading, action - 40);
@@ -1214,6 +1398,8 @@ void Editor::findReplace(bool replacing) {
     findState.lpstrReplaceWith = replaceBuffer.data();
     findState.wReplaceWithLen = (WORD)replaceBuffer.size();
     findDialog = replacing ? ReplaceTextW(&findState) : FindTextW(&findState);
+    if (findDialog)
+        themeDialog(findDialog, dark);
 }
 void Editor::findAction(DWORD flags) {
     if (flags & FR_DIALOGTERM) {
@@ -1269,30 +1455,28 @@ void Editor::findAction(DWORD flags) {
         SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&find.chrgText);
         SendMessageW(input, EM_SCROLLCARET, 0, 0);
     } else
-        MessageBoxW(owner, L"No matches.", L"Find in source", MB_OK | MB_ICONINFORMATION);
+        themedMessageBox(owner, L"No matches.", L"Find in source", MB_OK | MB_ICONINFORMATION);
     // Keep the modeless search dialog focused for repeated keyboard searches.
 }
 void Editor::outline() {
     if (outlineRevision != revision) {
         check();
-        MessageBoxW(owner, L"The outline is updating. Try again after validation finishes.",
-                    L"Document outline", MB_OK);
+        themedMessageBox(owner, L"The outline is updating. Try again after validation finishes.",
+                         L"Document outline", MB_OK);
         return;
     }
     if (headings.empty()) {
-        MessageBoxW(owner, L"This document has no headings.", L"Document outline", MB_OK);
+        themedMessageBox(owner, L"This document has no headings.", L"Document outline", MB_OK);
         return;
     }
     HMENU menu = CreatePopupMenu();
     for (size_t i = 0; i < std::min<size_t>(headings.size(), 500); ++i) {
         auto label = std::wstring((headings[i].level - 1) * 2, L' ') + headings[i].title;
-        for (size_t p = 0; (p = label.find(L'&', p)) != label.npos; p += 2)
-            label.insert(p, L"&");
         AppendMenuW(menu, MF_STRING, i + 1, label.c_str());
     }
     POINT point;
     GetCursorPos(&point);
-    auto choice = TrackPopupMenu(menu, TPM_RETURNCMD, point.x, point.y, 0, panel, nullptr);
+    auto choice = trackMenu(menu, 0, point.x, point.y);
     DestroyMenu(menu);
     if (choice)
         sourceAtHeading(choice - 1);
@@ -1396,25 +1580,45 @@ void Editor::tableAction(TableAction action) {
     if (edit)
         replace(*edit);
     else
-        MessageBoxW(
+        themedMessageBox(
             owner,
             L"Place the caret in a Markdown table. Header rows and the final column cannot be deleted.",
             L"Edit table", MB_OK);
 }
-double Editor::sourceFraction() const {
-    SCROLLINFO info{sizeof(info), SIF_ALL};
-    GetScrollInfo(input, SB_VERT, &info);
-    auto extent = std::max(1, info.nMax - (int)info.nPage + 1);
-    return std::clamp((double)info.nPos / extent, 0., 1.);
+double Editor::sourcePosition() const {
+    LONG line = (LONG)SendMessageW(input, EM_GETFIRSTVISIBLELINE, 0, 0);
+    LONG start = (LONG)SendMessageW(input, EM_LINEINDEX, line, 0);
+    LONG next = (LONG)SendMessageW(input, EM_LINEINDEX, line + 1, 0);
+    POINTL a{}, b{};
+    SendMessageW(input, EM_POSFROMCHAR, (WPARAM)&a, start);
+    if (next < 0)
+        return std::max(0L, start);
+    SendMessageW(input, EM_POSFROMCHAR, (WPARAM)&b, next);
+    RECT rect{};
+    SendMessageW(input, EM_GETRECT, 0, (LPARAM)&rect);
+    return start + std::clamp((double)(rect.top - a.y) / std::max(1L, b.y - a.y), 0., 1.) * (next - start);
 }
-void Editor::previewScroll(double fraction) {
-    if (!live || !synchronized || syncing)
+void Editor::previewScroll(double position) {
+    if (!canSynchronize() || syncing)
         return;
-    SCROLLINFO info{sizeof(info), SIF_ALL};
-    GetScrollInfo(input, SB_VERT, &info);
+    LONG at = (LONG)std::clamp(position, 0., (double)liveLength);
+    LONG line = (LONG)SendMessageW(input, EM_EXLINEFROMCHAR, 0, at);
+    LONG start = (LONG)SendMessageW(input, EM_LINEINDEX, line, 0);
+    LONG next = (LONG)SendMessageW(input, EM_LINEINDEX, line + 1, 0);
+    POINTL a{}, b{};
+    SendMessageW(input, EM_POSFROMCHAR, (WPARAM)&a, start);
+    if (next >= 0)
+        SendMessageW(input, EM_POSFROMCHAR, (WPARAM)&b, next);
+    RECT rect{};
+    SendMessageW(input, EM_GETRECT, 0, (LPARAM)&rect);
     POINT point{};
     SendMessageW(input, EM_GETSCROLLPOS, 0, (LPARAM)&point);
-    point.y = (LONG)(std::clamp(fraction, 0., 1.) * std::max(0, info.nMax - (int)info.nPage + 1));
+    LONG previousY = point.y;
+    point.y +=
+        a.y - rect.top + (next > start ? (LONG)((position - start) / (next - start) * (b.y - a.y)) : 0);
+    point.y = std::max(0L, point.y);
+    if (point.y == previousY)
+        return;
     syncing = true;
     SendMessageW(input, EM_SETSCROLLPOS, 0, (LPARAM)&point);
     syncing = false;
@@ -1556,8 +1760,8 @@ void Editor::recover() {
         return;
     captureText();
     if (modified()) {
-        MessageBoxW(owner, L"Save or finish this draft, then open a new file to recover another draft.",
-                    L"Recover draft", MB_OK);
+        themedMessageBox(owner, L"Save or finish this draft, then open a new file to recover another draft.",
+                         L"Recover draft", MB_OK);
         return;
     }
     auto result = std::make_shared<Auxiliary>();
@@ -1581,7 +1785,7 @@ void Editor::exportDocument(bool print) {
         PRINTDLGW dialog{sizeof(dialog)};
         dialog.hwndOwner = owner;
         dialog.Flags = PD_RETURNDC | PD_USEDEVMODECOPIESANDCOLLATE | PD_NOPAGENUMS | PD_NOSELECTION;
-        if (!PrintDlgW(&dialog))
+        if (!themedPrint(&dialog))
             return;
         bool pdf = false;
         if (dialog.hDevNames) {
@@ -1605,7 +1809,7 @@ void Editor::exportDocument(bool print) {
             chooser.lpstrFilter = L"PDF document\0*.pdf\0";
             chooser.lpstrDefExt = L"pdf";
             chooser.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (!GetSaveFileNameW(&chooser)) {
+            if (!themedSaveFile(&chooser)) {
                 DeleteDC(dialog.hDC);
                 return;
             }
@@ -1614,15 +1818,15 @@ void Editor::exportDocument(bool print) {
             CharLowerBuffW(extension.data(), (DWORD)extension.size());
             if (extension != L".pdf") {
                 DeleteDC(dialog.hDC);
-                MessageBoxW(owner, L"Choose a filename ending in .pdf.", L"Print / PDF", MB_OK);
+                themedMessageBox(owner, L"Choose a filename ending in .pdf.", L"Print / PDF", MB_OK);
                 return;
             }
             if (!filePath.empty()) {
                 std::error_code ec;
                 if (std::filesystem::equivalent(filePath, destination, ec)) {
                     DeleteDC(dialog.hDC);
-                    MessageBoxW(owner, L"Choose a separate PDF file to keep the source intact.",
-                                L"Print / PDF", MB_OK);
+                    themedMessageBox(owner, L"Choose a separate PDF file to keep the source intact.",
+                                     L"Print / PDF", MB_OK);
                     return;
                 }
             }
@@ -1665,7 +1869,7 @@ void Editor::exportDocument(bool print) {
         dialog.lpstrFilter = L"HTML document\0*.html\0";
         dialog.lpstrDefExt = L"html";
         dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        if (!GetSaveFileNameW(&dialog))
+        if (!themedSaveFile(&dialog))
             return;
         if (!filePath.empty()) {
             std::error_code ec;
@@ -1673,8 +1877,8 @@ void Editor::exportDocument(bool print) {
                 CompareStringOrdinal(std::filesystem::absolute(filePath).lexically_normal().c_str(), -1,
                                      std::filesystem::absolute(path).lexically_normal().c_str(), -1,
                                      TRUE) == CSTR_EQUAL) {
-                MessageBoxW(owner, L"Choose a separate HTML file to keep the Markdown source intact.",
-                            L"Export HTML", MB_OK | MB_ICONINFORMATION);
+                themedMessageBox(owner, L"Choose a separate HTML file to keep the Markdown source intact.",
+                                 L"Export HTML", MB_OK | MB_ICONINFORMATION);
                 return;
             }
         }
@@ -1714,13 +1918,13 @@ bool Editor::addImage(const std::filesystem::path &path) {
         auxiliary.reset();
     }
     if (auxiliary || !ready || saving) {
-        MessageBoxW(owner, L"Another editor action is still running. Add the image when it finishes.",
-                    L"Add image", MB_OK);
+        themedMessageBox(owner, L"Another editor action is still running. Add the image when it finishes.",
+                         L"Add image", MB_OK);
         return true;
     }
     if (filePath.empty()) {
-        MessageBoxW(owner, L"Save the Markdown file first so its images have a stable assets folder.",
-                    L"Add image", MB_OK);
+        themedMessageBox(owner, L"Save the Markdown file first so its images have a stable assets folder.",
+                         L"Add image", MB_OK);
         return true;
     }
     auto result = std::make_shared<Auxiliary>();
@@ -1753,8 +1957,8 @@ bool Editor::pasteImage() {
         !IsClipboardFormatAvailable(CF_HDROP))
         return false;
     if (auxiliary) {
-        MessageBoxW(owner, L"Another editor action is still running. Paste the image when it finishes.",
-                    L"Paste image", MB_OK);
+        themedMessageBox(owner, L"Another editor action is still running. Paste the image when it finishes.",
+                         L"Paste image", MB_OK);
         return true;
     }
     if (!OpenClipboard(panel))
@@ -1768,7 +1972,7 @@ bool Editor::pasteImage() {
     }
     if (filePath.empty()) {
         CloseClipboard();
-        MessageBoxW(owner, L"Save the Markdown file before pasting an image.", L"Paste image", MB_OK);
+        themedMessageBox(owner, L"Save the Markdown file before pasting an image.", L"Paste image", MB_OK);
         return true;
     }
     bool isPng = IsClipboardFormatAvailable(png) != FALSE;
@@ -1877,7 +2081,7 @@ void Editor::toolsPoll() {
         auto result = std::move(recoveryJob);
         if (!result->error.empty() && !recoveryErrorShown) {
             recoveryErrorShown = true;
-            MessageBoxW(
+            themedMessageBox(
                 owner,
                 (L"Your draft is still open, but crash recovery could not be updated.\n\n" + result->error)
                     .c_str(),
@@ -1904,7 +2108,7 @@ void Editor::toolsPoll() {
         return;
     }
     if (!result->error.empty()) {
-        MessageBoxW(owner, result->error.c_str(), L"Markdown editor", MB_OK | MB_ICONERROR);
+        themedMessageBox(owner, result->error.c_str(), L"Markdown editor", MB_OK | MB_ICONERROR);
         return;
     }
     if (result->kind == Auxiliary::Image) {
@@ -1919,25 +2123,28 @@ void Editor::toolsPoll() {
                                markdownFileDestination(relative.empty() ? result->path : relative)));
     } else if (result->kind == Auxiliary::Export) {
         if (result->print) {
-            MessageBoxW(owner, L"The document has been sent to the selected printer.", L"Print / PDF", MB_OK);
+            themedMessageBox(owner, L"The document has been sent to the selected printer.", L"Print / PDF",
+                             MB_OK);
         } else
-            MessageBoxW(owner, L"HTML document exported.", L"Export HTML", MB_OK);
+            themedMessageBox(owner, L"HTML document exported.", L"Export HTML", MB_OK);
     } else if (result->kind == Auxiliary::Probe) {
         if (result->changed && !externalChanged) {
             externalChanged = true;
             SetWindowTextW(buttons[8], L"File changed");
             if (GetForegroundWindow() == owner)
-                MessageBoxW(owner,
-                            L"The file changed outside Voltura Markdown. Use Insert → Reload from disk to "
-                            L"reload it. Saving will still check for conflicts.",
-                            L"File changed", MB_OK | MB_ICONINFORMATION);
+                themedMessageBox(
+                    owner,
+                    L"The file changed outside Voltura Markdown. Use Insert → Reload from disk to "
+                    L"reload it. Saving will still check for conflicts.",
+                    L"File changed", MB_OK | MB_ICONINFORMATION);
         }
     } else if (result->kind == Auxiliary::ReplaceAll) {
         if (result->revision != revision) {
-            MessageBoxW(owner,
-                        L"The source changed while replacements were being prepared. Run Replace All again "
-                        L"to apply it to the current draft.",
-                        L"Replace all", MB_OK);
+            themedMessageBox(
+                owner,
+                L"The source changed while replacements were being prepared. Run Replace All again "
+                L"to apply it to the current draft.",
+                L"Replace all", MB_OK);
             return;
         }
         captureText();
@@ -1979,7 +2186,7 @@ void Editor::toolsPoll() {
         if (result->revision != revision || modified() || saving)
             return;
         if (result->drafts.empty()) {
-            MessageBoxW(owner, L"No recoverable drafts were found.", L"Recover draft", MB_OK);
+            themedMessageBox(owner, L"No recoverable drafts were found.", L"Recover draft", MB_OK);
             return;
         }
         HMENU menu = CreatePopupMenu();
@@ -1990,7 +2197,7 @@ void Editor::toolsPoll() {
         }
         POINT point;
         GetCursorPos(&point);
-        auto choice = TrackPopupMenu(menu, TPM_RETURNCMD, point.x, point.y, 0, panel, nullptr);
+        auto choice = trackMenu(menu, 0, point.x, point.y);
         DestroyMenu(menu);
         if (!choice)
             return;
@@ -2035,10 +2242,10 @@ void Editor::toolsPoll() {
         check();
         title();
         checkpoint();
-        MessageBoxW(owner,
-                    L"Recovered into an unsaved document. Use Save As to choose its destination; the "
-                    L"original file has not been changed.",
-                    L"Recovered draft", MB_OK);
+        themedMessageBox(owner,
+                         L"Recovered into an unsaved document. Use Save As to choose its destination; the "
+                         L"original file has not been changed.",
+                         L"Recovered draft", MB_OK);
     }
 }
 bool Editor::key(WPARAM key) {
@@ -2136,9 +2343,139 @@ bool Editor::key(WPARAM key) {
     }
     return false;
 }
+RECT Editor::scrollTrack(HWND window, int axis) const {
+    RECT client{}, bounds{};
+    GetClientRect(window, &client);
+    GetWindowRect(window, &bounds);
+    POINT origin{};
+    ClientToScreen(window, &origin);
+    OffsetRect(&client, origin.x - bounds.left, origin.y - bounds.top);
+    if (axis == SB_VERT)
+        return {client.right, client.top, bounds.right - bounds.left, client.bottom};
+    return {client.left, client.bottom, client.right, bounds.bottom - bounds.top};
+}
+RECT Editor::scrollThumb(HWND window, int axis) const {
+    RECT track = scrollTrack(window, axis);
+    SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE | SIF_POS};
+    GetScrollInfo(window, axis, &info);
+    int length = std::max(0L, axis == SB_VERT ? track.bottom - track.top : track.right - track.left);
+    double range = std::max(1., (double)info.nMax - info.nMin + 1);
+    int size = std::clamp((int)(info.nPage / range * length), std::min(length, MulDiv(28, dpi, 96)), length);
+    int travel = length - size;
+    int pos = (int)((info.nPos - info.nMin) / std::max(1., range - info.nPage) * travel);
+    int width = std::max(1, MulDiv(6, dpi, 96));
+    if (axis == SB_VERT) {
+        int left = (track.left + track.right - width) / 2;
+        return {left, track.top + pos, left + width, track.top + pos + size};
+    }
+    int top = (track.top + track.bottom - width) / 2;
+    return {track.left + pos, top, track.left + pos + size, top + width};
+}
+void Editor::updateScrollRegion(HWND window) {
+    if (!window || settingScrollRegion)
+        return;
+    RECT client{}, bounds{};
+    GetClientRect(window, &client);
+    GetWindowRect(window, &bounds);
+    POINT origin{};
+    ClientToScreen(window, &origin);
+    OffsetRect(&client, origin.x - bounds.left, origin.y - bounds.top);
+    auto region = CreateRectRgnIndirect(&client), current = CreateRectRgn(0, 0, 0, 0);
+    bool same = GetWindowRgn(window, current) != ERROR && EqualRgn(region, current);
+    DeleteObject(current);
+    if (same) {
+        DeleteObject(region);
+        return;
+    }
+    settingScrollRegion = true;
+    if (!SetWindowRgn(window, region, TRUE))
+        DeleteObject(region);
+    settingScrollRegion = false;
+    // Repaint the parent-owned tracks exposed by clipping away the native bars.
+    MapWindowPoints(nullptr, panel, (POINT *)&bounds, 2);
+    InvalidateRect(panel, &bounds, FALSE);
+}
+void Editor::paintScrollbars(HWND window, HDC target) const {
+    if (!window || (!target && !(GetWindowLongW(window, GWL_STYLE) & WS_VISIBLE)))
+        return;
+    HDC dc = target ? target : GetDC(panel);
+    if (!dc)
+        return;
+    int saved = SaveDC(dc);
+    if (!target) {
+        RECT bounds{};
+        GetWindowRect(window, &bounds);
+        MapWindowPoints(nullptr, panel, (POINT *)&bounds, 2);
+        OffsetViewportOrgEx(dc, bounds.left, bounds.top, nullptr);
+    }
+    auto bg = CreateSolidBrush(dark ? RGB(16, 19, 25) : RGB(250, 251, 253));
+    LONG style = GetWindowLongW(window, GWL_STYLE);
+    for (int axis : {SB_VERT, SB_HORZ}) {
+        if (!(style & (axis == SB_VERT ? WS_VSCROLL : WS_HSCROLL)))
+            continue;
+        auto track = scrollTrack(window, axis);
+        FillRect(dc, &track, bg);
+        SCROLLBARINFO state{sizeof(state)};
+        if (GetScrollBarInfo(window, axis == SB_VERT ? OBJID_VSCROLL : OBJID_HSCROLL, &state) &&
+            (state.rgstate[0] & STATE_SYSTEM_UNAVAILABLE))
+            continue;
+        SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE};
+        if (!GetScrollInfo(window, axis, &info) || info.nMax - info.nMin + 1 <= (int)info.nPage)
+            continue;
+        auto thumb = scrollThumb(window, axis);
+        bool active = scrollWindow == window && scrollAxis == axis;
+        auto brush = CreateSolidBrush(active ? (dark ? RGB(144, 185, 255) : RGB(39, 95, 199))
+                                             : (dark ? RGB(146, 158, 175) : RGB(102, 117, 138)));
+        auto oldBrush = SelectObject(dc, brush);
+        auto oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        int diameter = std::max(2, MulDiv(6, dpi, 96));
+        RoundRect(dc, thumb.left, thumb.top, thumb.right, thumb.bottom, diameter, diameter);
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBrush);
+        DeleteObject(brush);
+    }
+    if ((style & WS_VSCROLL) && (style & WS_HSCROLL)) {
+        auto v = scrollTrack(window, SB_VERT), h = scrollTrack(window, SB_HORZ);
+        RECT corner{v.left, h.top, v.right, h.bottom};
+        FillRect(dc, &corner, bg);
+    }
+    DeleteObject(bg);
+    RestoreDC(dc, saved);
+    if (!target)
+        ReleaseDC(panel, dc);
+}
+void Editor::dragScrollbar(POINT point) {
+    if (!scrollWindow)
+        return;
+    RECT bounds{};
+    GetWindowRect(scrollWindow, &bounds);
+    auto track = scrollTrack(scrollWindow, scrollAxis), thumb = scrollThumb(scrollWindow, scrollAxis);
+    bool vertical = scrollAxis == SB_VERT;
+    int travel = vertical ? track.bottom - track.top - (thumb.bottom - thumb.top)
+                          : track.right - track.left - (thumb.right - thumb.left);
+    int offset = vertical ? point.y - bounds.top - track.top : point.x - bounds.left - track.left;
+    SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE};
+    GetScrollInfo(scrollWindow, scrollAxis, &info);
+    int maximum = std::max(info.nMin, info.nMax - (int)info.nPage + 1);
+    int pos = info.nMin + (int)((double)std::clamp(offset - scrollGrab, 0, std::max(0, travel)) /
+                                std::max(1, travel) * (maximum - info.nMin));
+    if (scrollWindow == input) {
+        POINT source{};
+        SendMessageW(input, EM_GETSCROLLPOS, 0, (LPARAM)&source);
+        (vertical ? source.y : source.x) = pos;
+        SendMessageW(input, EM_SETSCROLLPOS, 0, (LPARAM)&source);
+        if (live && synchronized && !syncing)
+            PostMessageW(owner, EditorScroll, 0, 0);
+    } else
+        SendMessageW(scrollWindow, LB_SETTOPINDEX, pos, 0);
+    paintScrollbars(scrollWindow);
+}
 LRESULT CALLBACK Editor::inputProc(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
     auto editor = (Editor *)data;
     try {
+        bool scrollable = window == editor->input || window == editor->warningList;
+        if (scrollable && msg == WM_NCPAINT)
+            return 0; // The native non-client area is outside the window region.
         if (window == editor->input && msg == WM_DROPFILES) {
             auto drop = (HDROP)wp;
             wchar_t path[32768]{};
@@ -2208,6 +2545,18 @@ LRESULT CALLBACK Editor::inputProc(HWND window, UINT msg, WPARAM wp, LPARAM lp, 
             editor->localMutation = true;
         }
         auto result = DefSubclassProc(window, msg, wp, lp);
+        if (scrollable && (msg == WM_SIZE || msg == WM_STYLECHANGED || msg == WM_WINDOWPOSCHANGED))
+            editor->updateScrollRegion(window);
+        if (scrollable &&
+            (msg == WM_PAINT || msg == WM_TIMER || msg == WM_NCACTIVATE || msg == WM_SETREDRAW ||
+             msg == EM_SETREADONLY || msg == WM_WINDOWPOSCHANGED || msg == WM_STYLECHANGED ||
+             msg == WM_SIZE || msg == WM_VSCROLL || msg == WM_HSCROLL || msg == WM_MOUSEWHEEL ||
+             msg == WM_MOUSEHWHEEL || msg == EM_SETSCROLLPOS || msg == WM_KEYDOWN || msg == WM_CHAR ||
+             msg == EM_SCROLLCARET || msg == EM_REPLACESEL || msg == EM_SETTEXTEX || msg == WM_SETTEXT ||
+             msg == WM_THEMECHANGED))
+            editor->paintScrollbars(window);
+        if (scrollable && msg == WM_PRINT && (lp & PRF_NONCLIENT))
+            editor->paintScrollbars(window, (HDC)wp);
         if (track) {
             editor->localMutation = priorMutation;
             if (editor->revision != oldRevision) {
@@ -2230,7 +2579,7 @@ LRESULT CALLBACK Editor::inputProc(HWND window, UINT msg, WPARAM wp, LPARAM lp, 
         editor->changeFrom = SIZE_MAX;
         editor->localMutation = false;
         editor->fullCapture = true;
-        MessageBoxW(editor->owner, fromUtf8(e.what()).c_str(), L"Markdown editor", MB_OK | MB_ICONERROR);
+        themedMessageBox(editor->owner, fromUtf8(e.what()).c_str(), L"Markdown editor", MB_OK | MB_ICONERROR);
         return 0;
     }
 }
@@ -2246,7 +2595,7 @@ LRESULT CALLBACK Editor::windowProc(HWND window, UINT msg, WPARAM wp, LPARAM lp)
     try {
         return editor->message(msg, wp, lp);
     } catch (const std::exception &e) {
-        MessageBoxW(editor->owner, fromUtf8(e.what()).c_str(), L"Edit Markdown", MB_OK | MB_ICONERROR);
+        themedMessageBox(editor->owner, fromUtf8(e.what()).c_str(), L"Edit Markdown", MB_OK | MB_ICONERROR);
         return 0;
     }
 }
@@ -2256,8 +2605,145 @@ LRESULT Editor::message(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     switch (msg) {
+    case WM_PAINT:
+    case WM_PRINTCLIENT: {
+        PAINTSTRUCT paint{};
+        auto dc = msg == WM_PAINT ? BeginPaint(panel, &paint) : (HDC)wp;
+        for (auto window : {input, warningList}) {
+            if (!window || !(GetWindowLongW(window, GWL_STYLE) & WS_VISIBLE))
+                continue;
+            RECT bounds{};
+            GetWindowRect(window, &bounds);
+            MapWindowPoints(nullptr, panel, (POINT *)&bounds, 2);
+            int saved = SaveDC(dc);
+            OffsetViewportOrgEx(dc, bounds.left, bounds.top, nullptr);
+            paintScrollbars(window, dc);
+            RestoreDC(dc, saved);
+        }
+        if (msg == WM_PAINT)
+            EndPaint(panel, &paint);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: {
+        POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ClientToScreen(panel, &point);
+        for (auto window : {input, warningList}) {
+            if (!(GetWindowLongW(window, GWL_STYLE) & WS_VISIBLE))
+                continue;
+            RECT bounds{};
+            GetWindowRect(window, &bounds);
+            POINT local{point.x - bounds.left, point.y - bounds.top};
+            for (int axis : {SB_VERT, SB_HORZ}) {
+                if (!(GetWindowLongW(window, GWL_STYLE) & (axis == SB_VERT ? WS_VSCROLL : WS_HSCROLL)))
+                    continue;
+                auto track = scrollTrack(window, axis);
+                SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE};
+                GetScrollInfo(window, axis, &info);
+                if (!PtInRect(&track, local) || info.nMax - info.nMin + 1 <= (int)info.nPage)
+                    continue;
+                SCROLLBARINFO state{sizeof(state)};
+                if (GetScrollBarInfo(window, axis == SB_VERT ? OBJID_VSCROLL : OBJID_HSCROLL, &state) &&
+                    (state.rgstate[0] & STATE_SYSTEM_UNAVAILABLE))
+                    continue;
+                scrollWindow = window;
+                scrollAxis = axis;
+                auto thumb = scrollThumb(window, axis);
+                bool vertical = axis == SB_VERT;
+                scrollGrab = PtInRect(&thumb, local)
+                                 ? (vertical ? local.y - thumb.top : local.x - thumb.left)
+                                 : (vertical ? thumb.bottom - thumb.top : thumb.right - thumb.left) / 2;
+                SetFocus(window);
+                SetCapture(panel);
+                dragScrollbar(point);
+                return 0;
+            }
+        }
+        break;
+    }
+    case WM_MOUSEMOVE:
+        if (scrollWindow) {
+            POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ClientToScreen(panel, &point);
+            dragScrollbar(point);
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
+    case WM_CANCELMODE:
+    case WM_CAPTURECHANGED:
+        if (scrollWindow) {
+            auto window = scrollWindow;
+            scrollWindow = nullptr;
+            if (msg != WM_CAPTURECHANGED && GetCapture() == panel)
+                ReleaseCapture();
+            paintScrollbars(window);
+            return 0;
+        }
+        break;
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL: {
+        if (forwardingScrollWheel)
+            return 0;
+        POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        for (auto window : {input, warningList}) {
+            RECT bounds{};
+            GetWindowRect(window, &bounds);
+            if ((GetWindowLongW(window, GWL_STYLE) & WS_VISIBLE) && PtInRect(&bounds, point)) {
+                // Controls may bubble an unhandled wheel message back to us.
+                forwardingScrollWheel = true;
+                auto result = SendMessageW(window, msg, wp, lp);
+                forwardingScrollWheel = false;
+                return result;
+            }
+        }
+        break;
+    }
+    case WM_MENUCHAR: {
+        // Owner-drawn menus need to supply native first-letter navigation.
+        HMENU menu = (HMENU)lp;
+        wchar_t character = LOWORD(wp);
+        int first = -1, next = -1, highlighted = -1, matches = 0;
+        for (int i = 0; i < GetMenuItemCount(menu); ++i) {
+            MENUITEMINFOW item{sizeof(item)};
+            item.fMask = MIIM_DATA | MIIM_STATE | MIIM_FTYPE;
+            GetMenuItemInfoW(menu, i, TRUE, &item);
+            if (item.fState & MFS_HILITE)
+                highlighted = i;
+        }
+        for (int i = 0; i < GetMenuItemCount(menu); ++i) {
+            MENUITEMINFOW item{sizeof(item)};
+            item.fMask = MIIM_DATA | MIIM_STATE | MIIM_FTYPE;
+            GetMenuItemInfoW(menu, i, TRUE, &item);
+            if (!item.dwItemData || (item.fType & MFT_SEPARATOR) || (item.fState & MFS_DISABLED))
+                continue;
+            auto &text = *reinterpret_cast<const std::wstring *>(item.dwItemData);
+            auto start = text.find_first_not_of(L' ');
+            if (start == text.npos ||
+                CompareStringOrdinal(text.c_str() + start, 1, &character, 1, TRUE) != CSTR_EQUAL)
+                continue;
+            if (first < 0)
+                first = i;
+            if (next < 0 && i > highlighted)
+                next = i;
+            ++matches;
+        }
+        if (first >= 0)
+            return MAKELRESULT(next >= 0 ? next : first, matches == 1 ? MNC_EXECUTE : MNC_SELECT);
+        return MAKELRESULT(0, MNC_IGNORE);
+    }
+    case WM_MEASUREITEM:
+        if (((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_MENU) {
+            measureMenu(*(MEASUREITEMSTRUCT *)lp);
+            return TRUE;
+        }
+        break;
     case WM_DRAWITEM: {
         auto &item = *(DRAWITEMSTRUCT *)lp;
+        if (item.CtlType == ODT_MENU) {
+            drawMenu(item);
+            return TRUE;
+        }
         RECT r = item.rcItem;
         auto dc = item.hDC;
         POINT point;
@@ -2380,6 +2866,127 @@ void Editor::verify() {
             throw std::runtime_error(message);
     };
     position(78);
+    RedrawWindow(panel, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    struct ToolbarActivity {
+        unsigned hides = 0, moves = 0, paints = 0;
+    } activity;
+    auto watchToolbar = [](HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR,
+                           DWORD_PTR data) -> LRESULT {
+        auto &counts = *(ToolbarActivity *)data;
+        if (message == WM_SHOWWINDOW && !wp)
+            ++counts.hides;
+        if (message == WM_WINDOWPOSCHANGED) {
+            auto &position = *(WINDOWPOS *)lp;
+            if (!(position.flags & SWP_NOMOVE) || !(position.flags & SWP_NOSIZE))
+                ++counts.moves;
+        }
+        if (message == WM_PAINT)
+            ++counts.paints;
+        return DefSubclassProc(window, message, wp, lp);
+    };
+    for (auto button : buttons)
+        require(SetWindowSubclass(button, watchToolbar, 42, (DWORD_PTR)&activity) != FALSE,
+                "watch toolbar refresh activity");
+    for (int refresh = 0; refresh < 3; ++refresh) {
+        position(78);
+        for (auto button : buttons)
+            UpdateWindow(button);
+    }
+    for (auto button : buttons)
+        RemoveWindowSubclass(button, watchToolbar, 42);
+    require(activity.hides == 0, "preview layout keeps toolbar buttons visible");
+    require(activity.moves == 0, "preview layout keeps toolbar geometry stable");
+    require(activity.paints == 0, "preview layout does not repaint unchanged toolbar buttons");
+    // Exercise parent-owned tracks without involving document parsing or undo.
+    std::wstring overflow;
+    for (int i = 0; i < 150; ++i)
+        overflow += std::wstring(200, L'x') + L"\r";
+    updating = true;
+    SetWindowTextW(input, overflow.c_str());
+    struct ScrollPaintProbe {
+        Editor *editor;
+        unsigned calls = 0;
+        bool clipped = true;
+    } scrollPaint{this};
+    auto watchScroll = [](HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR,
+                          DWORD_PTR data) -> LRESULT {
+        auto &probe = *(ScrollPaintProbe *)data;
+        if (message == EM_SETSCROLLPOS || message == EM_LINESCROLL || message == WM_MOUSEWHEEL) {
+            ++probe.calls;
+            auto region = CreateRectRgn(0, 0, 0, 0);
+            probe.clipped &= GetWindowRgn(window, region) != ERROR;
+            for (int axis : {SB_VERT, SB_HORZ}) {
+                auto track = probe.editor->scrollTrack(window, axis);
+                probe.clipped &=
+                    !PtInRegion(region, (track.left + track.right) / 2, (track.top + track.bottom) / 2);
+            }
+            DeleteObject(region);
+        }
+        return DefSubclassProc(window, message, wp, lp);
+    };
+    // Observe clipping at the native scroll handler, before any themed repaint.
+    RemoveWindowSubclass(input, inputProc, 1);
+    require(SetWindowSubclass(input, watchScroll, 43, (DWORD_PTR)&scrollPaint) != FALSE,
+            "watch native scrollbar painting");
+    require(SetWindowSubclass(input, inputProc, 1, (DWORD_PTR)this) != FALSE,
+            "restore editor above scrollbar clipping probe");
+    for (bool night : {true, false}) {
+        theme(night, 96);
+        for (int axis : {SB_VERT, SB_HORZ}) {
+            SCROLLINFO info{sizeof(info), SIF_ALL};
+            require(GetScrollInfo(input, axis, &info) && info.nMax > (int)info.nPage,
+                    "source has scrollable themed track");
+            auto thumb = scrollThumb(input, axis);
+            auto sampleThumb = [&](RECT rectangle) {
+                HDC screen = GetDC(nullptr), dc = CreateCompatibleDC(screen);
+                RECT bounds{};
+                GetWindowRect(input, &bounds);
+                auto bitmap =
+                    CreateCompatibleBitmap(screen, bounds.right - bounds.left, bounds.bottom - bounds.top);
+                auto old = SelectObject(dc, bitmap);
+                paintScrollbars(input, dc);
+                auto color = GetPixel(dc, (rectangle.left + rectangle.right) / 2,
+                                      (rectangle.top + rectangle.bottom) / 2);
+                SelectObject(dc, old);
+                DeleteObject(bitmap);
+                DeleteDC(dc);
+                ReleaseDC(nullptr, screen);
+                return color;
+            };
+            auto color = sampleThumb(thumb);
+            require(color == (night ? RGB(146, 158, 175) : RGB(102, 117, 138)),
+                    "source scrollbar matches reader muted palette");
+            RECT bounds{};
+            GetWindowRect(input, &bounds);
+            POINT start{bounds.left + (thumb.left + thumb.right) / 2,
+                        bounds.top + (thumb.top + thumb.bottom) / 2};
+            ScreenToClient(panel, &start);
+            SendMessageW(panel, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(start.x, start.y));
+            auto track = scrollTrack(input, axis);
+            POINT end{bounds.left + track.right, bounds.top + track.bottom};
+            ScreenToClient(panel, &end);
+            SendMessageW(panel, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(end.x, end.y));
+            GetScrollInfo(input, axis, &info);
+            require(info.nPos > info.nMin, "themed scrollbar drag scrolls source");
+            thumb = scrollThumb(input, axis);
+            color = sampleThumb(thumb);
+            require(color == (night ? RGB(144, 185, 255) : RGB(39, 95, 199)),
+                    "dragged scrollbar matches reader accent palette");
+            SendMessageW(panel, WM_LBUTTONUP, 0, MAKELPARAM(end.x, end.y));
+            require(!scrollWindow && GetCapture() != panel, "parent-owned scrollbar releases capture");
+            POINT origin{};
+            SendMessageW(input, EM_SETSCROLLPOS, 0, (LPARAM)&origin);
+            SendMessageW(input, EM_LINESCROLL, 0, 2);
+            SendMessageW(input, WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+            SendMessageW(input, EM_SETSCROLLPOS, 0, (LPARAM)&origin);
+        }
+    }
+    RemoveWindowSubclass(input, watchScroll, 43);
+    require(scrollPaint.calls >= 16 && scrollPaint.clipped,
+            "native scrollbar regions remain invisible inside every scroll handler");
+    SetWindowTextW(input, L"");
+    SendMessageW(input, EM_EMPTYUNDOBUFFER, 0, 0);
+    updating = false;
     replace(insertMarkdown(L"", 0, 0, Insert::Bold));
     captureText();
     require(cachedText == L"**bold text**", "native helper inserts plain Markdown");

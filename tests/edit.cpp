@@ -37,6 +37,26 @@ int main(int argc, char **argv) {
             std::wstring source =
                 L"# Voltura Markdown PDF\n\n**Bold**, *italic*, <u>underlined</u>, Unicode åäö.\n\n| Name | "
                 L"Value |\n| --- | ---: |\n| First | 42 |\n| Second | 84 |\n\n";
+            source += L"<table><caption>Native spanning table</caption><tbody>"
+                      L"<tr><th rowspan=2>Spanned group</th><td>A</td></tr><tr><td>B</td></tr>"
+                      L"<tr><td colspan=2>Spanned total</td></tr></tbody></table>\n\n";
+            auto imageTag = [&](const wchar_t *name, const char *color, unsigned width = 160) {
+                auto path = output.parent_path() / name;
+                std::ofstream svg(path);
+                svg << "<svg width='" << width << "' height='80'><rect width='" << width
+                    << "' height='80' fill='" << color << "'/></svg>";
+                return L"<img src=\"" + path.generic_wstring() + L"\" alt=\"Printed cell image\">";
+            };
+            source += L"<table><tr><td>Ordinary cell image: " + imageTag(L"ordinary.svg", "#008844", 1200) +
+                      L"</td><td>Neighbour text stays visible</td></tr></table>\n\n";
+            source += L"<table><tr><td colspan=2>Spanning cell image: " +
+                      imageTag(L"spanning.svg", "#cc6600") +
+                      L"</td></tr><tr><td>Left</td><td>Right</td></tr></table>\n\n";
+            source += L"<table><tr><td rowspan=2>Row-spanning image: " + imageTag(L"rowspan.svg", "#8844cc") +
+                      L"</td><td>Above</td></tr><tr><td>Below</td></tr></table>\n\n";
+            source += L"<table><tr><td>Nested cell image: <table><tr><td>" +
+                      imageTag(L"nested.svg", "#bb2244") +
+                      L"</td></tr></table></td><td>Nested neighbour</td></tr></table>\n\n";
             source += L"![Printed image](<" + markdownFileDestination(image) + L">)\n\n";
             for (unsigned i = 0; i < 180; ++i)
                 source += L"Paragraph " + std::to_wstring(i) +
@@ -118,11 +138,92 @@ int main(int argc, char **argv) {
                         html.find("javascript:") == html.npos && html.find("text-align:right") != html.npos,
                     "HTML formatting and escaped inactive content");
             auto linked = parse(L"[file](folder/a%20%C3%A5.md#title)\n\n![image](C:/images/a.png)\n");
+            auto mixedHeaders = exportHtml(parse(L"<table><tr><th>Label</th><td>Value</td></tr></table>\n"));
+            auto mixedRoundTrip = parse(fromUtf8(mixedHeaders));
+            require(mixedRoundTrip.blocks.front().cells[0].header &&
+                        !mixedRoundTrip.blocks.front().cells[1].header,
+                    "ordinary HTML export preserves individual header and data cells");
+            auto sized = exportHtml(parse(L"<img src='icon.png' width='96' height='96'>\n"));
+            require(sized.find("width=\"96\" height=\"96\"") != sized.npos,
+                    "HTML export preserves explicit image dimensions");
+            auto badges = exportHtml(parse(L"[![One](one.svg)](https://example.com/one)\n"
+                                           L"[![Two](two.svg)](https://example.com/two)\n"));
+            require(badges.find("<p><a href=\"https://example.com/one\"><img src=\"one.svg\"") !=
+                            badges.npos &&
+                        badges.find("</a> <a href=\"https://example.com/two\"><img src=\"two.svg\"") !=
+                            badges.npos &&
+                        badges.find("alt=\"Two\"></a> </p>") != badges.npos,
+                    "HTML export keeps linked badges inline in one paragraph");
+            auto picture =
+                exportHtml(parse(L"<picture><source media='(prefers-color-scheme: dark)' srcset='dark.png'>"
+                                 L"<img src='light.png' width='900'></picture><sub>Host caption</sub>\n"));
+            require(picture.find("<picture><source media=\"(prefers-color-scheme: dark)\"") != picture.npos &&
+                        picture.find("dark.png") != picture.npos &&
+                        picture.find("light.png") != picture.npos &&
+                        picture.find("<sub>Host caption</sub>") != picture.npos,
+                    "HTML export preserves picture variants and sub captions");
             linked.path = folder / L"source.md";
             html = exportHtml(linked);
             require(html.find("file:///") != html.npos && html.find("a%20") != html.npos &&
                         html.find("images/a.png") != html.npos,
                     "export resolves local links and Windows images");
+            auto richExport = exportHtml(parse(L"<table><tr><td align='center' width='34%'>"
+                                               L"<img src='cell.png' alt='Cell'><br><sup>2</sup>"
+                                               L"<td><table><tr><td>Inner</table></table>\n"));
+            require(richExport.find("<img src=\"cell.png\"") != richExport.npos &&
+                        richExport.find("width=\"34%\"") != richExport.npos &&
+                        richExport.find("<sup>2</sup>") != richExport.npos &&
+                        richExport.find("<table>", richExport.find("<table>") + 1) != richExport.npos,
+                    "HTML export retains nested tables, cell images, alignment, widths, and superscripts");
+            auto spanningSource =
+                parse(L"<table><caption>Span caption</caption><thead><tr><th colspan=3>Heading</thead>"
+                      L"<tbody><tr><th rowspan=0>Group<td>A<td>B<tr><td colspan=2>C</tbody>"
+                      L"<tbody><tr><td colspan=3>Next group</tbody></table>\n");
+            auto spanningExport = exportHtml(spanningSource);
+            require(spanningExport.find("colspan=\"3\"") != spanningExport.npos &&
+                        spanningExport.find("rowspan=\"0\"") != spanningExport.npos &&
+                        spanningExport.find("<caption>") != spanningExport.npos &&
+                        spanningExport.find("<thead>") != spanningExport.npos &&
+                        spanningExport.find("<tbody>", spanningExport.find("<tbody>") + 1) !=
+                            spanningExport.npos,
+                    "HTML export preserves spans, header cells, captions, and row-group boundaries");
+            auto roundTrip = parse(fromUtf8(spanningExport));
+            auto exportedTable = std::find_if(roundTrip.blocks.begin(), roundTrip.blocks.end(),
+                                              [](const Block &block) { return !!block.table; });
+            require(exportedTable != roundTrip.blocks.end() &&
+                        exportedTable->table->rows == spanningSource.blocks[0].table->rows &&
+                        exportedTable->table->columns == spanningSource.blocks[0].table->columns &&
+                        exportedTable->cells.size() == spanningSource.blocks[0].cells.size(),
+                    "exported HTML round-trips through the same native span model");
+            auto banded = parse(L"<table><tbody><tr><td colspan=2>First row</td></tr>"
+                                L"<tr><td rowspan=2>Spanning</td><td>A</td></tr><tr><td>B</td></tr>"
+                                L"</tbody><tbody><tr><td colspan=2>Last group</td></tr></tbody></table>\n");
+            require(banded.blocks.size() == 3, "independent table rows use bounded native rendering bands");
+            auto joinedExport = exportHtml(banded);
+            auto firstTable = joinedExport.find("<table>");
+            require(firstTable != joinedExport.npos &&
+                        joinedExport.find("<table>", firstTable + 1) == joinedExport.npos &&
+                        joinedExport.find("<tbody>", joinedExport.find("<tbody>") + 1) != joinedExport.npos,
+                    "export rejoins rendering bands into one table with its original row groups");
+            auto joinedRoundTrip = parse(fromUtf8(joinedExport));
+            size_t rows = 0, cells = 0;
+            for (auto &block : joinedRoundTrip.blocks)
+                if (block.table) {
+                    rows += block.table->rows;
+                    cells += block.cells.size();
+                }
+            require(rows == 4 && cells == 5,
+                    "banded table export round-trip preserves every logical row and cell");
+            auto columnsExport =
+                exportHtml(parse(L"<table><colgroup><col span=2 width='25%'><col width='50%'></colgroup>"
+                                 L"<tr><td colspan=2>A<td>B</table>\n"));
+            auto columnsRoundTrip = parse(fromUtf8(columnsExport));
+            auto columnModel = std::find_if(columnsRoundTrip.blocks.begin(), columnsRoundTrip.blocks.end(),
+                                            [](const Block &block) { return !!block.table; });
+            require(columnsExport.find("<colgroup>") != columnsExport.npos &&
+                        columnModel != columnsRoundTrip.blocks.end() && columnModel->table->columns == 3 &&
+                        columnModel->table->declaredColumns->size() == 3,
+                    "declared table column slots and widths survive HTML export round-trip");
             auto rebased = rebaseLocalLinks(
                 L"[doc](other.md#title) ![image](source.assets/a%20%C3%A5.png) `![literal](a.png)`\n",
                 folder / L"source.md", folder / L"sub" / L"copy.md");
@@ -347,7 +448,14 @@ int main(int argc, char **argv) {
                                    nullptr, GetModuleHandleW(nullptr), nullptr);
         {
             Editor editor(owner, parse(L""), false, 96);
+            require(!editor.isLive(), "compact edit sessions retain source-first mode");
             editor.verify();
+        }
+        SetWindowPos(owner, nullptr, 0, 0, 1400, 800, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        {
+            Editor editor(owner, parse(L"# Split preview\n"), false, 96);
+            require(editor.isLive(), "wide edit sessions default to live preview");
+            require(editor.previewBounds(78).left > 0, "default live preview occupies the right pane");
         }
         DestroyWindow(owner);
         std::filesystem::remove_all(folder);

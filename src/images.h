@@ -17,6 +17,8 @@ struct Image {
     std::vector<unsigned char> pixels;
     unsigned width = 0, height = 0;
     bool ready = false, failed = false;
+    // Retain vector source for asynchronous rerasterization without another read/download.
+    std::shared_ptr<const std::vector<unsigned char>> svgSource;
 };
 // Explicit export jobs reuse the reader's bounded decoders, off the UI thread.
 Image imageForExport(const std::wstring &url, const std::wstring &base, const std::atomic_bool &cancel);
@@ -29,6 +31,10 @@ class Images {
         std::wstring key;
         std::shared_ptr<Image> pending;
         std::shared_ptr<std::atomic_bool> cancel;
+        std::shared_ptr<const std::vector<unsigned char>> svgSource;
+        float rasterScale = 1;
+        // A raster job must not evict the base that future layouts look up by URL.
+        std::shared_ptr<Image> base;
     };
     std::shared_ptr<std::atomic_bool> generationCancel = std::make_shared<std::atomic_bool>(false);
     std::deque<Job> jobs;
@@ -47,5 +53,7 @@ class Images {
     ~Images();
     void cancelPending();
     std::shared_ptr<Image> get(const std::wstring &url, const std::wstring &base);
+    std::shared_ptr<Image> raster(const std::shared_ptr<Image> &image, float pixelWidth, float pixelHeight,
+                                  bool *pending = nullptr);
 };
 } // namespace vm

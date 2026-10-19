@@ -125,7 +125,7 @@ try:
             compiler,
             "/WX",
             "/V2",
-            "/DVERSION=1.2.0",
+            "/DVERSION=1.3.0",
             f"/DOUTPUT={setup}",
             f"/DPRODUCT_KEY={product_key}",
             f"/DSHORTCUT_NAME=Voltura Markdown Test {identity}",

@@ -27,6 +27,15 @@ class Editor {
     bool needsFirstSave = false;
     bool live = false;
     bool suppressCharacter = false;
+    HWND scrollWindow = nullptr;
+    bool settingScrollRegion = false;
+    bool forwardingScrollWheel = false;
+    int scrollAxis = SB_VERT, scrollGrab = 0;
+    RECT scrollTrack(HWND window, int axis) const;
+    RECT scrollThumb(HWND window, int axis) const;
+    void updateScrollRegion(HWND window);
+    void paintScrollbars(HWND window, HDC dc = nullptr) const;
+    void dragScrollbar(POINT point);
     POINT sourceScroll{};
     bool restoreScroll = false;
     unsigned dpi = 96;
@@ -83,6 +92,9 @@ class Editor {
     void replace(const TextEdit &edit);
     void insert(Insert kind, unsigned level = 0);
     void popup(bool overflow);
+    unsigned trackMenu(HMENU menu, UINT flags, int x, int y);
+    void measureMenu(MEASUREITEMSTRUCT &item) const;
+    void drawMenu(const DRAWITEMSTRUCT &item) const;
     void title();
 
   public:
@@ -104,7 +116,10 @@ class Editor {
     bool addImage(const std::filesystem::path &path);
     bool pasteImage();
     void previewScroll(double fraction);
-    double sourceFraction() const;
+    double sourcePosition() const;
+    bool canSynchronize() const {
+        return live && synchronized && checkedRevision == revision;
+    }
     void sourceAtHeading(size_t index);
     bool save(bool saveAs = false);
     Leave leave();

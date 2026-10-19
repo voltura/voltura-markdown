@@ -21,7 +21,7 @@ template <class F> void rejects(F action, const char *name) {
     }
     expect(rejected, name);
 }
-std::string metadata(std::string version = "1.2.1", bool setup = false) {
+std::string metadata(std::string version = "1.3.1", bool setup = false) {
     return "{\"tag_name\":\"v" + version +
            "\",\"draft\":false,\"prerelease\":false,\"assets\":[{\"name\":\"" +
            (setup ? "VolturaMarkdown-Setup-" + version + "-win-x64.exe" : "vmd.exe") +
@@ -73,7 +73,7 @@ void testUpdates() {
     for (auto value : {"", "1.2", "1.2.3.4", "1.2.3-preview.1", "01.2.3", "1.-2.3", "65536.0.0", "1.2.3junk"})
         rejects([&] { Version::parse(value); }, "invalid or preview version rejected");
     expect(releaseInfo(metadata(), false).asset == "vmd.exe", "portable asset selection");
-    expect(releaseInfo(metadata("1.2.1", true), true).asset == "VolturaMarkdown-Setup-1.2.1-win-x64.exe",
+    expect(releaseInfo(metadata("1.3.1", true), true).asset == "VolturaMarkdown-Setup-1.3.1-win-x64.exe",
            "installer asset selection");
     auto preview = metadata();
     preview.replace(preview.find("prerelease\":false"), 17, "prerelease\":true");
@@ -109,12 +109,12 @@ void testUpdates() {
     fs::create_directories(root);
     try {
         expect(!cached(root, target), "missing staged update ignored");
-        writeAtomic(root / L"pending", "1.2.1\n" + digest + "\n../outside\nportable\n");
+        writeAtomic(root / L"pending", "1.3.1\n" + digest + "\n../outside\nportable\n");
         expect(!cached(root, target), "cache traversal rejected");
-        writeAtomic(root / L"pending", "wanted 1.3.0\n");
-        expect(!cached(root, target) && wanted(root, target) == Version::parse("1.3.0"),
+        writeAtomic(root / L"pending", "wanted 1.4.0\n");
+        expect(!cached(root, target) && wanted(root, target) == Version::parse("1.4.0"),
                "newer incomplete update blocks old payload");
-        Candidate next{Version::parse("1.2.1"), digest, root, root / L"123", target, false};
+        Candidate next{Version::parse("1.3.1"), digest, root, root / L"123", target, false};
         fs::create_directory(next.directory);
         writeAtomic(next.payload(), "new");
         writeAtomic(target, "old");
@@ -171,7 +171,7 @@ void testUpdates() {
             auto work = updates.state;
             work->target = target;
             std::atomic_int calls = 0;
-            std::string selected = "1.2.1";
+            std::string selected = "1.3.1";
             bool offline = false, failDownload = false, incompleteAssets = false;
             work->text = [&](const std::wstring &url, const std::atomic_bool &) {
                 ++calls;
@@ -204,11 +204,11 @@ void testUpdates() {
             updates.check();
             wait();
             expect(!work->ready && !cached(root, target), "retracted release cannot remain eligible");
-            selected = "1.2.1";
+            selected = "1.3.1";
             updates.check();
             wait();
             older = work->ready;
-            selected = "1.3.0";
+            selected = "1.4.0";
             {
                 Handle lockedMarker(CreateFileW((root / L"pending").c_str(), GENERIC_READ, FILE_SHARE_READ,
                                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
@@ -221,7 +221,7 @@ void testUpdates() {
             // Subsequent scenarios model a fresh session after the filesystem failure.
             ResetEvent(*work->sessionSignal);
             offline = false;
-            selected = "1.3.0";
+            selected = "1.4.0";
             failDownload = true;
             updates.check();
             wait();
@@ -230,10 +230,10 @@ void testUpdates() {
             incompleteAssets = true;
             updates.check();
             wait();
-            expect(!work->ready && wanted(root, target) == Version::parse("1.3.0"),
+            expect(!work->ready && wanted(root, target) == Version::parse("1.4.0"),
                    "incomplete newer release still supersedes old download");
             incompleteAssets = false;
-            selected = "1.2.1";
+            selected = "1.3.1";
             failDownload = false;
             updates.check();
             wait();

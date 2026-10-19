@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <richedit.h>
 #include <richole.h>
@@ -661,7 +662,19 @@ std::string exportHtml(const Document &d) {
                 out += L"<del>";
             if (run.style & Mono)
                 out += L"<code>";
+            if (run.style & Subscript)
+                out += L"<sub>";
+            if (run.style & Superscript)
+                out += L"<sup>";
+            if (run.style & Small)
+                out += L"<small>";
             out += escape(std::wstring_view(d.text).substr(a, e - a));
+            if (run.style & Small)
+                out += L"</small>";
+            if (run.style & Superscript)
+                out += L"</sup>";
+            if (run.style & Subscript)
+                out += L"</sub>";
             if (run.style & Mono)
                 out += L"</code>";
             if (run.style & Strike)
@@ -680,49 +693,194 @@ std::string exportHtml(const Document &d) {
             out += escape(std::wstring_view(d.text).substr(at, end - at));
         return out;
     };
-    bool table = false;
-    for (auto &b : d.blocks) {
-        if (table && b.kind != Kind::Table) {
+    std::function<void(const std::deque<Block> &)> render = [&](const std::deque<Block> &blocks) {
+        bool table = false, gridOpen = false;
+        uint32_t groupIdentity = UINT32_MAX;
+        std::wstring openSection;
+        const void *tracks = nullptr;
+        auto closeGrid = [&] {
+            if (gridOpen) {
+                if (!openSection.empty())
+                    html += L"</" + openSection + L">";
+                html += L"</table>";
+            }
+            gridOpen = false;
+            openSection.clear();
+            groupIdentity = UINT32_MAX;
+        };
+        for (auto &b : blocks) {
+            if (gridOpen && !b.table)
+                closeGrid();
+            if (table && b.kind != Kind::Table) {
+                html += L"</table>";
+                table = false;
+            }
+            if (b.table) {
+                if (table) {
+                    html += L"</table>";
+                    table = false;
+                }
+                if (!gridOpen || !b.table->continued || tracks != b.table->tracks.get()) {
+                    closeGrid();
+                    html += L"<table>";
+                    gridOpen = true;
+                    tracks = b.table->tracks.get();
+                }
+                if (b.table->captions) {
+                    html += L"<caption>";
+                    render(*b.table->captions);
+                    html += L"</caption>";
+                }
+                if (!b.table->continued && b.table->declaredColumns) {
+                    html += L"<colgroup>";
+                    for (auto &column : *b.table->declaredColumns) {
+                        html += L"<col";
+                        if (column.pixels || column.percent)
+                            html +=
+                                L" width=\"" +
+                                std::to_wstring((unsigned)(column.percent ? column.percent : column.pixels)) +
+                                (column.percent ? L"%" : L"") + L"\"";
+                        html += L">";
+                    }
+                    html += L"</colgroup>";
+                }
+                std::vector<const Cell *> ordered;
+                for (auto &cell : b.cells)
+                    ordered.push_back(&cell);
+                std::stable_sort(ordered.begin(), ordered.end(), [](const Cell *a, const Cell *b) {
+                    return a->row != b->row ? a->row < b->row : a->column < b->column;
+                });
+                size_t at = 0;
+                for (auto &group : b.table->groups) {
+                    const wchar_t *section = group.section == TableSection::Head   ? L"thead"
+                                             : group.section == TableSection::Foot ? L"tfoot"
+                                                                                   : L"tbody";
+                    if (groupIdentity != group.identity) {
+                        if (!openSection.empty())
+                            html += L"</" + openSection + L">";
+                        openSection = section;
+                        groupIdentity = group.identity;
+                        html += L"<" + openSection + L">";
+                    }
+                    for (unsigned row = group.first; row < group.first + group.rows; ++row) {
+                        html += L"<tr>";
+                        while (at < ordered.size() && ordered[at]->row == row) {
+                            auto &cell = *ordered[at++];
+                            auto tag = cell.header ? L"th" : L"td";
+                            html += L"<" + std::wstring(tag) + L" colspan=\"" +
+                                    std::to_wstring(cell.colSpan) + L"\" rowspan=\"" +
+                                    std::to_wstring(cell.rowSpan) + L"\" style=\"text-align:" +
+                                    (cell.align == 3   ? L"right"
+                                     : cell.align == 2 ? L"center"
+                                                       : L"left") +
+                                    L";vertical-align:" +
+                                    (cell.verticalAlign == 1   ? L"top"
+                                     : cell.verticalAlign == 3 ? L"bottom"
+                                                               : L"middle") +
+                                    L"\"";
+                            if (cell.width)
+                                html += L" width=\"" + std::to_wstring(cell.width) +
+                                        (cell.percent ? L"%" : L"") + L"\"";
+                            html += L">";
+                            if (cell.content)
+                                render(*cell.content);
+                            else
+                                html += inlineText(b, cell.start, cell.length);
+                            html += L"</" + std::wstring(tag) + L">";
+                        }
+                        html += L"</tr>";
+                    }
+                }
+                if (!b.table->continues)
+                    closeGrid();
+            } else if (b.kind == Kind::Table) {
+                if (!table) {
+                    html += L"<table>";
+                    table = true;
+                }
+                html += L"<tr>";
+                for (auto &cell : b.cells) {
+                    auto tag = (cell.content ? cell.header : b.header) ? L"th" : L"td";
+                    html += L"<" + std::wstring(tag) + L" style=\"text-align:" +
+                            (cell.align == 3   ? L"right"
+                             : cell.align == 2 ? L"center"
+                                               : L"left") +
+                            L"\"";
+                    if (cell.width)
+                        html +=
+                            L" width=\"" + std::to_wstring(cell.width) + (cell.percent ? L"%" : L"") + L"\"";
+                    html += L">";
+                    if (cell.content)
+                        render(*cell.content);
+                    else
+                        html += inlineText(b, cell.start, cell.length);
+                    html += L"</" + std::wstring(tag) + L">";
+                }
+                html += L"</tr>";
+            } else if (b.kind == Kind::Rule)
+                html += L"<hr>";
+            else if ((b.kind == Kind::Image && b.image) || (b.image && b.image->inlineImages)) {
+                html += b.align == 2   ? L"<p style=\"text-align:center\">"
+                        : b.align == 3 ? L"<p style=\"text-align:right\">"
+                                       : L"<p>";
+                auto emitImage = [&](const Block &imageBlock) {
+                    auto &image = *imageBlock.image;
+                    auto url = exportUrl(image.url, d.path);
+                    auto linked = std::find_if(imageBlock.runs.begin(), imageBlock.runs.end(),
+                                               [](const Run &run) { return !run.link.empty(); });
+                    if (linked != imageBlock.runs.end())
+                        html += L"<a href=\"" + exportUrl(linked->link, d.path) + L"\">";
+                    bool picture = !image.lightUrl.empty() || !image.darkUrl.empty();
+                    if (picture) {
+                        html += L"<picture>";
+                        if (!image.darkUrl.empty())
+                            html += L"<source media=\"(prefers-color-scheme: dark)\" srcset=\"" +
+                                    exportUrl(image.darkUrl, d.path) + L"\">";
+                        if (!image.lightUrl.empty())
+                            html += L"<source media=\"(prefers-color-scheme: light)\" srcset=\"" +
+                                    exportUrl(image.lightUrl, d.path) + L"\">";
+                    }
+                    html += L"<img src=\"" + url + L"\" alt=\"" +
+                            escape(std::wstring_view(d.text).substr(imageBlock.start, imageBlock.length)) +
+                            L"\"";
+                    if (image.width)
+                        html += L" width=\"" + std::to_wstring(image.width) + L"\"";
+                    if (image.height)
+                        html += L" height=\"" + std::to_wstring(image.height) + L"\"";
+                    html += picture ? L"></picture>" : L">";
+                    if (linked != imageBlock.runs.end())
+                        html += L"</a>";
+                };
+                if (b.image && b.image->inlineImages)
+                    for (auto &image : *b.image->inlineImages) {
+                        emitImage(image);
+                        html += L" ";
+                    }
+                else
+                    emitImage(b);
+                html += L"</p>";
+            } else {
+                auto tag = b.kind == Kind::Heading
+                               ? L"h" + std::to_wstring(std::clamp((unsigned)b.level, 1u, 6u))
+                           : b.kind == Kind::Code ? L"pre"
+                                                  : L"p";
+                if (b.quote)
+                    html += L"<blockquote>";
+                html += L"<" + tag;
+                if (b.anchor)
+                    html += L" id=\"" + escape(*b.anchor) + L"\"";
+                if (b.align == 2 || b.align == 3)
+                    html += b.align == 2 ? L" style=\"text-align:center\"" : L" style=\"text-align:right\"";
+                html += L">" + inlineText(b, b.start, b.length) + L"</" + tag + L">";
+                if (b.quote)
+                    html += L"</blockquote>";
+            }
+        }
+        closeGrid();
+        if (table)
             html += L"</table>";
-            table = false;
-        }
-        if (b.kind == Kind::Table) {
-            if (!table) {
-                html += L"<table>";
-                table = true;
-            }
-            html += L"<tr>";
-            for (auto &cell : b.cells) {
-                auto tag = b.header ? L"th" : L"td";
-                html += L"<" + std::wstring(tag) + L" style=\"text-align:" +
-                        (cell.align == 3   ? L"right"
-                         : cell.align == 2 ? L"center"
-                                           : L"left") +
-                        L"\">" + inlineText(b, cell.start, cell.length) + L"</" + tag + L">";
-            }
-            html += L"</tr>";
-        } else if (b.kind == Kind::Rule)
-            html += L"<hr>";
-        else if (b.kind == Kind::Image && b.image) {
-            auto url = exportUrl(*b.image, d.path);
-            html += L"<p><img src=\"" + url + L"\" alt=\"" +
-                    escape(std::wstring_view(d.text).substr(b.start, b.length)) + L"\"></p>";
-        } else {
-            auto tag = b.kind == Kind::Heading ? L"h" + std::to_wstring(std::clamp(b.level, 1u, 6u))
-                       : b.kind == Kind::Code  ? L"pre"
-                                               : L"p";
-            if (b.quote)
-                html += L"<blockquote>";
-            html += L"<" + tag;
-            if (b.anchor)
-                html += L" id=\"" + escape(*b.anchor) + L"\"";
-            html += L">" + inlineText(b, b.start, b.length) + L"</" + tag + L">";
-            if (b.quote)
-                html += L"</blockquote>";
-        }
-    }
-    if (table)
-        html += L"</table>";
+    };
+    render(d.blocks);
     html += L"</body></html>";
     return toUtf8(html);
 }
@@ -839,11 +997,12 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
             for (auto &run : block.runs) {
                 range = {(LONG)run.start, (LONG)(run.start + run.length)};
                 SendMessageW(text, EM_EXSETSEL, 0, (LPARAM)&range);
-                format.dwMask = CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT;
+                format.dwMask = CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_SUBSCRIPT;
                 format.dwEffects = ((run.style & Bold) ? CFE_BOLD : 0) |
                                    ((run.style & Italic) ? CFE_ITALIC : 0) |
                                    ((run.style & Underline) ? CFE_UNDERLINE : 0) |
-                                   ((run.style & Strike) ? CFE_STRIKEOUT : 0);
+                                   ((run.style & Strike) ? CFE_STRIKEOUT : 0) |
+                                   ((run.style & Subscript) ? CFE_SUBSCRIPT : 0);
                 if (block.kind == Kind::Heading)
                     format.dwEffects |= CFE_BOLD;
                 SendMessageW(text, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&format);
@@ -884,13 +1043,168 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
             if (stream.dwError)
                 throw std::runtime_error("Could not prepare formatted print content.");
         };
+        auto imageRtf = [&](const Block &imageBlock, int maximumWidth) {
+            std::string imagesRtf;
+            try {
+                std::atomic_bool running = false;
+                auto image = imageForExport(imageBlock.image->source(false), document.path.wstring(),
+                                            cancel ? *cancel : running);
+                active();
+                size_t stride = ((size_t)image.width * 3 + 3) & ~size_t(3);
+                std::vector<unsigned char> dib(sizeof(BITMAPINFOHEADER) + stride * image.height, 0);
+                BITMAPINFOHEADER info{sizeof(info),
+                                      (LONG)image.width,
+                                      (LONG)image.height,
+                                      1,
+                                      24,
+                                      BI_RGB,
+                                      (DWORD)(stride * image.height),
+                                      0,
+                                      0,
+                                      0,
+                                      0};
+                memcpy(dib.data(), &info, sizeof(info));
+                for (size_t y = 0; y < image.height; ++y)
+                    for (size_t x = 0; x < image.width; ++x) {
+                        auto src = image.pixels.data() + (y * image.width + x) * 4;
+                        auto dst = dib.data() + sizeof(info) + (image.height - 1 - y) * stride + x * 3;
+                        for (unsigned c = 0; c < 3; ++c)
+                            dst[c] = (BYTE)std::min(255u, (unsigned)src[c] + 255 - src[3]);
+                    }
+                int width =
+                        MulDiv(GetDeviceCaps(printer, HORZRES), 1440, GetDeviceCaps(printer, LOGPIXELSX)) -
+                        1440,
+                    height =
+                        MulDiv(GetDeviceCaps(printer, VERTRES), 1440, GetDeviceCaps(printer, LOGPIXELSY)) -
+                        1840;
+                double scale =
+                    std::min({15., (double)std::max(1, std::min(width, maximumWidth)) / image.width,
+                              (double)height / image.height});
+                std::string rtf = "{\\pict\\dibitmap0\\wbmbitspixel24\\wbmplanes1\\wbmwidthbytes" +
+                                  std::to_string(stride) + "\\picw" + std::to_string(image.width) + "\\pich" +
+                                  std::to_string(image.height) + "\\picwgoal" +
+                                  std::to_string((int)(image.width * scale)) + "\\pichgoal" +
+                                  std::to_string((int)(image.height * scale)) + " ";
+                constexpr char hex[] = "0123456789abcdef";
+                rtf.reserve(rtf.size() + dib.size() * 2 + 2);
+                for (auto b : dib) {
+                    rtf += hex[b >> 4];
+                    rtf += hex[b & 15];
+                }
+                rtf += "}";
+                imagesRtf += rtf;
+            } catch (const std::exception &) {
+                active();
+                // Preserve the existing alt text when an image is unavailable, as in reading mode.
+                imagesRtf +=
+                    rtfText(std::wstring_view(document.text).substr(imageBlock.start, imageBlock.length));
+            }
+            return imagesRtf;
+        };
+        auto cellRtf = [&](uint32_t start, uint32_t length, const std::shared_ptr<std::deque<Block>> &content,
+                           int maximumWidth) {
+            std::vector<const Block *> pictures;
+            std::function<void(const std::deque<Block> &)> collect = [&](const std::deque<Block> &blocks) {
+                for (auto &b : blocks) {
+                    active();
+                    if (b.image && b.image->inlineImages)
+                        collect(*b.image->inlineImages);
+                    else if (b.image)
+                        pictures.push_back(&b);
+                    if (b.table && b.table->captions)
+                        collect(*b.table->captions);
+                    for (auto &cell : b.cells)
+                        if (cell.content)
+                            collect(*cell.content);
+                }
+            };
+            if (content)
+                collect(*content);
+            std::stable_sort(pictures.begin(), pictures.end(),
+                             [](const Block *a, const Block *b) { return a->start < b->start; });
+            std::string rtf;
+            uint32_t at = start, end = start + length;
+            for (auto picture : pictures) {
+                rtf += rtfText(std::wstring_view(document.text).substr(at, picture->start - at));
+                rtf += imageRtf(*picture, maximumWidth);
+                at = picture->start + picture->length;
+            }
+            rtf += rtfText(std::wstring_view(document.text).substr(at, end - at));
+            return rtf;
+        };
         // Replace from the end so original rendered offsets remain valid for earlier blocks.
         for (size_t i = document.blocks.size(); i-- > 0;) {
             active();
             auto &block = document.blocks[i];
-            if (block.kind == Kind::Table) {
+            if (block.table) {
+                std::string rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI;}}\\fs22 ";
+                int pageWidth =
+                    MulDiv(GetDeviceCaps(printer, HORZRES), 1440, GetDeviceCaps(printer, LOGPIXELSX)) - 1440;
+                std::vector<const Cell *> ordered, activeCells;
+                for (auto &cell : block.cells)
+                    ordered.push_back(&cell);
+                std::stable_sort(ordered.begin(), ordered.end(),
+                                 [](const Cell *a, const Cell *b) { return a->row < b->row; });
+                if (block.table->captions)
+                    for (auto &caption : *block.table->captions)
+                        rtf +=
+                            rtfText(std::wstring_view(document.text).substr(caption.start, caption.length)) +
+                            "\\par ";
+                size_t next = 0;
+                for (unsigned row = 0; row < block.table->rows; ++row) {
+                    active();
+                    std::erase_if(activeCells,
+                                  [&](const Cell *cell) { return cell->row + cell->rows <= row; });
+                    while (next < ordered.size() && ordered[next]->row == row)
+                        activeCells.push_back(ordered[next++]);
+                    std::stable_sort(activeCells.begin(), activeCells.end(),
+                                     [](const Cell *a, const Cell *b) { return a->column < b->column; });
+                    rtf += "\\trowd\\trgaph80 ";
+                    std::vector<const Cell *> slots;
+                    unsigned column = 0;
+                    for (auto cell : activeCells) {
+                        if (cell->column < column)
+                            continue; // Recover overlapping, invalid table models safely.
+                        if (cell->column > column) {
+                            rtf += "\\cellx" +
+                                   std::to_string((uint64_t)cell->column * pageWidth / block.table->columns);
+                            slots.push_back(nullptr);
+                        }
+                        if (cell->rows > 1)
+                            rtf += cell->row == row ? "\\clvmgf " : "\\clvmrg ";
+                        rtf += "\\clbrdrt\\brdrs\\brdrw10\\clbrdrl\\brdrs\\brdrw10\\clbrdrb\\brdrs\\brdrw10\\"
+                               "clbrdrr\\brdrs\\brdrw10\\cellx" +
+                               std::to_string((uint64_t)(cell->column + cell->colSpan) * pageWidth /
+                                              block.table->columns);
+                        slots.push_back(cell);
+                        column = cell->column + cell->colSpan;
+                    }
+                    if (column < block.table->columns) {
+                        rtf += "\\cellx" + std::to_string(pageWidth);
+                        slots.push_back(nullptr);
+                    }
+                    for (auto cell : slots) {
+                        rtf += "\\pard\\intbl ";
+                        if (cell && cell->row == row) {
+                            rtf += cell->align == 3 ? "\\qr " : cell->align == 2 ? "\\qc " : "\\ql ";
+                            if (cell->header)
+                                rtf += "\\b ";
+                            rtf += cellRtf(
+                                cell->start, cell->length, cell->content,
+                                std::max(1, MulDiv(pageWidth, cell->colSpan, block.table->columns) - 160));
+                            if (cell->header)
+                                rtf += "\\b0 ";
+                        }
+                        rtf += "\\cell ";
+                    }
+                    rtf += "\\row ";
+                }
+                rtf += block.table->continues ? "}" : "\\pard\\par}";
+                streamRtf((LONG)block.start, (LONG)(block.start + block.length), rtf);
+            } else if (block.kind == Kind::Table) {
                 size_t first = i;
-                while (first && document.blocks[first - 1].kind == Kind::Table)
+                while (first && document.blocks[first - 1].kind == Kind::Table &&
+                       !document.blocks[first - 1].table)
                     --first;
                 std::string rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI;}}\\fs22 ";
                 int pageWidth =
@@ -907,7 +1221,8 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
                         rtf += cell.align == 3 ? "\\qr " : cell.align == 2 ? "\\qc " : "\\ql ";
                         if (b.header)
                             rtf += "\\b ";
-                        rtf += rtfText(std::wstring_view(document.text).substr(cell.start, cell.length));
+                        rtf += cellRtf(cell.start, cell.length, cell.content,
+                                       std::max(1, pageWidth / (int)b.cells.size() - 160));
                         if (b.header)
                             rtf += "\\b0 ";
                         rtf += "\\cell ";
@@ -917,57 +1232,18 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
                 rtf += "\\pard\\par}";
                 streamRtf((LONG)document.blocks[first].start, (LONG)(block.start + block.length), rtf);
                 i = first;
-            } else if (block.kind == Kind::Image && block.image) {
-                try {
-                    std::atomic_bool running = false;
-                    auto image =
-                        imageForExport(*block.image, document.path.wstring(), cancel ? *cancel : running);
-                    active();
-                    size_t stride = ((size_t)image.width * 3 + 3) & ~size_t(3);
-                    std::vector<unsigned char> dib(sizeof(BITMAPINFOHEADER) + stride * image.height, 0);
-                    BITMAPINFOHEADER info{sizeof(info),
-                                          (LONG)image.width,
-                                          (LONG)image.height,
-                                          1,
-                                          24,
-                                          BI_RGB,
-                                          (DWORD)(stride * image.height),
-                                          0,
-                                          0,
-                                          0,
-                                          0};
-                    memcpy(dib.data(), &info, sizeof(info));
-                    for (size_t y = 0; y < image.height; ++y)
-                        for (size_t x = 0; x < image.width; ++x) {
-                            auto src = image.pixels.data() + (y * image.width + x) * 4;
-                            auto dst = dib.data() + sizeof(info) + (image.height - 1 - y) * stride + x * 3;
-                            for (unsigned c = 0; c < 3; ++c)
-                                dst[c] = (BYTE)std::min(255u, (unsigned)src[c] + 255 - src[3]);
-                        }
-                    int width = MulDiv(GetDeviceCaps(printer, HORZRES), 1440,
-                                       GetDeviceCaps(printer, LOGPIXELSX)) -
-                                1440,
-                        height = MulDiv(GetDeviceCaps(printer, VERTRES), 1440,
-                                        GetDeviceCaps(printer, LOGPIXELSY)) -
-                                 1840;
-                    double scale =
-                        std::min({15., (double)width / image.width, (double)height / image.height});
-                    std::string rtf = "{\\rtf1{\\pict\\dibitmap0\\wbmbitspixel24\\wbmplanes1\\wbmwidthbytes" +
-                                      std::to_string(stride) + "\\picw" + std::to_string(image.width) +
-                                      "\\pich" + std::to_string(image.height) + "\\picwgoal" +
-                                      std::to_string((int)(image.width * scale)) + "\\pichgoal" +
-                                      std::to_string((int)(image.height * scale)) + " ";
-                    constexpr char hex[] = "0123456789abcdef";
-                    rtf.reserve(rtf.size() + dib.size() * 2 + 2);
-                    for (auto b : dib) {
-                        rtf += hex[b >> 4];
-                        rtf += hex[b & 15];
+            } else if ((block.kind == Kind::Image && block.image) ||
+                       (block.image && block.image->inlineImages)) {
+                std::string imagesRtf = "{\\rtf1 ";
+                if (block.image->inlineImages)
+                    for (auto &image : *block.image->inlineImages) {
+                        imagesRtf += imageRtf(image, INT_MAX);
+                        imagesRtf += " ";
                     }
-                    rtf += "}}";
-                    streamRtf((LONG)block.start, (LONG)(block.start + block.length), rtf);
-                } catch (const std::exception &) {
-                    // Preserve the existing alt text when an image is unavailable, as in reading mode.
-                }
+                else
+                    imagesRtf += imageRtf(block, INT_MAX);
+                imagesRtf += "}";
+                streamRtf((LONG)block.start, (LONG)(block.start + block.length), imagesRtf);
             }
         }
         DOCINFOW info{sizeof(info)};

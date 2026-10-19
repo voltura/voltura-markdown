@@ -5,4 +5,5 @@
 - Before a release, commit the reviewed changes on `main`, push normally, and run `scripts/sync-source.ps1 -CheckOnly`. Local `HEAD` and `origin/main` must match. `release.ps1 -Publish` enforces this both before preparation and before publication.
 - After publishing, fetch and verify local `main`, `origin/main`, and the release tag identify the same source commit. Verify the live product site's portable and installer links target that release and their downloads match the signed release assets.
 - Production `vmd.exe` must exclude test switches and instrumentation. Keep them behind `VMD_TESTING` in `vmd-test.exe`; never package the test executable.
+- If a running `vmd.exe` blocks building, replacing executables, testing, or other requested work, terminating the blocking process is mandatory. Do so without asking for confirmation, then retry the blocked operation. Preserve unrelated processes.
 - Preserve fast startup, document loading, first-match display, and navigation. Keep UI changes narrow and run the relevant performance and behavior checks.

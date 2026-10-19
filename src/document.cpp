@@ -1,4 +1,5 @@
 #include "document.h"
+#include "lexbor/html/html.h"
 #include "md4c.h"
 extern "C" {
 #include "entity.h"
@@ -9,8 +10,10 @@ extern "C" {
 #endif
 #include <cwctype>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 namespace vm {
 std::wstring fromUtf8(std::string_view s) {
@@ -117,6 +120,48 @@ std::wstring entity(std::wstring_view s, const std::atomic_bool *cancel) {
 namespace {
 struct Parser {
     Document doc;
+    bool sourceMap = false;
+    const char *input = nullptr;
+    size_t bytePosition = 0;
+    size_t inputSize = 0;
+    size_t textEnd = 0;
+    uint32_t sourceCursor = 0;
+    uint32_t sourcePosition = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> sourceAnchors;
+    bool mappingHtml = false;
+    struct HtmlSourceTags {
+        std::vector<std::pair<size_t, size_t>> positions;
+        size_t next = 0;
+    };
+    std::map<std::pair<std::wstring, bool>, HtmlSourceTags> htmlSourceTags;
+    uint32_t htmlSource = 0;
+    size_t htmlPosition = 0;
+    bool currentLocated = false;
+    void locate(const char *p) {
+        if (!sourceMap || (uintptr_t)p < (uintptr_t)input || (uintptr_t)p > (uintptr_t)input + inputSize)
+            return;
+        size_t end = p - input;
+        if (end < bytePosition) {
+            uint32_t distance = 0;
+            for (size_t i = end; i < bytePosition; ++i) {
+                unsigned char c = input[i];
+                if ((c & 0xc0) != 0x80)
+                    distance += c >= 0xf0 ? 2 : 1;
+            }
+            sourcePosition = sourceCursor - distance;
+            return;
+        }
+        while (bytePosition < end) {
+            unsigned char c = input[bytePosition++];
+            if ((c & 0xc0) != 0x80)
+                sourceCursor += c >= 0xf0 ? 2 : 1;
+        }
+        sourcePosition = sourceCursor;
+        if (current >= 0 && !currentLocated) {
+            sourceAnchors.emplace_back(doc.blocks[current].start, sourcePosition);
+            currentLocated = true;
+        }
+    }
     const std::atomic_bool *cancel;
     std::exception_ptr error;
     int current = -1;
@@ -136,11 +181,38 @@ struct Parser {
     struct HtmlBlock {
         std::wstring tag;
         unsigned heading, quote, styles;
+        int alignment;
         size_t listDepth;
         bool inCode;
     };
     std::vector<HtmlBlock> htmlBlocks;
+    struct Picture {
+        std::wstring light, dark;
+    };
+    std::vector<Picture> pictures;
+    std::wstring htmlBuffer;
+    int alignment = 0;
+    struct HtmlCell {
+        int row;
+        size_t cell, firstChild;
+        int alignment;
+        unsigned styles;
+    };
+    std::vector<HtmlCell> htmlCells;
+    std::vector<std::pair<std::wstring, int>> tableAlignments;
+    struct HtmlTable {
+        size_t first;
+        uint32_t group = 0;
+        TableSection section = TableSection::Body;
+        std::vector<TableColumn> columns;
+        size_t colGroupFirst = 0;
+        unsigned colGroupSpan = 1;
+    };
+    std::vector<HtmlTable> htmlTables;
     std::wstring link, prefix;
+    uint64_t inlineGroup = 1;
+    size_t markdownImages = 0;
+    bool richTables = false;
     bool inCode = false, inImage = false, inHtml = false, separateRun = false;
     unsigned heading = 0;
     std::wstring attr(const MD_ATTRIBUTE &a) {
@@ -163,13 +235,17 @@ struct Parser {
         b.codeStart = b.start;
         b.indent = (unsigned)lists.size();
         b.quote = quote;
-        b.level = heading;
+        b.level = (uint8_t)heading;
+        b.align = (uint8_t)alignment;
         doc.blocks.push_back(std::move(b));
         current = (int)doc.blocks.size() - 1;
+        currentLocated = mappingHtml;
+        if (sourceMap)
+            sourceAnchors.emplace_back(doc.blocks.back().start, sourcePosition);
         if (!prefix.empty()) {
-            auto p = std::move(prefix);
+            // List markers are structural text, outside the first inline span.
+            doc.text.append(prefix);
             prefix.clear();
-            append(p);
         }
     }
     void finish() {
@@ -204,7 +280,8 @@ struct Parser {
                 copy.kind = doc.blocks[index].kind;
                 copy.indent = doc.blocks[index].indent;
                 copy.quote = quote;
-                copy.level = heading;
+                copy.level = (uint8_t)heading;
+                copy.align = doc.blocks[index].align;
                 copy.continuation = true;
                 copy.codeStart = doc.blocks[index].codeStart;
                 if (doc.blocks[index].language)
@@ -237,6 +314,7 @@ struct Parser {
     }
     void enter(MD_BLOCKTYPE t, void *d) {
         check();
+        ++inlineGroup;
         switch (t) {
         case MD_BLOCK_QUOTE:
             finish();
@@ -284,7 +362,8 @@ struct Parser {
             break;
         case MD_BLOCK_P:
             finish();
-            start();
+            // Start lazily when text arrives. An image can be the first inline;
+            // eagerly creating a paragraph leaves an empty, full-height block.
             break;
         case MD_BLOCK_TABLE:
             finish();
@@ -325,6 +404,7 @@ struct Parser {
         }
     }
     void leave(MD_BLOCKTYPE t, void *) {
+        ++inlineGroup;
         switch (t) {
         case MD_BLOCK_QUOTE:
             finish();
@@ -350,6 +430,7 @@ struct Parser {
             inCode = false;
             break;
         case MD_BLOCK_HTML:
+            renderHtmlFragment();
             finish();
             inHtml = false;
             break;
@@ -395,9 +476,18 @@ struct Parser {
             break;
         case MD_SPAN_IMG:
             finish();
+            if (sourceMap) {
+                // A reference image's URL may live at the end of the file.
+                // Anchor the image syntax at its use, including empty alt text.
+                auto marker = std::string_view(input, inputSize).find("![", textEnd);
+                if (marker != std::string_view::npos)
+                    locate(input + marker);
+            }
             inImage = true;
             start(Kind::Image);
-            block().image = std::make_unique<std::wstring>(attr(((MD_SPAN_IMG_DETAIL *)d)->src));
+            block().image = std::make_unique<ImageReference>(attr(((MD_SPAN_IMG_DETAIL *)d)->src));
+            block().image->inlineGroup = inlineGroup;
+            ++markdownImages;
             break;
         case MD_SPAN_FOOTNOTE_REF: {
             auto ref = (MD_SPAN_FOOTNOTE_REF_DETAIL *)d;
@@ -459,6 +549,380 @@ struct Parser {
     static bool htmlSpace(wchar_t c) {
         return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' || c == L'\f';
     }
+    void renderHtmlFragment() {
+        if (htmlBuffer.empty())
+            return;
+        if (sourceMap) {
+            mappingHtml = true;
+            htmlPosition = 0;
+        }
+        auto input = toUtf8(std::exchange(htmlBuffer, {}));
+        std::unique_ptr<lxb_html_document_t, decltype(&lxb_html_document_destroy)> tree(
+            lxb_html_document_create(), lxb_html_document_destroy);
+        if (!tree || lxb_html_document_parse_chunk_begin(tree.get()) != LXB_STATUS_OK)
+            throw std::runtime_error("HTML parser unavailable");
+        // Observe the real tokenizer, then forward to its tree builder. This
+        // excludes tag-like text in comments, attributes and raw-text elements.
+        // Count UTF-16 offsets in one forward pass over the stable UTF-8 input.
+        struct SourceIndex {
+            Parser &parser;
+            std::string_view input;
+            lxb_html_tokenizer_t *tokenizer;
+            lxb_html_tokenizer_token_f forward;
+            void *context;
+            size_t byte = 0, units = 0;
+            size_t position(size_t end) {
+                while (byte < end) {
+                    if ((byte & 4095) == 0)
+                        parser.check();
+                    unsigned char c = input[byte++];
+                    if ((c & 0xc0) != 0x80)
+                        units += c >= 0xf0 ? 2 : 1;
+                }
+                return units;
+            }
+            static lxb_html_token_t *token(lxb_html_tokenizer_t *tkz, lxb_html_token_t *token, void *data) {
+                auto &self = *(SourceIndex *)data;
+                try {
+                    self.parser.check();
+                    if (token->tag_id >= LXB_TAG__BEGIN) {
+                        bool close = (token->type & LXB_HTML_TOKEN_TYPE_CLOSE) != 0;
+                        size_t name = (const char *)token->begin - self.input.data();
+                        size_t end = (const char *)token->end - self.input.data();
+                        auto tag = fromUtf8(self.input.substr(name, end - name));
+                        for (auto &c : tag)
+                            c = (wchar_t)towlower(c);
+                        auto start = self.position(name) - (close ? 2 : 1);
+                        auto limit = self.position(end);
+                        self.parser.htmlSourceTags[{std::move(tag), close}].positions.emplace_back(start,
+                                                                                                   limit);
+                    }
+                    return self.forward(tkz, token, self.context);
+                } catch (...) {
+                    self.parser.error = std::current_exception();
+                    tkz->status = LXB_STATUS_ERROR;
+                    return nullptr;
+                }
+            }
+            ~SourceIndex() {
+                lxb_html_tokenizer_callback_token_done_set(tokenizer, forward, context);
+            }
+        };
+        auto tokenizer = ((lxb_html_parser_t *)tree->dom_document.parser)->tkz;
+        SourceIndex index{*this, input, tokenizer, tokenizer->callback_token_done,
+                          tokenizer->callback_token_ctx};
+        if (sourceMap)
+            lxb_html_tokenizer_callback_token_done_set(tokenizer, SourceIndex::token, &index);
+        for (size_t at = 0; at < input.size(); at += 65536) {
+            check();
+            if (lxb_html_document_parse_chunk(tree.get(), (const lxb_char_t *)input.data() + at,
+                                              std::min<size_t>(65536, input.size() - at)) != LXB_STATUS_OK) {
+                if (error)
+                    std::rethrow_exception(error);
+                throw std::runtime_error("HTML parsing failed");
+            }
+        }
+        if (lxb_html_document_parse_chunk_end(tree.get()) != LXB_STATUS_OK) {
+            if (error)
+                std::rethrow_exception(error);
+            throw std::runtime_error("HTML parsing failed");
+        }
+        // Tree construction (including implied end tags and table foster parenting)
+        // belongs to the HTML5 parser, not the native presentation adapter.
+        std::string normalized;
+        auto collect = [](const lxb_char_t *data, size_t size, void *context) -> lxb_status_t {
+            try {
+                ((std::string *)context)->append((const char *)data, size);
+                return LXB_STATUS_OK;
+            } catch (...) {
+                return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+            }
+        };
+        if (lxb_html_serialize_deep_cb(lxb_dom_interface_node(tree->body), collect, &normalized) !=
+            LXB_STATUS_OK)
+            throw std::runtime_error("HTML presentation failed");
+        html(fromUtf8(normalized));
+        mappingHtml = false;
+        htmlSourceTags.clear();
+    }
+    int htmlAlignment(std::wstring_view token, int inherited) {
+        auto value = attribute(token, L"align");
+        for (auto &c : value)
+            c = (wchar_t)towlower(c);
+        return value == L"left" ? 1 : value == L"center" ? 2 : value == L"right" ? 3 : inherited;
+    }
+    // WHATWG non-negative-integer parsing, followed by the table model limits.
+    unsigned tableSpan(std::wstring_view token, bool rows, std::wstring_view name = {}) {
+        auto value = attribute(token, name.empty() ? rows ? L"rowspan" : L"colspan" : name);
+        size_t at = 0;
+        while (at < value.size() && htmlSpace(value[at]))
+            ++at;
+        bool negative = at < value.size() && value[at] == L'-';
+        if (at < value.size() && (value[at] == L'+' || negative))
+            ++at;
+        if (at == value.size() || value[at] < L'0' || value[at] > L'9')
+            return 1;
+        unsigned result = 0, limit = rows ? 65534 : 1000;
+        while (at < value.size() && value[at] >= L'0' && value[at] <= L'9') {
+            check();
+            result = std::min(limit, result * 10 + (unsigned)(value[at++] - L'0'));
+        }
+        if (negative && result)
+            return 1;
+        return result || rows ? result : 1;
+    }
+    bool formSpanningTable(size_t first, std::vector<TableColumn> declarations) {
+        // Ordinary rows retain their incremental layout path. A span connects rows
+        // and is represented by one sparse grid; never allocate rows * columns slots.
+        bool needsGrid = !declarations.empty(), footerSeen = false;
+        for (size_t i = first; i < doc.blocks.size(); ++i)
+            if (doc.blocks[i].kind == Kind::Table) {
+                // Footer-first source needs visual row coordinates even without
+                // spans. Keep source/text order intact for search and selection.
+                if ((TableSection)doc.blocks[i].level == TableSection::Foot)
+                    footerSeen = true;
+                else if (footerSeen)
+                    needsGrid = true;
+                for (auto &cell : doc.blocks[i].cells)
+                    needsGrid |= cell.colSpan != 1 || cell.rowSpan != 1;
+            }
+        if (!needsGrid)
+            return false;
+        struct Group {
+            std::vector<Block *> rows;
+            TableSection section;
+            uint32_t id;
+        };
+        std::vector<Group> groups;
+        for (size_t i = first; i < doc.blocks.size(); ++i) {
+            auto &row = doc.blocks[i];
+            if (row.kind != Kind::Table)
+                continue;
+            if (groups.empty() || groups.back().id != row.codeStart)
+                groups.push_back({{}, (TableSection)row.level, row.codeStart});
+            groups.back().rows.push_back(&row);
+        }
+        if (groups.empty())
+            return true; // A caption-only/empty table has no visible grid.
+        // The HTML model processes footer groups after all other row groups.
+        std::stable_partition(groups.begin(), groups.end(),
+                              [](const Group &g) { return g.section != TableSection::Foot; });
+        auto model = std::make_unique<TableModel>();
+        model->columns = (unsigned)declarations.size();
+        if (!declarations.empty())
+            model->declaredColumns = std::make_shared<std::vector<TableColumn>>(std::move(declarations));
+        for (auto &group : groups) {
+            check();
+            unsigned count = (unsigned)group.rows.size();
+            for (unsigned y = 0; y < group.rows.size(); ++y)
+                for (auto &cell : group.rows[y]->cells)
+                    count = std::max(count, y + std::max<unsigned>(1, cell.rowSpan));
+            if (count > 1000000 || model->rows > 1000000 - count)
+                throw std::runtime_error("HTML table row limit");
+            model->groups.push_back({model->rows, count, group.section, (uint32_t)model->groups.size()});
+            std::vector<unsigned> occupiedUntil;
+            for (unsigned y = 0; y < group.rows.size(); ++y) {
+                unsigned x = 0;
+                for (auto &cell : group.rows[y]->cells) {
+                    check();
+                    while (x < occupiedUntil.size() && occupiedUntil[x] > y)
+                        ++x;
+                    if (x + cell.colSpan > 65536)
+                        throw std::runtime_error("HTML table column limit");
+                    occupiedUntil.resize(std::max(occupiedUntil.size(), (size_t)x + cell.colSpan));
+                    cell.row = model->rows + y;
+                    cell.column = x;
+                    cell.rows = cell.rowSpan ? cell.rowSpan : count - y;
+                    for (unsigned col = x; col < x + cell.colSpan; ++col) {
+                        model->overlap |= occupiedUntil[col] > y;
+                        occupiedUntil[col] = std::max(occupiedUntil[col], y + cell.rows);
+                    }
+                    x += cell.colSpan;
+                    model->columns = std::max(model->columns, x);
+                }
+            }
+            model->rows += count;
+        }
+        Block merged;
+        merged.kind = Kind::Table;
+        merged.table = std::move(model);
+        merged.start = UINT32_MAX;
+        uint32_t end = 0;
+        std::deque<Block> other;
+        for (size_t i = first; i < doc.blocks.size(); ++i) {
+            auto &row = doc.blocks[i];
+            if (row.kind != Kind::Table) {
+                merged.start = std::min(merged.start, row.start);
+                end = std::max(end, row.start + row.length);
+                merged.runs.insert(merged.runs.end(), row.runs.begin(), row.runs.end());
+                other.push_back(std::move(row));
+                continue;
+            }
+            merged.indent = row.indent;
+            merged.quote = row.quote;
+            merged.align = row.align;
+            merged.start = std::min(merged.start, row.start);
+            end = std::max(end, row.start + row.length);
+            for (auto &cell : row.cells)
+                merged.cells.push_back(std::move(cell));
+            for (auto &run : row.runs)
+                merged.runs.push_back(std::move(run));
+        }
+        doc.blocks.erase(doc.blocks.begin() + first, doc.blocks.end());
+        if (!other.empty())
+            merged.table->captions = std::make_shared<std::deque<Block>>(std::move(other));
+        std::sort(merged.runs.begin(), merged.runs.end(),
+                  [](const Run &a, const Run &b) { return a.start < b.start; });
+        merged.length = end - merged.start;
+        merged.table->tracks = std::make_shared<std::vector<TableColumn>>(merged.table->columns);
+        if (merged.table->declaredColumns)
+            std::copy(merged.table->declaredColumns->begin(), merged.table->declaredColumns->end(),
+                      merged.table->tracks->begin());
+        for (auto &cell : merged.cells) {
+            check();
+            for (unsigned col = cell.column; col < cell.column + cell.colSpan; ++col) {
+                auto &track = (*merged.table->tracks)[col];
+                track.minimum = std::max(track.minimum, 1.f / cell.colSpan);
+                if (cell.percent)
+                    track.percent = std::max(track.percent, (float)std::min(cell.width, 100u) / cell.colSpan);
+                else
+                    track.pixels = std::max(track.pixels, (float)cell.width / cell.colSpan);
+            }
+        }
+        // Rendering bands preserve the standard table model while bounding
+        // DirectWrite work to the connected rowspans near the viewport.
+        bool ordered = std::is_sorted(merged.cells.begin(), merged.cells.end(),
+                                      [](const Cell &a, const Cell &b) { return a.row < b.row; });
+        bool laterCaption =
+            merged.table->captions && !merged.cells.empty() &&
+            std::any_of(merged.table->captions->begin(), merged.table->captions->end(),
+                        [&](const Block &caption) { return caption.start >= merged.cells.front().start; });
+        if (!ordered || merged.cells.empty() || laterCaption) {
+            doc.blocks.push_back(std::move(merged));
+            return true;
+        }
+        size_t begin = 0, firstGroup = 0;
+        unsigned firstRow = 0;
+        while (begin < merged.cells.size()) {
+            check();
+            unsigned lastRow = firstRow + 1;
+            size_t endCell = begin;
+            while (endCell < merged.cells.size() && merged.cells[endCell].row < lastRow) {
+                lastRow = std::max(lastRow, merged.cells[endCell].row + merged.cells[endCell].rows);
+                ++endCell;
+            }
+            // Empty rows are zero-height unless a spanning cell gives them height.
+            if (endCell < merged.cells.size())
+                lastRow = merged.cells[endCell].row;
+            else
+                lastRow = merged.table->rows;
+            Block band;
+            band.kind = Kind::Table;
+            band.indent = merged.indent;
+            band.quote = merged.quote;
+            band.align = merged.align;
+            band.start = begin ? merged.cells[begin].start : merged.start;
+            uint32_t endText =
+                endCell < merged.cells.size() ? merged.cells[endCell].start : merged.start + merged.length;
+            band.length = endText - band.start;
+            band.table = std::make_unique<TableModel>();
+            band.table->rows = lastRow - firstRow;
+            band.table->columns = merged.table->columns;
+            band.table->rowOffset = firstRow;
+            band.table->overlap = merged.table->overlap;
+            band.table->continued = begin != 0;
+            band.table->continues = endCell < merged.cells.size();
+            band.table->tracks = merged.table->tracks;
+            band.table->declaredColumns = merged.table->declaredColumns;
+            if (!begin)
+                band.table->captions = std::move(merged.table->captions);
+            // Bands and groups are ordered. Skip expired groups once, and only
+            // visit groups that overlap this band instead of rescanning all.
+            auto &rowGroups = merged.table->groups;
+            while (firstGroup < rowGroups.size() &&
+                   rowGroups[firstGroup].first + rowGroups[firstGroup].rows <= firstRow)
+                ++firstGroup;
+            for (size_t g = firstGroup; g < rowGroups.size() && rowGroups[g].first < lastRow; ++g) {
+                auto group = rowGroups[g];
+                unsigned lo = std::max(group.first, firstRow),
+                         hi = std::min(group.first + group.rows, lastRow);
+                if (hi > lo) {
+                    group.first = lo - firstRow;
+                    group.rows = hi - lo;
+                    band.table->groups.push_back(group);
+                }
+            }
+            auto run = std::lower_bound(merged.runs.begin(), merged.runs.end(), band.start,
+                                        [](const Run &r, uint32_t at) { return r.start < at; });
+            while (run != merged.runs.end() && run->start < endText)
+                band.runs.push_back(*run++);
+            for (size_t cell = begin; cell < endCell; ++cell) {
+                merged.cells[cell].row -= firstRow;
+                band.cells.push_back(std::move(merged.cells[cell]));
+            }
+            doc.blocks.push_back(std::move(band));
+            firstRow = lastRow;
+            begin = endCell;
+        }
+        return true;
+    }
+    void pictureSource(std::wstring_view token) {
+        if (pictures.empty())
+            return;
+        auto srcset = attribute(token, L"srcset");
+        // Support a single resource, optionally marked 1x. Responsive candidate
+        // lists and viewport media queries need a browser-style sizing policy.
+        auto begin = srcset.find_first_not_of(L" \t\r\n\f");
+        if (begin == srcset.npos)
+            return;
+        auto end = srcset.find_first_of(L" \t\r\n\f", begin);
+        auto url = srcset.substr(begin, end - begin);
+        if (url.find(L',') != url.npos)
+            return;
+        if (end != srcset.npos) {
+            auto descriptor = srcset.substr(end);
+            auto first = descriptor.find_first_not_of(L" \t\r\n\f");
+            if (first != descriptor.npos &&
+                descriptor.substr(first, descriptor.find_last_not_of(L" \t\r\n\f") - first + 1) != L"1x")
+                return;
+        }
+        auto media = attribute(token, L"media");
+        std::wstring query;
+        for (auto c : media)
+            if (!htmlSpace(c))
+                query.push_back((wchar_t)towlower(c));
+        auto type = attribute(token, L"type");
+        for (auto &c : type)
+            c = (wchar_t)towlower(c);
+        if (!type.empty() && type != L"image/png" && type != L"image/jpeg" && type != L"image/gif" &&
+            type != L"image/bmp" && type != L"image/tiff" && type != L"image/svg+xml")
+            return;
+        auto &picture = pictures.back();
+        if ((query.empty() || query == L"all" || query == L"(prefers-color-scheme:light)") &&
+            picture.light.empty())
+            picture.light = url;
+        if ((query.empty() || query == L"all" || query == L"(prefers-color-scheme:dark)") &&
+            picture.dark.empty())
+            picture.dark = url;
+    }
+    uint32_t imageDimension(std::wstring_view token, std::wstring_view name) {
+        auto value = attribute(token, name);
+        size_t begin = 0, end = value.size();
+        while (begin < end && htmlSpace(value[begin]))
+            ++begin;
+        while (end > begin && htmlSpace(value[end - 1]))
+            --end;
+        uint32_t result = 0;
+        for (size_t i = begin; i < end; ++i) {
+            if (value[i] < L'0' || value[i] > L'9')
+                return 0;
+            unsigned digit = value[i] - L'0';
+            if (result > (UINT32_MAX - digit) / 10)
+                return 0;
+            result = result * 10 + digit;
+        }
+        return result;
+    }
     void htmlText(std::wstring_view text) {
         auto decoded = entity(text, cancel);
         if (inCode) {
@@ -486,6 +950,7 @@ struct Parser {
         heading = context.heading;
         quote = context.quote;
         styles = context.styles;
+        alignment = context.alignment;
         lists.resize(context.listDepth);
         inCode = context.inCode;
         prefix.clear();
@@ -494,7 +959,10 @@ struct Parser {
         bool isHeading = tag.size() == 2 && tag[0] == L'h' && tag[1] >= L'1' && tag[1] <= L'6';
         bool isList = tag == L"ul" || tag == L"ol";
         bool wrapper = tag == L"section" || tag == L"article" || tag == L"main" || tag == L"nav" ||
-                       tag == L"aside" || tag == L"header" || tag == L"footer" || tag == L"details";
+                       tag == L"aside" || tag == L"header" || tag == L"footer" || tag == L"details" ||
+                       tag == L"p" || tag == L"div" || tag == L"figure" || tag == L"figcaption" ||
+                       tag == L"center" || tag == L"address" || tag == L"dl" || tag == L"dt" ||
+                       tag == L"dd" || tag == L"caption";
         if (!isHeading && !isList && !wrapper && tag != L"li" && tag != L"blockquote" && tag != L"summary" &&
             tag != L"pre")
             return false;
@@ -508,7 +976,8 @@ struct Parser {
             return true;
         }
         finish();
-        htmlBlocks.push_back({tag, heading, quote, styles, lists.size(), inCode});
+        htmlBlocks.push_back({tag, heading, quote, styles, alignment, lists.size(), inCode});
+        alignment = tag == L"center" || tag == L"caption" ? 2 : htmlAlignment(token, alignment);
         if (isHeading) {
             heading = tag[1] - L'0';
             start(Kind::Heading);
@@ -541,6 +1010,12 @@ struct Parser {
     void html(std::wstring_view s) {
         size_t i = 0;
         while (i < s.size()) {
+            check();
+            if (s.substr(i, 4) == L"<!--") {
+                auto commentEnd = s.find(L"-->", i + 4);
+                i = commentEnd == s.npos ? s.size() : commentEnd + 3;
+                continue;
+            }
             if (s[i] != L'<') {
                 auto end = s.find(L'<', i);
                 if (end == s.npos)
@@ -583,17 +1058,39 @@ struct Parser {
             std::wstring tag(token.substr(a, at - a));
             for (auto &c : tag)
                 c = (wchar_t)towlower(c);
+            if (mappingHtml) {
+                // Normalization can repair/reorder HTML. Match surviving tags in
+                // source order; never let repaired markup move an anchor backwards.
+                auto found = htmlSourceTags.find({tag, close});
+                if (found != htmlSourceTags.end()) {
+                    auto &tags = found->second;
+                    while (tags.next < tags.positions.size() &&
+                           tags.positions[tags.next].first < htmlPosition) {
+                        check();
+                        ++tags.next;
+                    }
+                    if (tags.next < tags.positions.size()) {
+                        auto [match, endName] = tags.positions[tags.next++];
+                        sourcePosition = htmlSource + (uint32_t)match;
+                        htmlPosition = endName;
+                    }
+                }
+            }
             if (structuralHtml(tag, token, close)) {
                 i = end + 1;
                 continue;
             }
             unsigned style = tag == L"b" || tag == L"strong" ? Bold
-                             : tag == L"i" || tag == L"em"   ? Italic
-                             : tag == L"code"                ? Mono
-                             : tag == L"s" || tag == L"del"  ? Strike
-                             : tag == L"kbd"                 ? Keycap | Mono
-                             : tag == L"u"                   ? Underline
-                                                             : 0;
+                             : tag == L"i" || tag == L"em" || tag == L"cite" || tag == L"dfn" || tag == L"var"
+                                 ? Italic
+                             : tag == L"code" || tag == L"samp" || tag == L"tt" ? Mono
+                             : tag == L"s" || tag == L"del" || tag == L"strike" ? Strike
+                             : tag == L"kbd"                                    ? Keycap | Mono
+                             : tag == L"u" || tag == L"ins"                     ? Underline
+                             : tag == L"sub"                                    ? Subscript
+                             : tag == L"sup"                                    ? Superscript
+                             : tag == L"small"                                  ? Small
+                                                                                : 0;
             if (style) {
                 if (tag == L"kbd")
                     separateRun = true;
@@ -607,16 +1104,26 @@ struct Parser {
                     htmlStyles.push_back({tag, styles});
                     styles |= style;
                 }
-            } else if (tag == L"span") {
+            } else if (tag == L"picture") {
+                if (close) {
+                    if (!pictures.empty())
+                        pictures.pop_back();
+                } else
+                    pictures.push_back({});
+            } else if (tag == L"source" && !pictures.empty()) {
+                if (!close)
+                    pictureSource(token);
+            } else if (tag == L"span" || tag == L"abbr" || tag == L"time" || tag == L"data" ||
+                       tag == L"bdi" || tag == L"bdo" || tag == L"wbr") {
                 // Harmless wrappers retain their content; CSS and attributes are ignored.
             } else if (tag == L"hr" && !close) {
                 finish();
                 start(Kind::Rule);
                 finish();
             } else if (tag == L"br") {
-                append(L"\n");
-            } else if (tag == L"p" || tag == L"div") {
-                finish();
+                ++inlineGroup;
+                if (current >= 0)
+                    append(L"\n");
             } else if (tag == L"a") {
                 if (close) {
                     link.clear();
@@ -626,18 +1133,123 @@ struct Parser {
                     styles |= Underline;
                 }
             } else if (tag == L"img" && !close) {
+                ImageReference image{attribute(token, L"src")};
+                image.width = imageDimension(token, L"width");
+                image.height = imageDimension(token, L"height");
+                if (!pictures.empty()) {
+                    image.lightUrl = pictures.back().light;
+                    image.darkUrl = pictures.back().dark;
+                }
                 finish();
                 start(Kind::Image);
-                block().image = std::make_unique<std::wstring>(attribute(token, L"src"));
+                block().image = std::make_unique<ImageReference>(std::move(image));
                 append(attribute(token, L"alt"));
                 finish();
-            } else if (tag == L"table" || tag == L"thead" || tag == L"tbody") {
+            } else if (tag == L"colgroup" || tag == L"col") {
+                if (!htmlTables.empty()) {
+                    auto &table = htmlTables.back();
+                    if (tag == L"colgroup") {
+                        if (!close) {
+                            table.colGroupFirst = table.columns.size();
+                            table.colGroupSpan = tableSpan(token, false, L"span");
+                        } else if (table.columns.size() == table.colGroupFirst) {
+                            if (table.columns.size() + table.colGroupSpan > 65536)
+                                throw std::runtime_error("HTML table column limit");
+                            table.columns.resize(table.columns.size() + table.colGroupSpan);
+                        }
+                    } else if (!close) {
+                        unsigned span = tableSpan(token, false, L"span");
+                        if (table.columns.size() + span > 65536)
+                            throw std::runtime_error("HTML table column limit");
+                        TableColumn column;
+                        auto width = attribute(token, L"width");
+                        bool percent = !width.empty() && width.back() == L'%';
+                        if (percent)
+                            width.pop_back();
+                        if (!width.empty() && width.size() <= 9 &&
+                            std::all_of(width.begin(), width.end(),
+                                        [](wchar_t c) { return c >= L'0' && c <= L'9'; })) {
+                            auto hint = (float)wcstoul(width.c_str(), nullptr, 10);
+                            if (percent)
+                                column.percent = std::min(100.f, hint);
+                            else
+                                column.pixels = hint;
+                        }
+                        table.columns.insert(table.columns.end(), span, column);
+                    }
+                }
+            } else if (tag == L"table" || tag == L"thead" || tag == L"tbody" || tag == L"tfoot") {
                 finish();
+                if (tag == L"table") {
+                    if (!close)
+                        htmlTables.push_back({doc.blocks.size()});
+                    else if (!htmlTables.empty()) {
+                        auto context = std::move(htmlTables.back());
+                        auto first = context.first;
+                        htmlTables.pop_back();
+                        if (formSpanningTable(first, std::move(context.columns))) {
+                            // Span coordinates and row groups now belong to the grid.
+                        } else {
+                            std::vector<Cell> columns;
+                            for (size_t row = first; row < doc.blocks.size(); ++row) {
+                                auto &b = doc.blocks[row];
+                                if (b.kind != Kind::Table)
+                                    continue;
+                                columns.resize(
+                                    std::max(columns.size(), std::min<size_t>(256, b.cells.size())));
+                                for (size_t col = 0; col < std::min(columns.size(), b.cells.size()); ++col)
+                                    if (!columns[col].width && b.cells[col].width) {
+                                        columns[col].width = b.cells[col].width;
+                                        columns[col].percent = b.cells[col].percent;
+                                    }
+                            }
+                            for (size_t row = first; row < doc.blocks.size(); ++row) {
+                                auto &b = doc.blocks[row];
+                                if (b.kind != Kind::Table || b.cells.size() > 256)
+                                    continue;
+                                while (b.cells.size() < columns.size())
+                                    b.cells.push_back({b.start + b.length, 0});
+                                for (size_t col = 0; col < b.cells.size(); ++col) {
+                                    b.cells[col].width = columns[col].width;
+                                    b.cells[col].percent = columns[col].percent;
+                                }
+                                b.level = 0;
+                            }
+                        }
+                    }
+                } else if (!htmlTables.empty()) {
+                    ++htmlTables.back().group;
+                    htmlTables.back().section = !close && tag == L"thead"   ? TableSection::Head
+                                                : !close && tag == L"tfoot" ? TableSection::Foot
+                                                                            : TableSection::Body;
+                }
+                if (!close) {
+                    tableAlignments.push_back({tag, alignment});
+                    alignment = htmlAlignment(token, alignment);
+                } else if (!tableAlignments.empty() && tableAlignments.back().first == tag) {
+                    alignment = tableAlignments.back().second;
+                    tableAlignments.pop_back();
+                }
             } else if (tag == L"tr") {
+                if (close && current >= 0 && block().kind == Kind::Table)
+                    block().header =
+                        !block().cells.empty() && std::all_of(block().cells.begin(), block().cells.end(),
+                                                              [](const Cell &cell) { return cell.header; });
                 finish();
-                if (!close)
+                if (!close) {
+                    tableAlignments.push_back({tag, alignment});
+                    alignment = htmlAlignment(token, alignment);
                     start(Kind::Table);
+                    if (!htmlTables.empty()) {
+                        block().codeStart = htmlTables.back().group;
+                        block().level = (uint8_t)htmlTables.back().section;
+                    }
+                } else if (!tableAlignments.empty() && tableAlignments.back().first == tag) {
+                    alignment = tableAlignments.back().second;
+                    tableAlignments.pop_back();
+                }
             } else if (tag == L"th" || tag == L"td") {
+                richTables = true;
                 if (!close) {
                     if (block().kind != Kind::Table) {
                         finish();
@@ -645,22 +1257,66 @@ struct Parser {
                     }
                     if (!block().cells.empty())
                         append(L"\t");
-                    block().cells.push_back({(uint32_t)doc.text.size(), 0, 0});
+                    auto cellAlign = htmlAlignment(token, alignment ? alignment : tag == L"th" ? 2 : 0);
+                    auto width = attribute(token, L"width");
+                    bool percent = !width.empty() && width.back() == L'%';
+                    if (percent)
+                        width.pop_back();
+                    unsigned cellWidth = 0;
+                    if (!width.empty() && width.size() <= 5 &&
+                        std::all_of(width.begin(), width.end(),
+                                    [](wchar_t c) { return c >= L'0' && c <= L'9'; }))
+                        cellWidth = (unsigned)wcstoul(width.c_str(), nullptr, 10);
+                    block().cells.push_back({(uint32_t)doc.text.size(), 0, cellAlign, cellWidth, percent});
+                    block().cells.back().colSpan = (uint16_t)tableSpan(token, false);
+                    block().cells.back().rowSpan = (uint16_t)tableSpan(token, true);
+                    block().cells.back().header = tag == L"th";
+                    block().header |= tag == L"th";
+                    auto valign = attribute(token, L"valign");
+                    for (auto &c : valign)
+                        c = (wchar_t)towlower(c);
+                    block().cells.back().verticalAlign = valign == L"top" ? 1 : valign == L"bottom" ? 3 : 2;
+                    if (htmlCells.size() >= 64)
+                        throw std::runtime_error("HTML table nesting limit");
+                    htmlCells.push_back(
+                        {current, block().cells.size() - 1, doc.blocks.size(), alignment, styles});
+                    current = -1;
+                    alignment = cellAlign;
                     if (tag == L"th")
-                        block().header = true;
-                } else if (current >= 0 && !block().cells.empty())
-                    block().cells.back().length = (uint32_t)doc.text.size() - block().cells.back().start;
+                        styles |= Bold;
+
+                } else if (!htmlCells.empty()) {
+                    finish();
+                    auto context = htmlCells.back();
+                    htmlCells.pop_back();
+                    auto content = std::make_shared<std::deque<Block>>();
+                    for (size_t child = context.firstChild; child < doc.blocks.size(); ++child)
+                        content->push_back(std::move(doc.blocks[child]));
+                    doc.blocks.erase(doc.blocks.begin() + context.firstChild, doc.blocks.end());
+                    current = context.row;
+                    alignment = context.alignment;
+                    styles = context.styles;
+                    auto &cell = block().cells[context.cell];
+                    cell.length = (uint32_t)doc.text.size() - cell.start;
+                    cell.content = std::move(content);
+                    for (auto &child : *cell.content)
+                        block().runs.insert(block().runs.end(), child.runs.begin(), child.runs.end());
+                }
             } else
                 append(token);
             i = end + 1;
         }
     }
     void text(MD_TEXTTYPE t, const char *p, unsigned n) {
+        locate(p);
+        if (sourceMap && (uintptr_t)p >= (uintptr_t)input && (uintptr_t)p + n <= (uintptr_t)input + inputSize)
+            textEnd = std::max(textEnd, (size_t)(p - input) + n);
         if (t == MD_TEXT_NULLCHAR) {
             append(L"�");
             return;
         }
         if (t == MD_TEXT_BR) {
+            ++inlineGroup;
             append(L"\n");
             return;
         }
@@ -671,9 +1327,14 @@ struct Parser {
         auto s = fromUtf8({p, n});
         if (t == MD_TEXT_ENTITY)
             append(entity(s, cancel));
-        else if (t == MD_TEXT_HTML)
-            html(s);
-        else if (t == MD_TEXT_NORMAL) {
+        else if (t == MD_TEXT_HTML) {
+            if (inHtml) {
+                if (htmlBuffer.empty())
+                    htmlSource = sourcePosition;
+                htmlBuffer += s;
+            } else
+                html(s);
+        } else if (t == MD_TEXT_NORMAL) {
             std::wstring collapsed;
             collapsed.reserve(s.size());
             bool space = current >= 0 && !doc.text.empty() && doc.text.back() == L' ';
@@ -703,7 +1364,7 @@ struct Parser {
     }
 };
 } // namespace
-Document parse(std::wstring source, const std::atomic_bool *cancel, unsigned flags) {
+Document parse(std::wstring source, const std::atomic_bool *cancel, unsigned flags, bool sourceMap) {
 #ifdef VMD_TESTING
     auto begin = std::chrono::steady_clock::now();
 #endif
@@ -714,6 +1375,9 @@ Document parse(std::wstring source, const std::atomic_bool *cancel, unsigned fla
     p.doc.source = std::move(source);
     p.doc.text.reserve(p.doc.source.size());
     auto utf8 = toUtf8(p.doc.source);
+    p.sourceMap = sourceMap;
+    p.input = utf8.c_str();
+    p.inputSize = utf8.size();
     MD_PARSER parser{};
     parser.flags = flags == 0xffffffff ? MD_DIALECT_GITHUB : flags;
     parser.enter_block = [](MD_BLOCKTYPE t, void *d, void *u) {
@@ -737,16 +1401,104 @@ Document parse(std::wstring source, const std::atomic_bool *cancel, unsigned fla
     if (status)
         throw std::runtime_error("Markdown parsing failed.");
     p.finish();
+    // Soft line breaks between images are spaces in one Markdown paragraph.
+    // Retain each image's offsets and link while sharing a wrapping layout.
+    if (p.markdownImages > 1) {
+        std::deque<Block> grouped;
+        for (size_t i = 0; i < p.doc.blocks.size();) {
+            auto &first = p.doc.blocks[i];
+            size_t end = i + 1;
+            if (first.image && first.image->inlineGroup) {
+                size_t count = 1;
+                for (size_t j = end; j < p.doc.blocks.size() && count < 256; ++j) {
+                    p.check();
+                    auto &next = p.doc.blocks[j];
+                    if (next.start + next.length - first.start > 8192)
+                        break;
+                    if (next.image && next.image->inlineGroup == first.image->inlineGroup) {
+                        end = j + 1;
+                        ++count;
+                    } else if (next.kind != Kind::Paragraph ||
+                               !std::all_of(p.doc.text.begin() + next.start,
+                                            p.doc.text.begin() + next.start + next.length,
+                                            [](wchar_t c) { return c == L' ' || c == L'\t'; }))
+                        break;
+                }
+            }
+            if (end == i + 1) {
+                grouped.push_back(std::move(first));
+                ++i;
+                continue;
+            }
+            Block row;
+            row.start = first.start;
+            row.indent = first.indent;
+            row.quote = first.quote;
+            row.align = first.align;
+            auto &last = p.doc.blocks[end - 1];
+            row.length = last.start + last.length - row.start;
+            row.image = std::make_unique<ImageReference>();
+            row.image->inlineImages = std::make_unique<std::deque<Block>>();
+            for (; i < end; ++i) {
+                auto &child = p.doc.blocks[i];
+                if (!child.image)
+                    continue;
+                row.runs.insert(row.runs.end(), child.runs.begin(), child.runs.end());
+                row.image->inlineImages->push_back(std::move(child));
+            }
+            grouped.push_back(std::move(row));
+        }
+        p.doc.blocks = std::move(grouped);
+    }
+    // Rich tables cannot split cell text independently of their native children.
+    // Degrade oversized bands to those children in source order, preserving
+    // images, links and formatting while keeping viewport layout work bounded.
+    auto boundRichTables = [&](auto &&self, std::deque<Block> &blocks) -> void {
+        std::deque<Block> bounded;
+        for (auto &b : blocks) {
+            p.check();
+            size_t children = 0;
+            for (auto &cell : b.cells)
+                if (cell.content) {
+                    self(self, *cell.content);
+                    children += cell.content->size();
+                }
+            if (b.table && b.table->captions) {
+                self(self, *b.table->captions);
+                children += b.table->captions->size();
+            }
+            if (!children || (b.length <= 8192 && children <= 256 && b.cells.size() <= 256)) {
+                bounded.push_back(std::move(b));
+                continue;
+            }
+            std::vector<Block> content;
+            if (b.table && b.table->captions)
+                for (auto &child : *b.table->captions)
+                    content.push_back(std::move(child));
+            for (auto &cell : b.cells)
+                if (cell.content)
+                    for (auto &child : *cell.content)
+                        content.push_back(std::move(child));
+            std::stable_sort(content.begin(), content.end(),
+                             [](const Block &a, const Block &b) { return a.start < b.start; });
+            for (auto &child : content)
+                bounded.push_back(std::move(child));
+        }
+        blocks = std::move(bounded);
+    };
+    if (p.richTables)
+        boundRichTables(boundRichTables, p.doc.blocks);
     // Turn exceptionally tall table cells into bounded continuation rows. Keep
     // text/runs in the original logical order so selection and copying stay exact.
     bool needsSplit = std::any_of(p.doc.blocks.begin(), p.doc.blocks.end(), [](const Block &b) {
-        return b.cells.size() > 256 ||
-               std::any_of(b.cells.begin(), b.cells.end(), [](const Cell &c) { return c.length > 8192; });
+        return (!b.table && b.cells.size() > 256) ||
+               std::any_of(b.cells.begin(), b.cells.end(),
+                           [](const Cell &c) { return !c.content && c.length > 8192; });
     });
     if (needsSplit) {
         std::deque<Block> bounded;
         for (auto &b : p.doc.blocks) {
-            if (b.cells.size() > 256) {
+            if (!b.table && b.cells.size() > 256) {
                 uint32_t position = b.start, limit = b.start + b.length;
                 do {
                     p.check();
@@ -778,7 +1530,8 @@ Document parse(std::wstring source, const std::atomic_bool *cancel, unsigned fla
             }
             size_t pieces = 1;
             for (auto &c : b.cells)
-                pieces = std::max(pieces, ((size_t)c.length + 4095) / 4096);
+                if (!c.content)
+                    pieces = std::max(pieces, ((size_t)c.length + 4095) / 4096);
             if (pieces == 1) {
                 bounded.push_back(std::move(b));
                 continue;
@@ -839,6 +1592,24 @@ Document parse(std::wstring source, const std::atomic_bool *cancel, unsigned fla
     p.doc.parseMs =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
 #endif
+    if (sourceMap) {
+        p.doc.sourceMapLength = (uint32_t)p.doc.source.size();
+        std::stable_sort(p.sourceAnchors.begin(), p.sourceAnchors.end(),
+                         [](const auto &a, const auto &b) { return a.first < b.first; });
+        uint32_t previous = 0;
+        std::vector<uint32_t> lines{0};
+        for (size_t i = 0; i < p.doc.source.size(); ++i)
+            if (p.doc.source[i] == L'\n')
+                lines.push_back((uint32_t)i + 1);
+        for (const auto &b : p.doc.blocks) {
+            auto found = std::upper_bound(p.sourceAnchors.begin(), p.sourceAnchors.end(), b.start,
+                                          [](uint32_t at, const auto &a) { return at < a.first; });
+            if (found != p.sourceAnchors.begin())
+                previous = std::max(previous, std::prev(found)->second);
+            auto line = std::upper_bound(lines.begin(), lines.end(), previous);
+            p.doc.sourceStarts.push_back(*std::prev(line));
+        }
+    }
     return std::move(p.doc);
 }
 Document loadSource(const std::filesystem::path &path, const std::atomic_bool *cancel) {

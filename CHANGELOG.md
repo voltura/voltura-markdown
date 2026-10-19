@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0 — 2026-10-19
+
+- Adds complete code-block copying, basic syntax coloring for common language labels, inline-code backgrounds, and colored links with destination hover feedback.
+- Expands native HTML support with HTML5 tree construction, merged and nested tables, captions, image dimensions, themed pictures, small text, subscripts, and superscripts.
+- Renders simple SVG badge text sharply across zoom/DPI changes and wraps adjacent Markdown badges together.
+- Starts wide edit windows with side-by-side Live preview, adds View mode wording, and themes editor scrollbars, menus, dialogs, and file/print pickers.
+- Keeps large rich cells on bounded readable blocks, preserves mixed header/data cells during HTML export and rules inside cells, and fixes preview heading navigation and scrolling after CRLF saves.
+- Updates the README, built-in Help, user guide, product page, and compatibility limits to match the release.
+
 ## 1.2.0 — 2026-10-18
 
 - Adds optional Markdown editing, new files, encoding-preserving Save/Save As, validation, and live preview.

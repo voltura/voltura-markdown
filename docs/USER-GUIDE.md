@@ -14,6 +14,14 @@ The reader starts in a normal window without a document, and fullscreen when lau
 
 ## Controls
 
+Code blocks have a copy icon in their upper-right corner. Hover to see **Copy code to clipboard**; click to copy the complete block, with indentation and line breaks preserved. **Copied!** confirms success.
+
+Fenced blocks with a language label use basic syntax coloring in both themes: PowerShell (`powershell`, `pwsh`, `ps1`), TypeScript/JavaScript (`typescript`, `ts`, `tsx`, `javascript`, `js`, `jsx`), C# (`csharp`, `cs`, `c#`), C/C++, Python, JSON/JSONC, SQL, and shell/Bash. Unlabeled and unknown languages remain plain text.
+
+Inline code has a subtle background. Colored links show their destination on hover; internal heading links navigate within the document and keep synchronized Live source aligned.
+
+Supported HTML includes tables with merged cells, captions, nested tables and images; explicit image dimensions, light/dark pictures, small text, subscripts, superscripts, and keyboard keys. Simple SVG badges retain sharp text as zoom changes, and adjacent Markdown badges wrap together. Exceptionally large rich table bands show readable child blocks instead of table geometry. See [supported formats and limits](COMPATIBILITY.md) for the native presentation subset.
+
 | Action | Shortcut or icon |
 | --- | --- |
 | Help | F1 / three-dot menu → Help |
@@ -51,7 +59,7 @@ Choose **Edit Markdown** in the three-dot menu or press **Ctrl+E**. **Ctrl+N** c
 
 The edit toolbar provides Heading (levels 1–6 or Normal text), Bold (**Ctrl+B**), Italic (**Ctrl+I**), Underline (**Ctrl+U**), Link (**Ctrl+K**), Code, List, Image, and Insert. Insert includes tables, images, bulleted/numbered/task lists, quotes, code blocks, horizontal rules, strikethrough, and inline code. Table asks for body rows and columns and adds a header row. Link and image dialogs accept text and a destination; Image also offers a file picker and a Placeholder button for `![Image description](<path/to/image.png>)`. Image destinations can be local file paths or HTTPS URLs. Helpers apply to the selection or insert selected placeholder text, and each helper can be undone once with **Ctrl+Z**. **Ctrl+Y** redoes it. **More…** holds overflow actions in narrow windows. Underline inserts `<u>…</u>`, which the reader supports; Markdown underscores retain their usual emphasis meaning.
 
-**Live** keeps source and formatted preview visible together and refreshes after a typing pause. Windows at least 1000 logical pixels wide use side-by-side panes; narrower windows stack them. It is optional and off when starting an edit session. **Code** wraps the selection in a fenced code block or inserts a selected placeholder.
+**Live** keeps source and formatted preview visible together and refreshes after a typing pause. Edit sessions opened in windows at least 1000 logical pixels wide start with source on the left and live preview on the right. Smaller windows start with the source/preview toggle; enabling Live manually stacks the panes. Live can be turned off at any size. **Code** wraps the selection in a fenced code block or inserts a selected placeholder.
 
 **Preview** or **Ctrl+Shift+V** shows the formatted draft; **Source** returns to editing with caret, scroll, and undo history retained. **Ctrl+F** opens Find; **Ctrl+H** opens Find/Replace, with Match case, Whole word, Replace, and Replace All. Replace All runs in the background and creates one undo step. A changed draft rejects an older replacement result.
 
@@ -67,7 +75,7 @@ Validation runs after a short typing pause and before saving. The warning list i
 
 **Ctrl+S** saves; **Ctrl+Shift+S** opens Save As. Existing encodings, BOMs, and unchanged line endings are retained; new files default to UTF-8 without BOM and Windows line endings. If the original encoding cannot represent an edit, the app asks before converting to UTF-8. Changes made by another app produce an overwrite/Save As/cancel choice. Save failures retain the draft.
 
-An asterisk marks unsaved changes. Finish editing, Escape, opening another document, New, and closing prompt to save, discard, or cancel when necessary. In preview, Escape returns to source first. Update restarts are deferred while a modified draft is open. Reading remains read-only, and editor components load only on entering edit mode.
+An asterisk marks unsaved changes. **View mode** switches from editing to reading. It prompts to save, discard, or cancel when necessary, as do Escape, opening another document, New, and closing. In preview, Escape returns to source first. Update restarts are deferred while a modified draft is open. Reading remains read-only, and editor components load only on entering edit mode.
 
 Local crash-recovery snapshots are written in the background while editing, including during continuous typing, under `%LOCALAPPDATA%\Voltura\Markdown\Recovery`. They never save over the original file. After a crash, open a new draft and choose Insert → **Recover draft**. Recovery opens an unsaved document for Save As. Drafts in a running process are excluded; successful saves, undo back to the clean baseline, explicit discard, and normal closing clear obsolete snapshots. An abrupt crash can still lose changes since the last completed checkpoint. The original file always requires explicit Save.
 
@@ -94,13 +102,15 @@ The three-dot menu provides:
 - **Open file directory** to show the document in Explorer.
 - **Edit file with…** to choose an installed editor through Windows.
 
-Edit mode checks for external file changes in the background. Insert → **Reload from disk** reloads explicitly and asks before discarding a modified draft. Saving still checks the exact disk contents for conflicts. Reading mode requires reopening the document. Windows file/app dialogs follow the system appearance.
+Edit mode checks for external file changes in the background. Insert → **Reload from disk** reloads explicitly and asks before discarding a modified draft. Saving still checks the exact disk contents for conflicts. Reading mode requires reopening the document. Menus, dialogs, and file/print pickers follow the app's light/dark theme.
 
 ## Install, update, and defaults
 
 The portable download is just `vmd.exe`. To update, close it and replace the file in the same folder.
 
 Setup installs for your account under `%LOCALAPPDATA%\Programs\Voltura Markdown`. Run newer Setup to update; use Windows **Installed apps** to uninstall. Documents and preferences are retained.
+
+The three-dot menu's **Automatic updates** option is off by default. Enable it to download newer stable releases after publisher-signature and checksum verification, then install on close. Manual updates restore unchanged open documents and reading positions; modified drafts defer update restarts.
 
 To use the reader for `.md` files, select Setup's optional **Choose as default Markdown reader**, or choose **Register for .md files** in the app. Both open the app's page in Windows Default apps where supported; otherwise, find **Voltura Markdown** in Default apps. Confirm it for **.md** files. No administrator rights are required. Keep a portable copy at a stable path and register again if you move it. **Unregister application** removes its registration.
 
