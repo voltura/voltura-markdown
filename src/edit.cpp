@@ -112,12 +112,14 @@ TextEdit insertMarkdown(std::wstring_view s, size_t start, size_t end, Insert ki
         std::wstring escapedLabel, escapedDestination;
         auto title = label.empty() ? (selected.empty() ? L"text" : selected) : std::wstring(label);
         for (auto c : title) {
-            if (c == L'[' || c == L']' || c == L'\\')
+            if (std::wstring_view(L"[]\\&<>*_`~").find(c) != std::wstring_view::npos)
                 escapedLabel += L'\\';
             escapedLabel += c;
         }
         for (auto c : destination) {
-            if (c == L' ')
+            if (c == L'&')
+                escapedDestination += L"&amp;";
+            else if (c == L' ')
                 escapedDestination += L"%20";
             else if (c == L'<')
                 escapedDestination += L"%3C";
@@ -188,14 +190,18 @@ TextEdit insertMarkdown(std::wstring_view s, size_t start, size_t end, Insert ki
                 next = lines.size();
             auto line = lines.substr(at, next - at);
             std::wstring prefix;
+            size_t indent = 0;
             if (kind == Insert::Heading) {
-                size_t n = 0;
+                while (indent < line.size() && indent < 3 && line[indent] == L' ')
+                    ++indent;
+                size_t n = indent;
                 while (n < line.size() && line[n] == L'#')
                     ++n;
-                if (n >= 1 && n <= 6 && (n == line.size() || line[n] == L' ')) {
-                    if (n < line.size())
+                if (n > indent && n - indent <= 6 &&
+                    (n == line.size() || line[n] == L' ' || line[n] == L'\t')) {
+                    while (n < line.size() && (line[n] == L' ' || line[n] == L'\t'))
                         ++n;
-                    line.erase(0, n);
+                    line.erase(indent, n - indent);
                 }
                 if (first)
                     prefix = std::wstring(std::min(first, 6u), L'#') + L" ";
@@ -208,8 +214,9 @@ TextEdit insertMarkdown(std::wstring_view s, size_t start, size_t end, Insert ki
             else if (kind == Insert::Quote)
                 prefix = L"> ";
             if (result.replacement.empty())
-                result.selection = prefix.size();
-            result.replacement += prefix + line;
+                result.selection = indent + prefix.size();
+            line.insert(indent, prefix);
+            result.replacement += line;
             if (next == lines.size())
                 break;
             result.replacement += L'\n';

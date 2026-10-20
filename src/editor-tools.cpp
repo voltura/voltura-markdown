@@ -127,9 +127,19 @@ std::vector<HeadingEntry> sourceOutline(std::wstring_view source) {
                 auto newline = at ? s.bytes.rfind('\n', at - 1) : std::string::npos;
                 s.offset = newline == std::string::npos ? 0 : newline + 1;
             }
-            if (s.title.size() < 512) {
-                auto value = fromUtf8(std::string_view(text, size));
-                s.title += type == MD_TEXT_ENTITY ? entity(value) : value;
+            if (s.title.size() < 512 && type != MD_TEXT_HTML) {
+                size_t bytes = std::min<size_t>(size, (512 - s.title.size()) * 4);
+                while (bytes < size && bytes && ((unsigned char)text[bytes] & 0xc0) == 0x80)
+                    --bytes;
+                auto value = type == MD_TEXT_SOFTBR || type == MD_TEXT_BR
+                                 ? L" "
+                                 : fromUtf8(std::string_view(text, bytes));
+                if (type == MD_TEXT_ENTITY)
+                    value = entity(value);
+                size_t count = std::min(value.size(), 512 - s.title.size());
+                if (count && count < value.size() && value[count - 1] >= 0xd800 && value[count - 1] <= 0xdbff)
+                    --count;
+                s.title.append(value, 0, count);
             }
         } catch (...) {
             s.error = std::current_exception();
@@ -157,23 +167,23 @@ std::optional<TextEdit> continueMarkdown(std::wstring_view line, size_t caret) {
     size_t quote = p;
     std::wstring marker;
     if (p + 1 < prefix.size() && (prefix[p] == '-' || prefix[p] == '+' || prefix[p] == '*') &&
-        prefix[p + 1] == ' ') {
+        (prefix[p + 1] == ' ' || prefix[p + 1] == '\t')) {
         marker = std::wstring(prefix.substr(p, 2));
         p += 2;
         if (p + 3 < prefix.size() && prefix[p] == '[' &&
             (prefix[p + 1] == ' ' || prefix[p + 1] == 'x' || prefix[p + 1] == 'X') && prefix[p + 2] == ']' &&
-            prefix[p + 3] == ' ') {
+            (prefix[p + 3] == ' ' || prefix[p + 3] == '\t')) {
             marker += L"[ ] ";
             p += 4;
         }
     } else {
         size_t digits = p;
-        while (p < prefix.size() && iswdigit(prefix[p]))
+        while (p < prefix.size() && prefix[p] >= '0' && prefix[p] <= '9')
             ++p;
         if (p > digits && p - digits <= 9 && p + 1 < prefix.size() &&
-            (prefix[p] == '.' || prefix[p] == ')') && prefix[p + 1] == ' ') {
-            marker = std::to_wstring(std::stoul(std::wstring(prefix.substr(digits, p - digits))) + 1) +
-                     prefix[p] + L" ";
+            (prefix[p] == '.' || prefix[p] == ')') && (prefix[p + 1] == ' ' || prefix[p + 1] == '\t')) {
+            auto number = std::stoul(std::wstring(prefix.substr(digits, p - digits)));
+            marker = std::to_wstring(std::min(number + 1, 999999999ul)) + prefix[p] + prefix[p + 1];
             p += 2;
         } else
             p = quote;
@@ -532,8 +542,8 @@ std::wstring replaceMatches(std::wstring_view source, std::wstring_view needle, 
             !wholeWord || ((!found || !word(source[found - 1])) &&
                            (found + query.size() == source.size() || !word(source[found + query.size()])));
         out += source.substr(at, found - at);
-        out += match ? replacement : source.substr(found, query.size());
-        at = found + query.size();
+        out += match ? replacement : source.substr(found, 1);
+        at = found + (match ? query.size() : 1);
         if (out.size() > 500000000)
             throw std::runtime_error("The replacement would make this document too large.");
     }
@@ -563,23 +573,23 @@ std::wstring rebaseLocalLinks(std::wstring_view source, const std::filesystem::p
                 return 0;
             auto attr =
                 type == MD_SPAN_A ? ((MD_SPAN_A_DETAIL *)detail)->href : ((MD_SPAN_IMG_DETAIL *)detail)->src;
-            auto begin = (uintptr_t)s.bytes.data(), pointer = (uintptr_t)attr.text;
-            if (pointer < begin || pointer + attr.size > begin + s.bytes.size())
+            auto begin = (uintptr_t)s.bytes.data(), pointer = (uintptr_t)attr.raw_text;
+            if (pointer < begin || pointer > begin + s.bytes.size() ||
+                attr.raw_size > begin + s.bytes.size() - pointer)
                 return 0;
-            auto raw = entity(fromUtf8(std::string_view(attr.text, attr.size)));
+            std::wstring raw;
+            for (size_t i = 0; attr.substr_offsets[i] < attr.size; ++i) {
+                auto part = fromUtf8(std::string_view(attr.text + attr.substr_offsets[i],
+                                                      attr.substr_offsets[i + 1] - attr.substr_offsets[i]));
+                raw += attr.substr_types[i] == MD_TEXT_ENTITY ? entity(part) : part;
+            }
             if (raw.empty() || raw[0] == '#' || raw.find(':') != raw.npos || raw.starts_with(L"//"))
                 return 0;
             auto suffix = raw.find_first_of(L"#?");
             auto path = raw.substr(0, suffix), fragment = suffix == raw.npos ? L"" : raw.substr(suffix);
-            std::wstring unescaped;
-            for (size_t i = 0; i < path.size(); ++i) {
-                if (path[i] == '\\' && i + 1 < path.size() && iswpunct(path[i + 1]))
-                    ++i;
-                unescaped += path[i];
-            }
-            std::wstring decoded(unescaped.size() + 1, L'\0');
+            std::wstring decoded(path.size() + 1, L'\0');
             DWORD n = (DWORD)decoded.size();
-            if (FAILED(UrlUnescapeW(unescaped.data(), decoded.data(), &n, URL_UNESCAPE_AS_UTF8)))
+            if (FAILED(UrlUnescapeW(path.data(), decoded.data(), &n, URL_UNESCAPE_AS_UTF8)))
                 return 0;
             decoded.resize(n);
             std::filesystem::path target(decoded);
@@ -603,7 +613,25 @@ std::wstring rebaseLocalLinks(std::wstring_view source, const std::filesystem::p
                 else
                     encoded += c;
             }
-            s.replacements[(size_t)(pointer - begin)] = {attr.size, toUtf8(encoded + fragment)};
+            for (auto c : fragment) {
+                if (c == '&')
+                    encoded += L"&amp;";
+                else if (c == '(')
+                    encoded += L"%28";
+                else if (c == ')')
+                    encoded += L"%29";
+                else if (c == '<')
+                    encoded += L"%3C";
+                else if (c == '>')
+                    encoded += L"%3E";
+                else if (c == ' ')
+                    encoded += L"%20";
+                else if (c == '\\')
+                    encoded += L"%5C";
+                else
+                    encoded += c;
+            }
+            s.replacements[(size_t)(pointer - begin)] = {attr.raw_size, toUtf8(encoded)};
         } catch (...) {
             s.error = std::current_exception();
             return 1;
@@ -1369,9 +1397,16 @@ std::vector<DraftRecovery::Draft> DraftRecovery::list() {
             continue;
         auto filename = entry.path().filename().wstring();
         auto dash = filename.find('-');
-        if (dash != filename.npos && dash < 11 &&
+        if (dash != filename.npos &&
             filename.substr(0, dash).find_first_not_of(L"0123456789") == filename.npos) {
-            DWORD pid = std::stoul(filename.substr(0, dash));
+            if (!dash || dash > 10)
+                continue;
+            uint64_t value = 0;
+            for (size_t i = 0; i < dash; ++i)
+                value = value * 10 + (filename[i] - L'0');
+            if (value > MAXDWORD)
+                continue;
+            DWORD pid = (DWORD)value;
             HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
             if (process) {
                 auto live = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;

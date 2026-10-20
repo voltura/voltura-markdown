@@ -75,6 +75,61 @@ int main(int argc, char **argv) {
     try {
         std::filesystem::create_directory(folder);
         {
+            unsigned failures = 0;
+            auto check = [&](bool ok, const char *message) {
+                if (!ok) {
+                    std::cerr << "REGRESSION: " << message << '\n';
+                    ++failures;
+                }
+            };
+            std::atomic_bool cancel = false;
+            check(replaceMatches(L"xa a a", L"a a", L"Z", true, true, cancel) == L"xa Z",
+                  "whole-word replacement finds overlapping candidates after a rejected match");
+            check(insertMarkdown(L"  ##\tTitle", 0, 10, Insert::Heading, 1).replacement == L"  # Title",
+                  "heading conversion recognizes indentation and tab separators");
+            auto inserted = insertMarkdown(L"", 0, 0, Insert::Link, 0, 0, L"<name> &copy; *literal*",
+                                           L"https://example.com");
+            check(parse(inserted.replacement).text == L"<name> &copy; *literal*\n",
+                  "inserted link labels preserve literal markup and entities");
+            inserted =
+                insertMarkdown(L"", 0, 0, Insert::Link, 0, 0, L"label", L"https://example.com/?x=1&copy;=2");
+            auto linked = parse(inserted.replacement);
+            check(linked.blocks.front().runs.front().link == L"https://example.com/?x=1&copy;=2",
+                  "inserted destinations preserve entity-like query parameters");
+            auto rebased = parse(rebaseLocalLinks(L"[label](other.md#x&amp;copy;)", folder / L"source.md",
+                                                  folder / L"sub/copy.md"));
+            check(rebased.blocks.front().runs.front().link == L"../other.md#x&copy;",
+                  "Save As preserves entity-like fragments");
+            auto outline = sourceOutline(L"# <u>Title</u>\n");
+            check(outline.size() == 1 && outline[0].title == L"Title", "outline omits inline HTML tags");
+            outline = sourceOutline(L"First\nsecond\n---\n");
+            check(outline.size() == 1 && outline[0].title == L"First second",
+                  "multiline heading outline uses readable spacing");
+            outline = sourceOutline(L"# " + std::wstring(4096, L'a') + L"\n");
+            check(outline.size() == 1 && outline[0].title.size() <= 512,
+                  "outline bounds long heading labels");
+            auto next = continueMarkdown(L"-\titem", 6);
+            check(next && next->replacement == L"\n-\t", "list continuation recognizes tab separators");
+            next = continueMarkdown(L"999999999. item", 15);
+            check(next && next->replacement == L"\n999999999. ",
+                  "ordered continuation stays within Markdown's nine-digit limit");
+            require(!failures, "editor helper regressions");
+            auto reference =
+                rebaseLocalLinks(L"[one][id] [two][id] `other&amp;file.md`\n\n[id]: other&amp;file.md\n",
+                                 folder / L"source.md", folder / L"sub/copy.md");
+            require(reference == L"[one][id] [two][id] `other&amp;file.md`\n\n[id]: ../other%26file.md\n",
+                    "Save As rewrites a shared entity-bearing reference once and preserves code");
+            auto escaped = rebaseLocalLinks(L"[file](a\\(b\\).md#part\\))", folder / L"source.md",
+                                            folder / L"sub/copy.md");
+            require(escaped == L"[file](../a%28b%29.md#part%29)",
+                    "Save As retains escaped delimiters in filenames and fragments");
+            outline = sourceOutline(L"# " + std::wstring(511, L'a') + L"😀\n");
+            require(outline.size() == 1 && outline[0].title == std::wstring(511, L'a'),
+                    "outline truncation never splits a surrogate pair");
+            next = continueMarkdown(L"2)\titem", 7);
+            require(next && next->replacement == L"\n3)\t", "ordered lists preserve tab separators");
+        }
+        {
             auto outline = sourceOutline(
                 L"# Heading    \n---\n\nå😀\n===\n\n```\n# hidden\n```\n\n> ## Quoted\n\n- ### Listed\n");
             require(outline.size() == 4 && outline[0].title == L"Heading" && outline[1].title == L"å😀" &&
@@ -258,6 +313,20 @@ int main(int argc, char **argv) {
                         DraftRecovery::read(drafts[0].snapshot).text == L"recover å😀" &&
                         drafts[0].original == folder / L"source.md",
                     "recovery preserves Unicode and original path");
+            auto malformed = snapshot.parent_path() / L"9999999999-invalid.draft";
+            std::filesystem::copy_file(snapshot, malformed);
+            require(DraftRecovery::list().size() == 1,
+                    "out-of-range recovery process IDs do not hide valid drafts");
+            std::filesystem::remove(malformed);
+            malformed = snapshot.parent_path() / L"-invalid.draft";
+            std::filesystem::copy_file(snapshot, malformed);
+            require(DraftRecovery::list().size() == 1, "empty recovery process IDs do not hide valid drafts");
+            std::filesystem::remove(malformed);
+            malformed = snapshot.parent_path() / L"999999999999999999999-invalid.draft";
+            std::filesystem::copy_file(snapshot, malformed);
+            require(DraftRecovery::list().size() == 1,
+                    "overlong recovery process IDs are not offered as orphaned drafts");
+            std::filesystem::remove(malformed);
             state->clear(true);
             state->write(L"stale", {});
             require(!std::filesystem::exists(snapshot),

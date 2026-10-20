@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.1 — 2026-10-20
+
+- Preserves literal link labels and destinations and local links during Save As.
+- Fixes heading conversion, outline labels, tab-separated list continuation, and overlapping whole-word replacements.
+- Ignores malformed recovery filenames without hiding valid drafts.
+
 ## 1.3.0 — 2026-10-19
 
 - Adds complete code-block copying, basic syntax coloring for common language labels, inline-code backgrounds, and colored links with destination hover feedback.

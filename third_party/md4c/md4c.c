@@ -1591,6 +1591,8 @@ md_build_attribute(MD_CTX* ctx, const CHAR* raw_text, SZ raw_size,
     attr->size = off;
     attr->substr_offsets = build->substr_offsets;
     attr->substr_types = build->substr_types;
+    attr->raw_text = raw_text;
+    attr->raw_size = raw_size;
     return 0;
 
 abort:

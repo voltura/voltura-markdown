@@ -289,6 +289,10 @@ typedef struct MD_ATTRIBUTE {
     MD_SIZE size;
     const MD_TEXTTYPE* substr_types;
     const MD_OFFSET* substr_offsets;
+    /* Voltura extension: original spelling for source-preserving editor changes.
+     * Valid for the same callback lifetime as text. */
+    const MD_CHAR* raw_text;
+    MD_SIZE raw_size;
 } MD_ATTRIBUTE;
 
 
