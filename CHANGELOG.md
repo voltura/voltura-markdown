@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.5 - 2026-10-20
+
+- Add a themed, draggable divider to resize side-by-side and stacked Live editor panes.
+- Keep preview resizing smooth and clear stale text fragments from the margin beside the source scrollbar.
+- Make Shift+Enter insert a Markdown source newline so code fences and line numbers remain aligned.
+
 ## 1.3.4 - 2026-10-20
 
 - Add an integrated Find bar with match counts, previous/next controls, and match markers in the scrollbar.

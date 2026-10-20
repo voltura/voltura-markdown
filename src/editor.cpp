@@ -529,6 +529,81 @@ void Editor::theme(bool isDark, unsigned scale) {
 int Editor::headerHeight() const {
     return MulDiv(expanded ? 150 : 42, dpi, 96);
 }
+int Editor::splitPosition(int width, int height) const {
+    bool vertical = width >= MulDiv(1000, dpi, 96);
+    int length = vertical ? width : std::max(1, height - headerHeight());
+    int minimum = std::min(length / 2, MulDiv(vertical ? 240 : 120, dpi, 96));
+    return (vertical ? 0 : headerHeight()) +
+           std::clamp((int)(length * (vertical ? splitWidth : splitHeight)), minimum, length - minimum);
+}
+RECT Editor::splitBounds() const {
+    RECT r{};
+    if (!live || preview) return r;
+    GetClientRect(panel, &r);
+    int middle = splitPosition(r.right, r.bottom), half = MulDiv(4, dpi, 96);
+    if (r.right >= MulDiv(1000, dpi, 96))
+        return {middle - half, headerHeight(), middle + half, r.bottom};
+    return {0, middle - half, r.right, middle + half};
+}
+RECT Editor::splitMargin() const {
+    auto margin = splitBounds();
+    if (IsRectEmpty(&margin)) return margin;
+    RECT source{}, panelBounds{};
+    GetWindowRect(input, &source);
+    MapWindowPoints(nullptr, panel, (POINT *)&source, 2);
+    GetClientRect(panel, &panelBounds);
+    if (panelBounds.right >= MulDiv(1000, dpi, 96))
+        margin.left = std::min(margin.left, source.right);
+    else
+        margin.top = std::min(margin.top, source.bottom);
+    return margin;
+}
+void Editor::paintSplit(HDC target) const {
+    auto bounds = splitBounds();
+    if (IsRectEmpty(&bounds)) return;
+    RECT panelBounds{};
+    GetClientRect(panel, &panelBounds);
+    bool vertical = panelBounds.right >= MulDiv(1000, dpi, 96);
+    int thickness = std::max(1, MulDiv(1, dpi, 96));
+    auto track = scrollTrack(input, vertical ? SB_VERT : SB_HORZ);
+    SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE};
+    SCROLLBARINFO state{sizeof(state)};
+    bool unavailable = GetScrollBarInfo(input, vertical ? OBJID_VSCROLL : OBJID_HSCROLL, &state) &&
+                       (state.rgstate[0] & STATE_SYSTEM_UNAVAILABLE);
+    bool scrollbar = !unavailable && (vertical ? track.right > track.left : track.bottom > track.top) &&
+                     GetScrollInfo(input, vertical ? SB_VERT : SB_HORZ, &info) &&
+                     info.nMax - info.nMin + 1 > (int)info.nPage;
+    std::array<int64_t, 7> key{bounds.left, bounds.top, bounds.right, bounds.bottom, dark, scrollbar, dpi};
+    if (!target && paintedSplit == key) return;
+    HDC destination = target ? target : GetDC(panel);
+    if (!destination) return;
+    {
+        // The native scrollbar ends before the grip's hit area. Own the whole
+        // intervening margin so no document pixels survive a move/no-erase paint.
+        auto margin = splitMargin();
+        ChromePaint buffered(destination, margin);
+        auto dc = buffered.dc();
+        FillRect(dc, &margin, background);
+        int x = (bounds.left + bounds.right) / 2, y = (bounds.top + bounds.bottom) / 2;
+        auto border = CreateSolidBrush(dark ? RGB(48, 58, 73) : RGB(220, 226, 235));
+        if (!scrollbar) {
+            RECT line = vertical ? RECT{x, bounds.top, x + thickness, bounds.bottom}
+                                 : RECT{bounds.left, y, bounds.right, y + thickness};
+            FillRect(dc, &line, border);
+        }
+        DeleteObject(border);
+        auto grip = CreateSolidBrush(dark ? RGB(146, 158, 175) : RGB(102, 117, 138));
+        for (int i = -1; i <= 1; ++i) {
+            int offset = MulDiv(i * 5, dpi, 96), size = std::max(2, MulDiv(2, dpi, 96));
+            RECT dot = vertical ? RECT{x - size / 2, y + offset, x - size / 2 + size, y + offset + size}
+                                : RECT{x + offset, y - size / 2, x + offset + size, y - size / 2 + size};
+            FillRect(dc, &dot, grip);
+        }
+        DeleteObject(grip);
+    }
+    paintedSplit = key;
+    if (!target) ReleaseDC(panel, destination);
+}
 RECT Editor::previewBounds(int top) const {
     RECT r;
     GetClientRect(owner, &r);
@@ -536,9 +611,9 @@ RECT Editor::previewBounds(int top) const {
     if (live) {
         int gap = MulDiv(8, dpi, 96);
         if (r.right >= MulDiv(1000, dpi, 96))
-            r.left = r.right / 2 + gap / 2;
+            r.left = splitPosition(r.right, r.bottom - top) + gap / 2;
         else
-            r.top += std::max(1L, r.bottom - r.top) / 2 + gap / 2;
+            r.top = top + splitPosition(r.right, r.bottom - top) + gap / 2;
     }
     return r;
 }
@@ -606,9 +681,9 @@ void Editor::layout() {
     int sourceHeight = std::max(1L, r.bottom - headerHeight() - px(8));
     if (live) {
         if (r.right >= px(1000))
-            sourceWidth = std::max(1L, r.right / 2 - px(20));
+            sourceWidth = std::max(1, splitPosition(r.right, r.bottom) - px(20));
         else
-            sourceHeight = std::max(1L, (r.bottom - headerHeight()) / 2 - px(8));
+            sourceHeight = std::max(1, splitPosition(r.right, r.bottom) - headerHeight() - px(8));
     }
     RECT sourceBounds{};
     GetWindowRect(input, &sourceBounds);
@@ -2541,8 +2616,17 @@ bool Editor::key(WPARAM key) {
         SendMessageW(input, EM_PASTESPECIAL, CF_UNICODETEXT, 0);
         return true;
     }
-    if (!ctrl && !shift && key == VK_RETURN && GetFocus() == input && smartEnter())
-        return true;
+    if (!ctrl && key == VK_RETURN && GetFocus() == input) {
+        if (shift) {
+            // Rich Edit's soft break is not a Markdown line boundary. Keep source
+            // paragraphs and fence parsing aligned, without smart list continuation.
+            if (ready && !saving && !preview)
+                SendMessageW(input, EM_REPLACESEL, TRUE, (LPARAM)L"\r");
+            return true;
+        }
+        if (smartEnter())
+            return true;
+    }
     if (ctrl && shift) {
         if (key >= '0' && key <= '6') {
             insert(Insert::Heading, (unsigned)(key - '0'));
@@ -2753,8 +2837,10 @@ void Editor::paintScrollbars(HWND window, HDC target) const {
     RestoreDC(dc, saved);
     if (!target)
         ReleaseDC(panel, dc);
-    if (window == input && !target)
+    if (window == input && !target) {
         paintLineNumbers();
+        paintSplit();
+    }
 }
 void Editor::paintLineNumbers(HDC target) const {
     if (!input || preview || !(GetWindowLongW(input, GWL_STYLE) & WS_VISIBLE))
@@ -3028,6 +3114,7 @@ LRESULT Editor::message(UINT msg, WPARAM wp, LPARAM lp) {
             RestoreDC(dc, saved);
         }
         paintLineNumbers(dc);
+        paintSplit(dc);
         if (msg == WM_PAINT)
             EndPaint(panel, &paint);
         return 0;
@@ -3035,6 +3122,12 @@ LRESULT Editor::message(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        auto split = splitBounds();
+        if (PtInRect(&split, point)) {
+            draggingSplit = true;
+            SetCapture(panel);
+            return 0;
+        }
         ClientToScreen(panel, &point);
         for (auto window : {input, warningList}) {
             if (!(GetWindowLongW(window, GWL_STYLE) & WS_VISIBLE))
@@ -3069,7 +3162,42 @@ LRESULT Editor::message(UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
+    case WM_SETCURSOR: {
+        POINT point{};
+        GetCursorPos(&point);
+        ScreenToClient(panel, &point);
+        auto split = splitBounds();
+        if (draggingSplit || PtInRect(&split, point)) {
+            RECT r{};
+            GetClientRect(panel, &r);
+            SetCursor(LoadCursorW(nullptr, r.right >= MulDiv(1000, dpi, 96) ? IDC_SIZEWE : IDC_SIZENS));
+            return TRUE;
+        }
+        break;
+    }
     case WM_MOUSEMOVE:
+        if (draggingSplit) {
+            auto previous = splitBounds();
+            auto previousMargin = splitMargin();
+            RECT r{};
+            GetClientRect(panel, &r);
+            if (r.right >= MulDiv(1000, dpi, 96))
+                splitWidth = std::clamp((double)GET_X_LPARAM(lp) / std::max(1L, r.right), .1, .9);
+            else
+                splitHeight = std::clamp((double)(GET_Y_LPARAM(lp) - headerHeight()) /
+                                         std::max(1L, r.bottom - headerHeight()), .1, .9);
+            auto requested = splitBounds();
+            if (EqualRect(&previous, &requested)) return 0;
+            SendMessageW(owner, EditorResizeSplit, 0, 0);
+            auto next = splitMargin();
+            RECT dirty{};
+            UnionRect(&dirty, &previousMargin, &next);
+            // Clear the old grip and newly exposed margin, without invalidating
+            // the toolbar or exposing an erased source pane between frames.
+            InvalidateRect(panel, &dirty, FALSE);
+            RedrawWindow(panel, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
+            return 0;
+        }
         if (scrollWindow) {
             POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ClientToScreen(panel, &point);
@@ -3080,6 +3208,11 @@ LRESULT Editor::message(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONUP:
     case WM_CANCELMODE:
     case WM_CAPTURECHANGED:
+        if (draggingSplit) {
+            draggingSplit = false;
+            if (msg != WM_CAPTURECHANGED && GetCapture() == panel) ReleaseCapture();
+            return 0;
+        }
         if (scrollWindow) {
             auto window = scrollWindow;
             scrollWindow = nullptr;
@@ -3519,6 +3652,47 @@ void Editor::verify() {
                 "060 native outline sizing does not allocate a shortcut badge for heading tabs");
     }
     theme(false, 96);
+    {
+        struct KeyboardState {
+            BYTE saved[256]{};
+            KeyboardState() { GetKeyboardState(saved); }
+            ~KeyboardState() { SetKeyboardState(saved); }
+        } keyboard;
+        BYTE keys[256]{};
+        keys[VK_SHIFT] = 0x80;
+        SetKeyboardState(keys);
+        SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"");
+        SetFocus(input);
+        const std::wstring sample = L"# test\n\n```json\n{\n\t\"sip\": \"sop\",\n\t\"hip: \"hop\"\n}\n```\n\nsdfdf\n";
+        for (auto character : sample) {
+            if (character == L'\n')
+                SendMessageW(input, WM_KEYDOWN, VK_RETURN, 1);
+            SendMessageW(input, WM_CHAR, character == L'\n' ? L'\r' : character, 1);
+        }
+        captureText();
+        require(cachedText == sample, "Shift+Enter inserts Markdown source newlines");
+        auto typed = parse(cachedText);
+        require(typed.blocks.size() == 3 && typed.blocks[1].kind == Kind::Code,
+                "Shift+Enter JSON fence parses as a code block rather than inline code");
+        auto count = SendMessageW(input, EM_GETLINECOUNT, 0, 0);
+        require(count == 11, "Shift+Enter keeps source line numbers aligned");
+        SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"- item");
+        CHARRANGE selection{6, 6};
+        SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&selection);
+        SendMessageW(input, WM_KEYDOWN, VK_RETURN, 1);
+        SendMessageW(input, WM_CHAR, L'\r', 1);
+        captureText();
+        require(cachedText == L"- item\n", "Shift+Enter does not continue list markers");
+        SendMessageW(input, EM_UNDO, 0, 0);
+        captureText();
+        require(cachedText == L"- item", "Shift+Enter newline supports undo");
+        selection = {2, 6};
+        SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&selection);
+        SendMessageW(input, WM_KEYDOWN, VK_RETURN, 1);
+        SendMessageW(input, WM_CHAR, L'\r', 1);
+        captureText();
+        require(cachedText == L"- \n", "Shift+Enter replaces the selection with a source newline");
+    }
     SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"    alpha");
     SetFocus(input);
     CHARRANGE outdentCaret{6, 6};

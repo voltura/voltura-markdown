@@ -10,7 +10,8 @@
 namespace vm {
 constexpr UINT EditorLayout = WM_APP + 30, EditorPreview = WM_APP + 31, EditorSaved = WM_APP + 32,
                EditorFinish = WM_APP + 33, EditorChanged = WM_APP + 34, EditorScroll = WM_APP + 35,
-               EditorFind = WM_APP + 36, EditorReplace = WM_APP + 37, EditorFindKey = WM_APP + 38;
+               EditorFind = WM_APP + 36, EditorReplace = WM_APP + 37, EditorFindKey = WM_APP + 38,
+               EditorResizeSplit = WM_APP + 39;
 class Editor {
     struct Job;
     struct Auxiliary;
@@ -28,6 +29,13 @@ class Editor {
     void trackCapture(size_t start, size_t oldEnd, size_t newEnd);
     bool needsFirstSave = false;
     bool live = false, sourceWrapped = false;
+    double splitWidth = .5, splitHeight = .5;
+    bool draggingSplit = false;
+    int splitPosition(int width, int height) const;
+    RECT splitBounds() const;
+    RECT splitMargin() const;
+    void paintSplit(HDC dc = nullptr) const;
+    mutable std::optional<std::array<int64_t, 7>> paintedSplit;
     bool suppressCharacter = false;
     HWND scrollWindow = nullptr;
     bool settingScrollRegion = false;

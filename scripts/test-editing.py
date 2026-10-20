@@ -266,6 +266,156 @@ for accept in (False, True):
         wait(lambda: u.IsWindowVisible(canvas) and u.IsWindowVisible(edit), "default wide live preview")
         assert text(u.GetDlgItem(panel, 12)) == "Live: on"
         assert not path.exists(), "Create must defer disk writes until Save"
+        code_source = '# test\n\n```json\n{\n\t"sip": "sop",\n\t"hip: "hop"\n}\n```\n\nsdfdf\n'
+        for entry in ("typed", "pasted"):
+            set_text(edit, "")
+            previous_rows = len(metrics.read_text().splitlines())
+            if entry == "typed":
+                for character in code_source:
+                    if character == "\n":
+                        u.SendMessageW(edit, 0x0100, 13, 1)
+                    u.SendMessageW(edit, 0x0102, 13 if character == "\n" else ord(character), 1)
+                    time.sleep(0.01)
+            else:
+                value = c.create_unicode_buffer(code_source)
+                u.SendMessageW(edit, 0x00C2, 1, c.cast(value, c.c_void_p).value)
+            assert text(edit) == code_source, (entry, repr(text(edit)))
+            def code_painted():
+                rows = [json.loads(line) for line in metrics.read_text().splitlines()[previous_rows:]
+                        if line.endswith("}")]
+                return any(row.get("source_units") == len(code_source) and row.get("code_blocks") == 1
+                           and row.get("full_width_code_blocks") == 1
+                           and row.get("code_buttons") == 1 for row in rows)
+            wait(code_painted, f"{entry} JSON fence has a block and copy button")
+            for mode in ("dark", "light"):
+                if mode == "light":
+                    command(hwnd, 103)
+                    time.sleep(0.15)
+                capture(f"code-{entry}-{mode}.png")
+                if args.capture:
+                    from PIL import Image
+                    u.SendMessageW(canvas, 0x802D, 0, 0)
+                    frame, canvas_rect = w.RECT(), w.RECT()
+                    u.GetWindowRect(hwnd, c.byref(frame))
+                    u.GetWindowRect(canvas, c.byref(canvas_rect))
+                    image_path = folder / f"code-{entry}-{mode}.png"
+                    with Image.open(image_path) as screenshot, Image.open(str(metrics) + ".canvas.bmp") as preview:
+                        screenshot.paste(preview, (canvas_rect.left - frame.left, canvas_rect.top - frame.top))
+                        screenshot.save(image_path)
+            command(hwnd, 103)
+        set_text(edit, "")
+        print("PASS: typed and pasted JSON fences render a code block with a copy button")
+        # Exercise the actual split handle in both layouts and themes, before typing.
+        def bounds_in_panel(window):
+            rect = w.RECT()
+            u.GetWindowRect(window, c.byref(rect))
+            u.MapWindowPoints(None, panel, c.byref(rect), 2)
+            return rect
+
+        u.GetClientRect.argtypes = [w.HWND, c.POINTER(w.RECT)]
+        u.MapWindowPoints.argtypes = [w.HWND, w.HWND, c.c_void_p, w.UINT]
+        for width, height, vertical in ((1100, 780, True), (850, 780, False)):
+            resize_window(width, height)
+            time.sleep(0.15)
+            for night in (True, False):
+                if not night:
+                    command(hwnd, 103)
+                time.sleep(0.1)
+                panel_rect = w.RECT()
+                u.GetClientRect(panel, c.byref(panel_rect))
+                before = bounds_in_panel(canvas)
+                gap = round(4 * u.GetDpiForWindow(hwnd) / 96)
+                x = before.left - gap if vertical else panel_rect.right // 2
+                y = (before.top + before.bottom) // 2 if vertical else before.top - gap
+                delta = round(80 * u.GetDpiForWindow(hwnd) / 96)
+                end_x, end_y = (x + delta, y) if vertical else (x, y + delta)
+                def drag(start_x, start_y, finish_x, finish_y):
+                    u.SendMessageW(panel, 0x0201, 1, start_x | (start_y << 16))
+                    u.SendMessageW(panel, 0x0200, 1, finish_x | (finish_y << 16))
+                    u.SendMessageW(panel, 0x0202, 0, finish_x | (finish_y << 16))
+                drag(x, y, end_x, end_y)
+                after = bounds_in_panel(canvas)
+                movement = after.left - before.left if vertical else after.top - before.top
+                assert abs(movement - delta) <= 2, "split grip must resize the preview"
+                assert text(edit) == "", "split drag must not edit the draft"
+                time.sleep(0.1)
+                capture(f"split-{'vertical' if vertical else 'horizontal'}-{'dark' if night else 'light'}.png")
+                if args.capture:
+                    # PrintWindow cannot capture the D2D child. Composite its
+                    # software-rendered test capture into the native chrome image.
+                    from PIL import Image
+                    u.SendMessageW(canvas, 0x802D, 0, 0)
+                    canvas_image = Image.open(str(metrics) + ".canvas.bmp")
+                    frame, canvas_rect = w.RECT(), w.RECT()
+                    u.GetWindowRect(hwnd, c.byref(frame))
+                    u.GetWindowRect(canvas, c.byref(canvas_rect))
+                    image_path = folder / f"split-{'vertical' if vertical else 'horizontal'}-{'dark' if night else 'light'}.png"
+                    with Image.open(image_path) as screenshot:
+                        screenshot.paste(canvas_image, (canvas_rect.left - frame.left, canvas_rect.top - frame.top))
+                        screenshot.save(image_path)
+                drag(end_x, end_y, x, y)
+                # Watch every resize step with populated content. An intermediate
+                # full-window canvas move can copy source pixels into the preview.
+                set_text(edit, code_source)
+                time.sleep(0.5)
+                def probe(index):
+                    return u.SendMessageW(hwnd, 0x802E, index, 0)
+                u.SendMessageW(panel, 0x0201, 1, x | (y << 16))
+                for step in list(range(1, 17)) + list(range(15, -1, -1)):
+                    move_x = x + round(delta * step / 16) if vertical else x
+                    move_y = y if vertical else y + round(delta * step / 16)
+                    viewport = probe(3)
+                    u.SendMessageW(panel, 0x0200, 1, move_x | (move_y << 16))
+                    assert probe(0) == 1, "drag must move the canvas directly to its final bounds"
+                    assert probe(1) == 1, (
+                        "drag must present one completed preview before returning", vertical, night, step,
+                        probe(0), probe(1),
+                    )
+                    assert probe(2) == 0, "resize must keep formatted preview active"
+                    assert probe(3) == viewport, "split drag must not relayout the whole application"
+                    assert u.SendMessageW(hwnd, 0x8029, 0, 0) == 1, "each drag frame needs a matching D2D buffer"
+                u.SendMessageW(panel, 0x0202, 0, x | (y << 16))
+                assert text(edit) == code_source, "rapid resizing must preserve the source"
+                # Emulate stale document pixels left behind by a moved pane.
+                # A normal paint (without WM_ERASEBKGND) must clear the whole
+                # margin, including the space between the scrollbar and grip.
+                source_rect, preview_rect = bounds_in_panel(edit), bounds_in_panel(canvas)
+                margin = (
+                    w.RECT(source_rect.right, source_rect.top, preview_rect.left, panel_rect.bottom)
+                    if vertical else
+                    w.RECT(0, source_rect.bottom, panel_rect.right, preview_rect.top)
+                )
+                g = c.WinDLL("gdi32")
+                g.CreateSolidBrush.argtypes = [w.DWORD]
+                g.CreateSolidBrush.restype = w.HBRUSH
+                g.DeleteObject.argtypes = [w.HANDLE]
+                g.GetPixel.argtypes = [w.HDC, c.c_int, c.c_int]
+                g.GetPixel.restype = w.DWORD
+                u.GetDC.argtypes = [w.HWND]
+                u.GetDC.restype = w.HDC
+                u.ReleaseDC.argtypes = [w.HWND, w.HDC]
+                u.FillRect.argtypes = [w.HDC, c.POINTER(w.RECT), w.HBRUSH]
+                u.InvalidateRect.argtypes = [w.HWND, c.POINTER(w.RECT), w.BOOL]
+                u.UpdateWindow.argtypes = [w.HWND]
+                dc = u.GetDC(panel)
+                poison = g.CreateSolidBrush(0xFF00FF)
+                u.FillRect(dc, c.byref(margin), poison)
+                g.DeleteObject(poison)
+                u.ReleaseDC(panel, dc)
+                u.InvalidateRect(panel, c.byref(margin), False)
+                u.UpdateWindow(panel)
+                dc = u.GetDC(panel)
+                sample_x = margin.left + 1 if vertical else margin.right // 3
+                sample_y = margin.top + 20 if vertical else margin.top + 1
+                actual = g.GetPixel(dc, sample_x, sample_y)
+                u.ReleaseDC(panel, dc)
+                expected = 0x191310 if night else 0xFDFBFA
+                assert actual == expected, ("divider margin retains stale document pixels", vertical, night, hex(actual))
+                set_text(edit, "")
+                time.sleep(0.5)
+            command(hwnd, 103)  # Restore dark theme.
+        resize_window(1100, 780)
+        print("PASS: split grips resize both layouts/themes with one final canvas move and completed preview per drag step")
         navigation_source = (
             "[Jump](#%64estination-1)\n\n## Destination\n\n" + "Paragraph before destination.\n\n" * 200
         )

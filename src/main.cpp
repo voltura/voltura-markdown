@@ -220,6 +220,9 @@ struct App {
     size_t pressedCode = SIZE_MAX, copiedCode = SIZE_MAX;
     ULONGLONG copiedCodeUntil = 0;
     unsigned viewportUpdates = 0;
+#ifdef VMD_TESTING
+    unsigned canvasMoves = 0, canvasPaints = 0, splitFrameMoves = 0, splitFramePaints = 0;
+#endif
     int scrollDrag = 0;
     float dragStart = 0;
     double dragScroll = 0;
@@ -590,8 +593,14 @@ struct App {
             return DefWindowProcW(w, msg, wp, lp);
 #ifdef VMD_TESTING
         if (msg == WM_APP + 45) { a->printCanvas(); return 0; }
+        if (msg == WM_WINDOWPOSCHANGED) {
+            auto &position = *(WINDOWPOS *)lp;
+            if (!(position.flags & SWP_NOMOVE) || !(position.flags & SWP_NOSIZE))
+                ++a->canvasMoves;
+        }
 #endif
         if (msg == WM_PAINT) {
+            VMD_TEST_ONLY(++a->canvasPaints;)
             a->paint();
             return 0;
         }
@@ -2006,7 +2015,13 @@ struct App {
                 out << "{\"edit_preview_painted\":true,\"source\":" << source
                     << ",\"first_kind\":" << (int)doc->blocks.front().kind
                     << ",\"source_units\":" << doc->source.size() << ",\"live\":" << editor->isLive()
-                    << ",\"source_focus\":" << editor->sourceFocused() << "}\n";
+                    << ",\"source_focus\":" << editor->sourceFocused()
+                    << ",\"code_blocks\":" << std::count_if(doc->blocks.begin(), doc->blocks.end(),
+                           [](const auto &b) { return b.kind == Kind::Code; })
+                    << ",\"full_width_code_blocks\":" << std::count_if(cache.begin(), cache.end(),
+                           [&](const auto &item) { return doc->blocks[item.first].kind == Kind::Code &&
+                               !item.second.plain && item.second.width >= contentWidth() - .1f; })
+                    << ",\"code_buttons\":" << codeButtons.size() << "}\n";
             }
         }
 #endif
@@ -2492,6 +2507,26 @@ struct App {
         zoomExpanded = std::abs(zoom - 1.f) > .001f || GetTickCount64() < zoomUntil;
         zoomVisibility();
     }
+    void positionCanvas(const RECT &bounds) {
+        canvasLeft = bounds.left / scale();
+        width = std::max(1.f, (bounds.right - bounds.left) / scale() - 12);
+        RECT current{};
+        GetWindowRect(canvas, &current);
+        MapWindowPoints(nullptr, hwnd, (POINT *)&current, 2);
+        if (!EqualRect(&current, &bounds))
+            SetWindowPos(canvas, nullptr, bounds.left, bounds.top,
+                         std::max(1L, bounds.right - bounds.left),
+                         std::max(1L, bounds.bottom - bounds.top),
+                         SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOCOPYBITS);
+        if (target) {
+            auto size = D2D1::SizeU(std::max(1L, bounds.right - bounds.left),
+                                  std::max(1L, bounds.bottom - bounds.top));
+            auto currentSize = target->GetPixelSize();
+            if (currentSize.width != size.width || currentSize.height != size.height)
+                target->Resize(size);
+            target->SetTransform(D2D1::Matrix3x2F::Translation(0, -top));
+        }
+    }
     void positions() {
         RECT r;
         GetClientRect(hwnd, &r);
@@ -2506,34 +2541,20 @@ struct App {
                        (int)(34 * scale()), (int)(34 * scale()), TRUE);
         positionZoomOverlay();
         positionAssociation();
-        if (canvas)
-            MoveWindow(canvas, 0, (int)(top * scale()), r.right,
-                       std::max<LONG>(1, r.bottom - (int)(top * scale())), FALSE);
+        RECT canvasBounds{0, (LONG)(top * scale()), r.right, r.bottom};
         if (editor && !informationView) {
             editor->position((int)(headerBottom() * scale()));
             bool visible = editor->isPreview() || editor->isLive();
             ShowWindow(canvas, visible ? SW_SHOWNA : SW_HIDE);
             if (visible) {
-                auto bounds = editor->previewBounds((int)(headerBottom() * scale()));
-                canvasLeft = bounds.left / scale();
-                top = bounds.top / scale();
-                width = std::max(1.f, (bounds.right - bounds.left) / scale() - 12);
-                SetWindowPos(canvas, HWND_TOP, bounds.left, bounds.top,
-                             std::max(1L, bounds.right - bounds.left),
-                             std::max(1L, bounds.bottom - bounds.top), SWP_NOACTIVATE);
+                canvasBounds = editor->previewBounds((int)(headerBottom() * scale()));
+                top = canvasBounds.top / scale();
+                SetWindowPos(canvas, HWND_TOP, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
             }
         }
-        if (target) {
-            // Mode changes resize the canvas without resizing the parent window.
-            // Keep its backing buffer in sync or D2D stretches the old preview frame.
-            RECT bounds{};
-            GetClientRect(canvas, &bounds);
-            auto size = D2D1::SizeU(bounds.right, bounds.bottom);
-            auto current = target->GetPixelSize();
-            if (current.width != size.width || current.height != size.height)
-                target->Resize(size);
-            target->SetTransform(D2D1::Matrix3x2F::Translation(0, -top));
-        }
+        if (canvas)
+            positionCanvas(canvasBounds);
         positionZoomOverlay();
         invalidateHeader();
         positionSearch();
@@ -5855,6 +5876,14 @@ In the **three-dot menu**:
             }
             return 0;
 #ifdef VMD_TESTING
+        case WM_APP + 46:
+            switch (wp) {
+            case 0: return splitFrameMoves;
+            case 1: return splitFramePaints;
+            case 2: return source;
+            case 3: return viewportUpdates;
+            }
+            return 0;
         case WM_APP + 40:
             // Private-desktop scroll regression probe; absent from vmd.exe.
             return (LRESULT)std::llround(previewSourcePosition()) + 1;
@@ -5913,6 +5942,24 @@ In the **three-dot menu**:
         case EditorFindKey:
             if (wp == VK_ESCAPE && !searching) return 0;
             key(wp); return 1;
+        case EditorResizeSplit:
+            if (editor && editor->isLive() && !editor->isPreview() && !informationView) {
+                VMD_TEST_ONLY(auto previousMoves = canvasMoves; auto previousPaints = canvasPaints;)
+                auto previousWidth = width;
+                editor->position((int)(headerBottom() * scale()));
+                auto bounds = editor->previewBounds((int)(headerBottom() * scale()));
+                top = bounds.top / scale();
+                positionCanvas(bounds);
+                if (doc && width != previousWidth) resetLayout();
+                else bars();
+                // Present only after the final geometry, D2D buffer, and text
+                // layouts agree. Never copy source pixels into the moved canvas.
+                invalidate();
+                UpdateWindow(canvas);
+                VMD_TEST_ONLY(splitFrameMoves = canvasMoves - previousMoves;
+                              splitFramePaints = canvasPaints - previousPaints;)
+            }
+            return 0;
         case EditorLayout:
             if (editor) {
                 message(WM_SIZE, SIZE_RESTORED, 0);
