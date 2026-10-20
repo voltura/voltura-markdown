@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.2 — 2026-10-20
+
+- Fixes duplicate heading links, list-heading anchors, explicit HTML heading identifiers, and HTML list numbering.
+- Preserves heading text, nested quotes, task spacing, and enclosing quotes when editing.
+- Protects fenced and indented code from table commands and retains missing final newlines.
+- Corrects literal local-link validation and query-only links during export and Save As.
+- Preserves separate tables, long code blocks, vertical cell alignment, and nested quotes in HTML exports.
+- Rejects malformed numeric entities and respects UTF-8 byte-order marks when decoding damaged files.
+- Adds regression coverage for all 20 fixes and native duplicate-heading navigation.
+
 ## 1.3.1 — 2026-10-20
 
 - Preserves literal link labels and destinations and local links during Save As.

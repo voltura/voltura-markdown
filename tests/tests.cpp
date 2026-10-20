@@ -691,9 +691,9 @@ int wmain(int argc, wchar_t **argv) {
                     structure.text.find(L"5.  Five") != structure.text.npos &&
                     structure.text.find(L"Always expanded") != structure.text.npos,
                 "ordered HTML start values and expanded details remain readable");
-        auto malformedHtml =
-            parse(L"<div><ol start='-7'><li>Default one<li>Default two</ol><kbd-custom>literal</kbd-custom>"
-                  L"<kbd@invalid>unknown</kbd@invalid><script>no execution</script></div>");
+        auto malformedHtml = parse(
+            L"<div><ol start='invalid'><li>Default one<li>Default two</ol><kbd-custom>literal</kbd-custom>"
+            L"<kbd@invalid>unknown</kbd@invalid><script>no execution</script></div>");
         validate(malformedHtml);
         require(malformedHtml.text.find(L"1.  Default one") != malformedHtml.text.npos &&
                     malformedHtml.text.find(L"2.  Default two") != malformedHtml.text.npos &&

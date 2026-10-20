@@ -199,6 +199,18 @@ TextEdit insertMarkdown(std::wstring_view s, size_t start, size_t end, Insert ki
                     ++n;
                 if (n > indent && n - indent <= 6 &&
                     (n == line.size() || line[n] == L' ' || line[n] == L'\t')) {
+                    auto tail = line.find_last_not_of(L" \t");
+                    if (tail != line.npos && line[tail] == L'#') {
+                        auto hashes = tail;
+                        while (hashes && line[hashes - 1] == L'#')
+                            --hashes;
+                        if (hashes >= n && hashes &&
+                            (line[hashes - 1] == L' ' || line[hashes - 1] == L'\t')) {
+                            while (hashes > n && (line[hashes - 1] == L' ' || line[hashes - 1] == L'\t'))
+                                --hashes;
+                            line.erase(hashes);
+                        }
+                    }
                     while (n < line.size() && (line[n] == L' ' || line[n] == L'\t'))
                         ++n;
                     line.erase(indent, n - indent);
@@ -492,14 +504,13 @@ std::vector<Diagnostic> validateDraft(const Document &doc, const std::atomic_boo
             locate(attribute.text, attribute.size);
             size_t location = position;
             position = previousPosition;
-            auto target = entity(fromUtf8(std::string_view(attribute.text, attribute.size)));
-            std::wstring unescaped;
-            for (size_t i = 0; i < target.size(); ++i) {
-                if (target[i] == L'\\' && i + 1 < target.size() && iswpunct(target[i + 1]))
-                    ++i;
-                unescaped += target[i];
+            std::wstring target;
+            for (size_t i = 0; attribute.substr_offsets[i] < attribute.size; ++i) {
+                auto part =
+                    fromUtf8(std::string_view(attribute.text + attribute.substr_offsets[i],
+                                              attribute.substr_offsets[i + 1] - attribute.substr_offsets[i]));
+                target += attribute.substr_types[i] == MD_TEXT_ENTITY ? entity(part) : part;
             }
-            target = std::move(unescaped);
             bool fragmentOnly = target.starts_with(L"#");
             if (!fragmentOnly) {
                 auto fragment = target.find_first_of(L"#?");

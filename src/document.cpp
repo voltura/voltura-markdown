@@ -50,8 +50,11 @@ std::wstring decode(std::string_view b, std::wstring *encoding) {
             s.push_back(0xfffd);
         return s;
     }
-    if (b.starts_with("\xef\xbb\xbf"))
+    if (b.starts_with("\xef\xbb\xbf")) {
         b.remove_prefix(3);
+        label(L"UTF-8");
+        return fromUtf8(b);
+    }
     if (b.empty()) {
         label(L"UTF-8");
         return {};
@@ -96,8 +99,12 @@ std::wstring entity(std::wstring_view s, const std::atomic_bool *cancel) {
                     std::wstring n(token.substr(2, token.size() - 3));
                     wchar_t *tail = nullptr;
                     bool hex = !n.empty() && (n[0] == L'x' || n[0] == L'X');
+                    auto digits = std::wstring_view(n).substr(hex ? 1 : 0);
+                    bool valid = !digits.empty() &&
+                                 digits.find_first_not_of(hex ? L"0123456789abcdefABCDEF" : L"0123456789") ==
+                                     digits.npos;
                     unsigned long c = wcstoul(n.c_str() + (hex ? 1 : 0), &tail, hex ? 16 : 10);
-                    if (tail && *tail == 0 && tail != n.c_str() + (hex ? 1 : 0)) {
+                    if (valid && tail && *tail == 0) {
                         codepoint(out, c);
                         i = end + 1;
                         continue;
@@ -166,9 +173,11 @@ struct Parser {
     std::exception_ptr error;
     int current = -1;
     unsigned quote = 0, styles = 0;
+    size_t headingContentStart = 0;
+    std::map<std::wstring, unsigned> headingIds;
     struct List {
         bool ordered;
-        unsigned next;
+        int64_t next;
     };
     std::vector<List> lists;
     struct Span {
@@ -247,20 +256,31 @@ struct Parser {
             doc.text.append(prefix);
             prefix.clear();
         }
+        if (kind == Kind::Heading)
+            headingContentStart = doc.text.size();
     }
     void finish() {
         if (current < 0)
             return;
         auto &b = doc.blocks[current];
         b.length = (uint32_t)doc.text.size() - b.start;
-        if (b.kind == Kind::Heading) {
-            std::wstring id = doc.text.substr(b.start, b.length);
+        if (b.kind == Kind::Heading && !b.anchor) {
+            std::wstring id = doc.text.substr(std::max<size_t>(b.start, headingContentStart));
             for (auto &c : id)
                 c = (wchar_t)towlower(c);
             id.erase(std::remove_if(id.begin(), id.end(),
                                     [](wchar_t c) { return iswpunct(c) && c != L'-' && c != L'_'; }),
                      id.end());
             std::replace(id.begin(), id.end(), L' ', L'-');
+            auto base = id;
+            auto &next = headingIds[base];
+            if (next) {
+                do {
+                    id = base + L"-" + std::to_wstring(next++);
+                } while (headingIds.contains(id));
+                headingIds.emplace(id, 1);
+            } else
+                next = 1;
             b.anchor = std::make_unique<std::wstring>(std::move(id));
         }
         doc.text.push_back(L'\n');
@@ -981,20 +1001,33 @@ struct Parser {
         if (isHeading) {
             heading = tag[1] - L'0';
             start(Kind::Heading);
+            auto id = attribute(token, L"id");
+            if (!id.empty()) {
+                headingIds.try_emplace(id, 1);
+                block().anchor = std::make_unique<std::wstring>(std::move(id));
+            }
         } else if (tag == L"blockquote") {
             ++quote;
         } else if (isList) {
-            unsigned number = 1;
+            int64_t number = 1;
             if (tag == L"ol") {
                 auto value = attribute(token, L"start");
                 wchar_t *tail = nullptr;
-                unsigned long parsed = wcstoul(value.c_str(), &tail, 10);
-                if (!value.empty() && value.front() != L'-' && tail && *tail == 0 && parsed > 0 &&
-                    parsed < UINT32_MAX)
-                    number = (unsigned)parsed;
+                auto parsed = wcstoll(value.c_str(), &tail, 10);
+                if (!value.empty() && tail != value.c_str() && *tail == 0 && parsed >= INT32_MIN &&
+                    parsed <= INT32_MAX)
+                    number = parsed;
             }
             lists.push_back({tag == L"ol", number});
         } else if (tag == L"li") {
+            if (!lists.empty() && lists.back().ordered) {
+                auto value = attribute(token, L"value");
+                wchar_t *tail = nullptr;
+                auto parsed = wcstoll(value.c_str(), &tail, 10);
+                if (!value.empty() && tail != value.c_str() && *tail == 0 && parsed >= INT32_MIN &&
+                    parsed <= INT32_MAX)
+                    lists.back().next = parsed;
+            }
             prefix = !lists.empty() && lists.back().ordered ? std::to_wstring(lists.back().next++) + L".  "
                                                             : L"•  ";
             start();

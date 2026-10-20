@@ -1,4 +1,5 @@
 #include "edit.h"
+#include "bug-regressions.h"
 #include "editor.h"
 #include <algorithm>
 #include <fstream>
@@ -74,6 +75,7 @@ int main(int argc, char **argv) {
         std::filesystem::temp_directory_path() / (L"vmd-edit-test-" + std::to_wstring(GetCurrentProcessId()));
     try {
         std::filesystem::create_directory(folder);
+        bugRegressions(folder);
         {
             unsigned failures = 0;
             auto check = [&](bool ok, const char *message) {

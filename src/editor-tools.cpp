@@ -63,6 +63,8 @@ std::wstring exportUrl(std::wstring_view value, const std::filesystem::path &doc
         return {};
     decoded.resize(size);
     std::filesystem::path path(decoded);
+    if (path.empty() && !document.empty())
+        path = std::filesystem::absolute(document);
     if (path.is_relative()) {
         if (document.empty())
             return safeUrl(value);
@@ -161,7 +163,7 @@ std::optional<TextEdit> continueMarkdown(std::wstring_view line, size_t caret) {
     size_t indent = p;
     while (p < prefix.size() && prefix[p] == '>') {
         ++p;
-        if (p < prefix.size() && prefix[p] == ' ')
+        while (p < prefix.size() && (prefix[p] == ' ' || prefix[p] == '\t'))
             ++p;
     }
     size_t quote = p;
@@ -170,6 +172,8 @@ std::optional<TextEdit> continueMarkdown(std::wstring_view line, size_t caret) {
         (prefix[p + 1] == ' ' || prefix[p + 1] == '\t')) {
         marker = std::wstring(prefix.substr(p, 2));
         p += 2;
+        while (p < prefix.size() && (prefix[p] == ' ' || prefix[p] == '\t'))
+            marker += prefix[p++];
         if (p + 3 < prefix.size() && prefix[p] == '[' &&
             (prefix[p + 1] == ' ' || prefix[p + 1] == 'x' || prefix[p + 1] == 'X') && prefix[p + 2] == ']' &&
             (prefix[p + 3] == ' ' || prefix[p + 3] == '\t')) {
@@ -190,8 +194,10 @@ std::optional<TextEdit> continueMarkdown(std::wstring_view line, size_t caret) {
     }
     if (marker.empty() && quote == indent && !indent)
         return {};
-    if (p > indent && trim(prefix.substr(p)).empty() && caret == line.size())
-        return TextEdit{indent, caret - indent, L"", 0, 0};
+    if (p > indent && trim(prefix.substr(p)).empty() && caret == line.size()) {
+        auto remove = marker.empty() ? indent : quote;
+        return TextEdit{remove, caret - remove, L"", 0, 0};
+    }
     std::wstring next = L"\n" + std::wstring(prefix.substr(0, quote)) + marker;
     return TextEdit{caret, 0, next, next.size(), 0};
 }
@@ -230,10 +236,23 @@ std::optional<TextEdit> editTable(std::wstring_view s, size_t caret, TableAction
     caret = std::min(caret, s.size());
     size_t start = caret ? s.rfind(L'\n', caret - 1) : s.npos;
     start = start == s.npos ? 0 : start + 1;
+    FenceState fence;
+    for (size_t at = 0; at < start;) {
+        auto end = s.find(L'\n', at);
+        if (end == s.npos)
+            break;
+        fence = scanFenceLine(s.substr(at, end - at), fence);
+        at = end + 1;
+    }
     auto lineAt = [&](size_t at) {
         auto e = s.find(L'\n', at);
         return s.substr(at, (e == s.npos ? s.size() : e) - at);
     };
+    if (fence.marker && scanFenceLine(lineAt(start), fence).marker)
+        return {};
+    auto indentation = lineAt(start).find_first_not_of(L" ");
+    if (indentation >= 4 || lineAt(start).substr(indentation).starts_with(L"\t"))
+        return {};
     if (lineAt(start).find('|') == s.npos)
         return {};
     while (start) {
@@ -362,6 +381,8 @@ std::optional<TextEdit> editTable(std::wstring_view s, size_t caret, TableAction
             edit.replacement += L" " + cell + L" |";
         edit.replacement += L'\n';
     }
+    if (end == s.size() && !s.ends_with(L"\n"))
+        edit.replacement.pop_back();
     edit.selection = std::min(caret - start, edit.replacement.size());
     return edit;
 }
@@ -557,10 +578,11 @@ std::wstring rebaseLocalLinks(std::wstring_view source, const std::filesystem::p
     struct State {
         std::string bytes;
         std::filesystem::path from, to;
+        std::filesystem::path sourceFile;
         std::map<size_t, std::pair<size_t, std::string>> replacements;
         std::exception_ptr error;
     } state{toUtf8(source), std::filesystem::absolute(from).parent_path(),
-            std::filesystem::absolute(to).parent_path()};
+            std::filesystem::absolute(to).parent_path(), std::filesystem::absolute(from)};
     MD_PARSER parser{};
     parser.flags = MD_DIALECT_GITHUB;
     parser.enter_block = parser.leave_block = [](MD_BLOCKTYPE, void *, void *) -> int { return 0; };
@@ -595,7 +617,7 @@ std::wstring rebaseLocalLinks(std::wstring_view source, const std::filesystem::p
             std::filesystem::path target(decoded);
             if (target.is_absolute())
                 return 0;
-            target = (s.from / target).lexically_normal();
+            target = target.empty() ? s.sourceFile : (s.from / target).lexically_normal();
             auto relative = target.lexically_relative(s.to);
             auto destination = markdownFileDestination(relative.empty() ? target : relative);
             std::wstring encoded;
@@ -723,6 +745,17 @@ std::string exportHtml(const Document &d) {
     };
     std::function<void(const std::deque<Block> &)> render = [&](const std::deque<Block> &blocks) {
         bool table = false, gridOpen = false;
+        bool codeOpen = false;
+        uint32_t codeIdentity = 0;
+        unsigned codeQuotes = 0;
+        auto closeCode = [&] {
+            if (!codeOpen)
+                return;
+            html += L"</pre>";
+            for (unsigned q = 0; q < codeQuotes; ++q)
+                html += L"</blockquote>";
+            codeOpen = false;
+        };
         uint32_t groupIdentity = UINT32_MAX;
         std::wstring openSection;
         const void *tracks = nullptr;
@@ -737,9 +770,14 @@ std::string exportHtml(const Document &d) {
             groupIdentity = UINT32_MAX;
         };
         for (auto &b : blocks) {
+            if (codeOpen && (b.kind != Kind::Code || b.codeStart != codeIdentity))
+                closeCode();
             if (gridOpen && !b.table)
                 closeGrid();
-            if (table && b.kind != Kind::Table) {
+            bool markdownHeader = b.header && !b.continuation &&
+                                  std::none_of(b.cells.begin(), b.cells.end(),
+                                               [](const Cell &cell) { return cell.content != nullptr; });
+            if (table && (b.kind != Kind::Table || markdownHeader)) {
                 html += L"</table>";
                 table = false;
             }
@@ -833,6 +871,10 @@ std::string exportHtml(const Document &d) {
                             (cell.align == 3   ? L"right"
                              : cell.align == 2 ? L"center"
                                                : L"left") +
+                            L";vertical-align:" +
+                            (cell.verticalAlign == 1   ? L"top"
+                             : cell.verticalAlign == 3 ? L"bottom"
+                                                       : L"middle") +
                             L"\"";
                     if (cell.width)
                         html +=
@@ -845,6 +887,16 @@ std::string exportHtml(const Document &d) {
                     html += L"</" + std::wstring(tag) + L">";
                 }
                 html += L"</tr>";
+            } else if (b.kind == Kind::Code) {
+                if (!codeOpen) {
+                    codeOpen = true;
+                    codeIdentity = b.codeStart;
+                    codeQuotes = b.quote;
+                    for (unsigned q = 0; q < b.quote; ++q)
+                        html += L"<blockquote>";
+                    html += L"<pre>";
+                }
+                html += inlineText(b, b.start, b.length);
             } else if (b.kind == Kind::Rule)
                 html += L"<hr>";
             else if ((b.kind == Kind::Image && b.image) || (b.image && b.image->inlineImages)) {
@@ -892,7 +944,7 @@ std::string exportHtml(const Document &d) {
                                ? L"h" + std::to_wstring(std::clamp((unsigned)b.level, 1u, 6u))
                            : b.kind == Kind::Code ? L"pre"
                                                   : L"p";
-                if (b.quote)
+                for (unsigned q = 0; q < b.quote; ++q)
                     html += L"<blockquote>";
                 html += L"<" + tag;
                 if (b.anchor)
@@ -900,10 +952,11 @@ std::string exportHtml(const Document &d) {
                 if (b.align == 2 || b.align == 3)
                     html += b.align == 2 ? L" style=\"text-align:center\"" : L" style=\"text-align:right\"";
                 html += L">" + inlineText(b, b.start, b.length) + L"</" + tag + L">";
-                if (b.quote)
+                for (unsigned q = 0; q < b.quote; ++q)
                     html += L"</blockquote>";
             }
         }
+        closeCode();
         closeGrid();
         if (table)
             html += L"</table>";

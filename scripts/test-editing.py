@@ -266,7 +266,9 @@ for accept in (False, True):
         wait(lambda: u.IsWindowVisible(canvas) and u.IsWindowVisible(edit), "default wide live preview")
         assert text(u.GetDlgItem(panel, 12)) == "Live: on"
         assert not path.exists(), "Create must defer disk writes until Save"
-        navigation_source = "[Jump](#destination)\n\n" + "Paragraph before destination.\n\n" * 200
+        navigation_source = (
+            "[Jump](#destination-1)\n\n## Destination\n\n" + "Paragraph before destination.\n\n" * 200
+        )
         navigation_source += "## Destination\n\n" + "Paragraph after destination.\n\n" * 80
         set_text(edit, navigation_source)
         wait(lambda: "0 warnings" in text(u.GetDlgItem(panel, 9)), "navigation fixture validation")
@@ -277,7 +279,7 @@ for accept in (False, True):
         point = round(40 * scale) | (round(8 * scale) << 16)
         u.SendMessageW(canvas, 0x0201, 1, point)
         u.SendMessageW(canvas, 0x0202, 0, point)
-        destination_line = navigation_source[: navigation_source.index("## Destination")].count("\n")
+        destination_line = navigation_source[: navigation_source.rindex("## Destination")].count("\n")
         wait(
             lambda: u.SendMessageW(edit, 0x00CE, 0, 0) >= destination_line - 1,
             "preview heading link moves source to destination",
@@ -286,7 +288,7 @@ for accept in (False, True):
         assert (
             u.SendMessageW(edit, 0x00CE, 0, 0) >= destination_line - 1
         ), "Heading navigation must not snap back"
-        print("PASS: live-preview heading links retain destination after lazy layout")
+        print("PASS: duplicate-heading links reach the second heading and survive lazy layout")
         scroll_image = folder / "scroll.svg"
         scroll_image.write_text(
             '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="1200">'
