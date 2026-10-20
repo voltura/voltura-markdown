@@ -17,6 +17,9 @@ g.CreateCompatibleBitmap.argtypes = [w.HDC, c.c_int, c.c_int]
 g.CreateCompatibleDC.argtypes = [w.HDC]
 g.SelectObject.argtypes = [w.HDC, w.HANDLE]
 u.PrintWindow.argtypes = [w.HWND, w.HDC, w.UINT]
+u.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+u.GetClassNameW.argtypes = [w.HWND, w.LPWSTR, c.c_int]
+u.IsWindowVisible.argtypes = [w.HWND]
 g.DeleteObject.argtypes = [w.HANDLE]
 g.DeleteDC.argtypes = [w.HDC]
 u.ReleaseDC.argtypes = [w.HWND, w.HDC]
@@ -28,7 +31,9 @@ handles = []
 def callback(hwnd, _):
     owner = w.DWORD()
     u.GetWindowThreadProcessId(hwnd, c.byref(owner))
-    if owner.value == pid and u.IsWindowVisible(hwnd):
+    name = c.create_unicode_buffer(256)
+    u.GetClassNameW(hwnd, name, 256)
+    if owner.value == pid and u.IsWindowVisible(hwnd) and (len(sys.argv) < 4 or name.value == sys.argv[3]):
         handles.append(hwnd)
     return True
 
@@ -48,6 +53,34 @@ old = g.SelectObject(memory, bitmap)
 if not u.PrintWindow(hwnd, memory, 2):
     raise SystemExit("PrintWindow failed")
 
+
+# D2D HWND targets do not participate in the parent's default PrintWindow path.
+# The test executable renders its canvas into a process-local DC; a DC owned
+# by this Python process cannot be bound by Direct2D in the application.
+canvas_capture = None
+u.EnumChildWindows.argtypes = [w.HWND, c.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM), w.LPARAM]
+u.GetWindowRect.argtypes = [w.HWND, c.POINTER(w.RECT)]
+u.GetClientRect.argtypes = [w.HWND, c.POINTER(w.RECT)]
+g.BitBlt.argtypes = [w.HDC, c.c_int, c.c_int, c.c_int, c.c_int, w.HDC, c.c_int, c.c_int, w.DWORD]
+
+@c.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
+def capture_canvas(child, unused):
+    global canvas_capture
+    name = c.create_unicode_buffer(128)
+    u.GetClassNameW(child, name, len(name))
+    if name.value != "VolturaMarkdownCanvas" or not u.IsWindowVisible(child):
+        return True
+    bounds, client = w.RECT(), w.RECT()
+    u.GetWindowRect(child, c.byref(bounds))
+    u.GetClientRect(child, c.byref(client))
+    if len(sys.argv) > 4:
+        path = pathlib.Path(sys.argv[4] + ".canvas.bmp")
+        path.unlink(missing_ok=True)
+        u.SendMessageW(child, 0x8000 + 45, 0, 0)
+        canvas_capture = (path, bounds.left - r.left, bounds.top - r.top)
+    return True
+
+u.EnumChildWindows(hwnd, capture_canvas, 0)
 
 class Header(c.Structure):
     _fields_ = [
@@ -70,6 +103,10 @@ pixels = c.create_string_buffer(width * height * 4)
 g.GetDIBits.argtypes = [w.HDC, w.HBITMAP, w.UINT, w.UINT, c.c_void_p, c.c_void_p, w.UINT]
 g.GetDIBits(memory, bitmap, 0, height, pixels, c.byref(header), 0)
 image = Image.frombuffer("RGB", (width, height), pixels, "raw", "BGRX", 0, 1)
+if canvas_capture:
+    path, x, y = canvas_capture
+    with Image.open(path) as rendered:
+        image.paste(rendered, (x, y))
 output = pathlib.Path(sys.argv[2])
 output.parent.mkdir(parents=True, exist_ok=True)
 image.save(output)

@@ -203,7 +203,15 @@ int wmain(int argc, wchar_t **argv) {
                         countMatches(text, L"", 0, cancel).total == 0 &&
                         findMatch(text, L"", 0, false, cancel) == -1,
                     "empty and missing searches");
+            auto indexed = indexMatches(L"aa aa\nAA", L"aa", cancel);
+            require(indexed.offsets == std::vector<uint32_t>{0, 3, 6} && indexed.lines == std::vector<uint32_t>{0, 1} && indexed.totalLines == 2,
+                    "match index includes sorted offsets and unique logical lines");
+            require(indexMatches(L"aaaaa", L"aa", cancel).offsets == std::vector<uint32_t>{0, 1, 2, 3}, "indexed overlapping matches");
+            require(indexMatches(L"aa AA", L"aa", cancel, {true, false}).offsets == std::vector<uint32_t>{0}, "case sensitive index");
+            require(indexMatches(L"cat scatter cat_ cat2 cat\u0301 cat", L"cat", cancel, {false, true}).offsets == std::vector<uint32_t>{0, 27}, "whole words exclude letters digits underscore and combining marks");
+            require(findMatch(L"aa AA", L"aa", 0, true, cancel, {true, false}) == 0, "case sensitive backward wrap");
             cancel = true;
+            require(indexMatches(text, L"one", cancel).offsets.empty(), "cancelled index is not published");
             require(countMatches(text, L"one", 0, cancel).total == 0 &&
                         findMatch(text, L"one", 0, false, cancel) == -1,
                     "cancelled search stops promptly");

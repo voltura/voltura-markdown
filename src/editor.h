@@ -1,6 +1,7 @@
 #pragma once
 #include "edit.h"
 #include "editor-tools.h"
+#include "search.h"
 #include <array>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -8,7 +9,8 @@
 
 namespace vm {
 constexpr UINT EditorLayout = WM_APP + 30, EditorPreview = WM_APP + 31, EditorSaved = WM_APP + 32,
-               EditorFinish = WM_APP + 33, EditorChanged = WM_APP + 34, EditorScroll = WM_APP + 35;
+               EditorFinish = WM_APP + 33, EditorChanged = WM_APP + 34, EditorScroll = WM_APP + 35,
+               EditorFind = WM_APP + 36, EditorReplace = WM_APP + 37, EditorFindKey = WM_APP + 38;
 class Editor {
     struct Job;
     struct Auxiliary;
@@ -25,7 +27,7 @@ class Editor {
     void resetCapture();
     void trackCapture(size_t start, size_t oldEnd, size_t newEnd);
     bool needsFirstSave = false;
-    bool live = false;
+    bool live = false, sourceWrapped = false;
     bool suppressCharacter = false;
     HWND scrollWindow = nullptr;
     bool settingScrollRegion = false;
@@ -35,12 +37,29 @@ class Editor {
     RECT scrollThumb(HWND window, int axis) const;
     void updateScrollRegion(HWND window);
     void paintScrollbars(HWND window, HDC dc = nullptr) const;
+    void paintLineNumbers(HDC dc = nullptr) const;
+    mutable std::optional<std::array<uint64_t, 8>> paintedLineNumbers;
+    mutable std::array<std::optional<std::array<int64_t, 14>>, 4> paintedScrollbars;
+#ifdef VMD_TESTING
+    mutable unsigned lineNumberPaints = 0;
+    mutable unsigned scrollbarPaints = 0;
+#endif
     void dragScrollbar(POINT point);
     POINT sourceScroll{};
     bool restoreScroll = false;
     unsigned dpi = 96;
     uint64_t revision = 0, checkedRevision = UINT64_MAX;
     std::wstring baselineText, cachedText, findQuery;
+    std::shared_ptr<const MatchIndex> searchResults;
+    uint32_t activeSearch = UINT32_MAX;
+    std::vector<int> searchMarkerRows;
+    int searchActiveRow = -1;
+    void projectFindMarkers();
+    LONG searchFormatFrom = 0, searchFormatTo = 0;
+    bool paintingFind = false;
+    void paintFindHighlights();
+    void clearFindHighlights();
+    DWORD replaceFindFlags = FR_DOWN;
     std::filesystem::path filePath, savePath;
     std::filesystem::path recoveredSnapshot;
     std::filesystem::path recoveredBase;
@@ -111,6 +130,13 @@ class Editor {
     void togglePreview();
     void focus();
     void find();
+    void prepareFind();
+    std::shared_ptr<const std::wstring> findTextSnapshot();
+    uint64_t textRevision() const { return revision; }
+    void setFindResults(std::shared_ptr<const MatchIndex> results, uint32_t active);
+    void revealFind(uint32_t start, uint32_t length);
+    void presentFind();
+    void setReplaceFind(const std::wstring &query, SearchOptions options);
     void findReplace(bool replace);
     bool dialogMessage(MSG &message);
     bool addImage(const std::filesystem::path &path);

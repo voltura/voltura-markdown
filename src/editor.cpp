@@ -22,6 +22,51 @@
 
 namespace vm {
 namespace {
+// Present each small chrome surface only after its background and text are ready.
+// Buffer the gutter/buttons rather than the Rich Edit document or preview.
+class ChromePaint {
+    HDC destination, memory = nullptr;
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ previous = nullptr;
+    RECT bounds;
+
+  public:
+    ChromePaint(HDC dc, RECT rect) : destination(dc), bounds(rect) {
+        if (rect.right <= rect.left || rect.bottom <= rect.top)
+            return;
+        memory = CreateCompatibleDC(dc);
+        bitmap = CreateCompatibleBitmap(dc, rect.right - rect.left, rect.bottom - rect.top);
+        if (memory && bitmap) {
+            previous = SelectObject(memory, bitmap);
+            SetViewportOrgEx(memory, -rect.left, -rect.top, nullptr);
+        }
+    }
+    HDC dc() const { return previous ? memory : destination; }
+    ~ChromePaint() {
+        if (previous) {
+            BitBlt(destination, bounds.left, bounds.top, bounds.right - bounds.left,
+                   bounds.bottom - bounds.top, memory, bounds.left, bounds.top, SRCCOPY);
+            SelectObject(memory, previous);
+        }
+        if (bitmap) DeleteObject(bitmap);
+        if (memory) DeleteDC(memory);
+    }
+};
+std::optional<CHARRANGE> sourceParagraph(HWND input, LONG at) {
+    Microsoft::WRL::ComPtr<IRichEditOle> ole;
+    SendMessageW(input, EM_GETOLEINTERFACE, 0, (LPARAM)ole.GetAddressOf());
+    Microsoft::WRL::ComPtr<ITextDocument> document;
+    Microsoft::WRL::ComPtr<ITextRange> range;
+    if (!ole || FAILED(ole.As(&document)) || FAILED(document->Range(at, at, &range)) ||
+        FAILED(range->Expand(tomParagraph, nullptr)))
+        return {};
+    CHARRANGE result{};
+    if (FAILED(range->GetStart(&result.cpMin)) || FAILED(range->GetEnd(&result.cpMax)))
+        return {};
+    // TOM includes the paragraph mark, including the final implicit mark.
+    result.cpMax = std::max(result.cpMin, result.cpMax - 1);
+    return result;
+}
 constexpr unsigned Save = 1, Preview = 2, Finish = 3, Heading = 4, BoldAction = 5, ItalicAction = 6, Link = 7,
                    MoreInsert = 8, Warnings = 9, Overflow = 10, UnderlineAction = 11, Live = 12, Code = 13,
                    List = 14, ImageAction = 15;
@@ -55,12 +100,14 @@ struct Fields {
     std::wstring title, firstLabel, secondLabel, first, second;
     bool numbers = false, browse = false, dark = false;
     HBRUSH brush = nullptr;
+    HBRUSH inputBrush = nullptr;
 };
 INT_PTR CALLBACK fieldProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp) {
     auto fields = (Fields *)GetWindowLongPtrW(dialog, DWLP_USER);
     if (msg == WM_INITDIALOG) {
         fields = (Fields *)lp;
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetPropW(dialog, L"VolturaFieldDialog", (HANDLE)1);
         SetWindowTextW(dialog, fields->title.c_str());
         SetDlgItemTextW(dialog, 101, fields->firstLabel.c_str());
         SetDlgItemTextW(dialog, 102, fields->secondLabel.c_str());
@@ -77,10 +124,75 @@ INT_PTR CALLBACK fieldProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp) {
         return FALSE;
     if (msg == WM_CTLCOLORDLG || msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLOREDIT) {
         SetTextColor((HDC)wp, fields->dark ? RGB(229, 233, 240) : RGB(32, 41, 56));
-        SetBkColor((HDC)wp, fields->dark ? RGB(28, 34, 45) : RGB(250, 251, 253));
-        return (INT_PTR)fields->brush;
+        bool input = msg == WM_CTLCOLOREDIT;
+        SetBkColor((HDC)wp, input ? (fields->dark ? RGB(28, 34, 45) : RGB(255, 255, 255))
+                                 : (fields->dark ? RGB(16, 19, 25) : RGB(250, 251, 253)));
+        return (INT_PTR)(input ? fields->inputBrush : fields->brush);
+    }
+    if (msg == WM_PAINT || msg == WM_PRINTCLIENT) {
+        PAINTSTRUCT paint{};
+        HDC dc = msg == WM_PAINT ? BeginPaint(dialog, &paint) : (HDC)wp;
+        int saved = SaveDC(dc);
+        RECT client{};
+        GetClientRect(dialog, &client);
+        FillRect(dc, &client, fields->brush);
+        int dpi = GetDpiForWindow(dialog);
+        auto px = [dpi](int value) { return MulDiv(value, dpi, 96); };
+        SelectObject(dc, GetStockObject(DC_PEN));
+        SelectObject(dc, fields->inputBrush);
+        for (int id : {201, 202}) {
+            RECT rect{};
+            GetWindowRect(GetDlgItem(dialog, id), &rect);
+            MapWindowPoints(nullptr, dialog, (POINT *)&rect, 2);
+            InflateRect(&rect, px(10), px(7));
+            SetDCPenColor(dc, GetFocus() == GetDlgItem(dialog, id)
+                                 ? (fields->dark ? RGB(144, 185, 255) : RGB(39, 95, 199))
+                                 : (fields->dark ? RGB(48, 58, 73) : RGB(220, 226, 235)));
+            RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, px(8), px(8));
+        }
+        RestoreDC(dc, saved);
+        if (msg == WM_PAINT)
+            EndPaint(dialog, &paint);
+        return TRUE;
+    }
+    if (msg == WM_NOTIFY && ((NMHDR *)lp)->code == NM_CUSTOMDRAW) {
+        auto draw = (NMCUSTOMDRAW *)lp;
+        if (draw->dwDrawStage != CDDS_PREPAINT)
+            return FALSE;
+        auto dc = draw->hdc;
+        int saved = SaveDC(dc);
+        auto rect = draw->rc;
+        FillRect(dc, &rect, fields->brush);
+        bool primary = draw->hdr.idFrom == IDOK;
+        bool pressed = (draw->uItemState & CDIS_SELECTED) != 0;
+        bool hot = (draw->uItemState & CDIS_HOT) != 0;
+        bool focus = (draw->uItemState & CDIS_FOCUS) != 0;
+        auto fill = primary ? (pressed ? RGB(32, 78, 163) : hot ? RGB(52, 111, 220) : RGB(39, 95, 199))
+                            : fields->dark ? (pressed ? RGB(48, 65, 90) : hot ? RGB(46, 59, 78) : RGB(28, 34, 45))
+                                           : (pressed ? RGB(209, 223, 248) : hot ? RGB(230, 237, 250) : RGB(255, 255, 255));
+        SelectObject(dc, GetStockObject(DC_BRUSH));
+        SelectObject(dc, GetStockObject(DC_PEN));
+        SetDCBrushColor(dc, fill);
+        SetDCPenColor(dc, focus ? (fields->dark ? RGB(144, 185, 255) : RGB(39, 95, 199))
+                                : primary ? fill : fields->dark ? RGB(48, 58, 73) : RGB(220, 226, 235));
+        int radius = MulDiv(8, GetDpiForWindow(dialog), 96);
+        RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+        SelectObject(dc, (HFONT)SendMessageW(draw->hdr.hwndFrom, WM_GETFONT, 0, 0));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, primary ? RGB(255, 255, 255) : fields->dark ? RGB(229, 233, 240) : RGB(32, 41, 56));
+        auto text = windowText(draw->hdr.hwndFrom);
+        DrawTextW(dc, text.c_str(), (int)text.size(), &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (focus && !(SendMessageW(draw->hdr.hwndFrom, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
+            InflateRect(&rect, -4, -4);
+            DrawFocusRect(dc, &rect);
+        }
+        RestoreDC(dc, saved);
+        SetWindowLongPtrW(dialog, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
+        return TRUE;
     }
     if (msg == WM_COMMAND) {
+        if (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS)
+            InvalidateRect(dialog, nullptr, FALSE);
         if (LOWORD(wp) == 204 && fields->browse) {
             fields->first = windowText(GetDlgItem(dialog, 201));
             if (fields->first.empty())
@@ -101,7 +213,7 @@ INT_PTR CALLBACK fieldProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp) {
             chooser.nMaxFile = 32768;
             chooser.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.gif;*.svg\0All files\0*.*\0";
             chooser.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (themedOpenFile(&chooser))
+            if (GetOpenFileNameW(&chooser))
                 SetDlgItemTextW(dialog, 202, path);
             return TRUE;
         }
@@ -144,13 +256,13 @@ bool prompt(HWND owner, Fields &fields) {
             word(*text);
         } while (*text++);
     };
-    dword(WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT | DS_CENTER);
+    dword(WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | DS_MODALFRAME | DS_SETFONT | DS_CENTER);
     dword(0);
     word(9);
     word(0);
     word(0);
     word(300);
-    word(138);
+    word(162);
     word(0);
     word(0);
     string(L"");
@@ -172,21 +284,23 @@ bool prompt(HWND owner, Fields &fields) {
         string(text);
         word(0);
     };
-    control(0, 10, 9, 276, 12, 101, 0x82, L"");
-    control(WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, 10, 23, 276, 16, 201, 0x81, L"");
-    control(0, 10, 47, 276, 12, 102, 0x82, L"");
-    control(WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, 10, 61, 276, 16, 202, 0x81, L"");
-    control(WS_TABSTOP | BS_PUSHBUTTON, 10, 84, 65, 18, 203, 0x80, L"Browse…");
-    control(WS_TABSTOP | BS_PUSHBUTTON, 82, 84, 70, 18, 204, 0x80, L"Placeholder");
-    control(WS_TABSTOP | BS_DEFPUSHBUTTON, 152, 110, 64, 18, IDOK, 0x80, L"Insert");
-    control(WS_TABSTOP | BS_PUSHBUTTON, 222, 110, 64, 18, IDCANCEL, 0x80, L"Cancel");
+    control(0, 16, 12, 268, 12, 101, 0x82, L"");
+    control(WS_TABSTOP | ES_AUTOHSCROLL, 21, 31, 258, 12, 201, 0x81, L"");
+    control(0, 16, 56, 268, 12, 102, 0x82, L"");
+    control(WS_TABSTOP | ES_AUTOHSCROLL, 21, 75, 258, 12, 202, 0x81, L"");
+    control(WS_TABSTOP | BS_PUSHBUTTON, 16, 100, 65, 22, 203, 0x80, L"Browse…");
+    control(WS_TABSTOP | BS_PUSHBUTTON, 88, 100, 76, 22, 204, 0x80, L"Placeholder");
+    control(WS_TABSTOP | BS_DEFPUSHBUTTON, 148, 128, 64, 22, IDOK, 0x80, L"Insert");
+    control(WS_TABSTOP | BS_PUSHBUTTON, 220, 128, 64, 22, IDCANCEL, 0x80, L"Cancel");
     // The last static supplies screen readers with the selected row-count convention.
-    control(0, 82, 85, 204, 16, 103, 0x82, fields.numbers ? L"A header row is added automatically." : L"");
-    fields.brush = CreateSolidBrush(fields.dark ? RGB(28, 34, 45) : RGB(250, 251, 253));
+    control(0, 16, 101, 268, 16, 103, 0x82, fields.numbers ? L"A header row is added automatically." : L"");
+    fields.brush = CreateSolidBrush(fields.dark ? RGB(16, 19, 25) : RGB(250, 251, 253));
+    fields.inputBrush = CreateSolidBrush(fields.dark ? RGB(28, 34, 45) : RGB(255, 255, 255));
     DialogThemeScope theme;
     auto result = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), (DLGTEMPLATE *)words.data(), owner,
                                           fieldProc, (LPARAM)&fields);
     DeleteObject(fields.brush);
+    DeleteObject(fields.inputBrush);
     return result == IDOK;
 }
 } // namespace
@@ -391,7 +505,8 @@ void Editor::theme(bool isDark, unsigned scale) {
     SendMessageW(input, WM_SETFONT, (WPARAM)mono, TRUE);
     SendMessageW(input, EM_SETBKGNDCOLOR, 0, dark ? RGB(16, 19, 25) : RGB(250, 251, 253));
     CHARFORMAT2W format{sizeof(format)};
-    format.dwMask = CFM_COLOR;
+    format.dwMask = CFM_COLOR | CFM_BACKCOLOR;
+    format.crBackColor = dark ? RGB(16, 19, 25) : RGB(250, 251, 253);
     format.crTextColor = dark ? RGB(229, 233, 240) : RGB(32, 41, 56);
     SendMessageW(input, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&format);
     if (previousFont)
@@ -498,7 +613,25 @@ void Editor::layout() {
     RECT sourceBounds{};
     GetWindowRect(input, &sourceBounds);
     MapWindowPoints(nullptr, panel, (POINT *)&sourceBounds, 2);
-    RECT next{px(12), headerHeight(), px(12) + sourceWidth, headerHeight() + sourceHeight};
+    // Reserve a stable gutter, with enough digits for even one-character lines.
+    int gutter = px(12 + 8 * (int)std::max<size_t>(4, std::to_wstring(liveLength + 1).size()));
+    sourceWidth = std::max(1, sourceWidth - gutter);
+    RECT next{px(12) + gutter, headerHeight(), px(12) + gutter + sourceWidth,
+              headerHeight() + sourceHeight};
+    if (sourceWrapped != live) {
+        // Wrap only the split source pane. Reflow is a view change, not an edit,
+        // and must not run again on each live-preview refresh.
+        LONG first = (LONG)SendMessageW(input, EM_GETFIRSTVISIBLELINE, 0, 0);
+        LONG anchor = (LONG)SendMessageW(input, EM_LINEINDEX, first, 0);
+        bool previousSyncing = syncing;
+        syncing = true;
+        SendMessageW(input, EM_SETTARGETDEVICE, 0, live ? 0 : 1);
+        sourceWrapped = live;
+        LONG line = (LONG)SendMessageW(input, EM_EXLINEFROMCHAR, 0, anchor);
+        SendMessageW(input, EM_LINESCROLL, 0,
+                     line - SendMessageW(input, EM_GETFIRSTVISIBLELINE, 0, 0));
+        syncing = previousSyncing;
+    }
     if (!EqualRect(&sourceBounds, &next)) {
         settingScrollRegion = true;
         SetWindowRgn(input, CreateRectRgn(0, 0, 0, 0), FALSE);
@@ -528,6 +661,8 @@ bool Editor::busy() const {
 void Editor::changed() {
     if (updating)
         return;
+    searchResults.reset(); searchMarkerRows.clear(); activeSearch = UINT32_MAX;
+    clearFindHighlights();
     textCurrent = false;
     if (!localMutation)
         fullCapture = true;
@@ -544,7 +679,7 @@ void Editor::changed() {
     SetTimer(panel, 5, 600, nullptr);
     SetWindowTextW(buttons[8], L"Checking…");
     title();
-    PostMessageW(owner, EditorChanged, 0, 0);
+    SendMessageW(owner, EditorChanged, 0, 0);
 }
 void Editor::captureText() {
     if (textCurrent)
@@ -1144,7 +1279,7 @@ void Editor::command(unsigned id) {
             dialog.nMaxFile = 32768;
             dialog.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.gif;*.svg;*.bmp;*.webp\0All files\0*.*\0";
             dialog.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-            if (themedOpenFile(&dialog))
+            if (GetOpenFileNameW(&dialog))
                 addImage(path);
             break;
         }
@@ -1359,12 +1494,11 @@ bool Editor::tab(bool backward) {
         SendMessageW(input, EM_EXGETSEL, 0, (LPARAM)&range);
         if (range.cpMin == range.cpMax && !backward)
             return false;
-        LONG first = (LONG)SendMessageW(input, EM_EXLINEFROMCHAR, 0, range.cpMin);
-        LONG last = (LONG)SendMessageW(input, EM_EXLINEFROMCHAR, 0,
-                                       range.cpMax > range.cpMin ? range.cpMax - 1 : range.cpMax);
-        LONG start = (LONG)SendMessageW(input, EM_LINEINDEX, first, 0),
-             end = (LONG)SendMessageW(input, EM_LINEINDEX, last, 0);
-        end += (LONG)SendMessageW(input, EM_LINELENGTH, end, 0);
+        auto first = sourceParagraph(input, range.cpMin);
+        auto last = sourceParagraph(input, range.cpMax > range.cpMin ? range.cpMax - 1 : range.cpMax);
+        if (!first || !last)
+            return true;
+        LONG start = first->cpMin, end = last->cpMax;
         std::wstring text((size_t)(end - start) + 1, L'\0');
         TEXTRANGEW get{{start, end}, text.data()};
         text.resize((size_t)SendMessageW(input, EM_GETTEXTRANGE, 0, (LPARAM)&get));
@@ -1386,12 +1520,126 @@ bool Editor::tab(bool backward) {
     return true;
 }
 void Editor::find() {
-    findReplace(false);
+    SendMessageW(owner, EditorFind, 0, 0);
+}
+void Editor::prepareFind() {
+    if (preview) togglePreview();
+    if (findDialog) DestroyWindow(findDialog);
+}
+std::shared_ptr<const std::wstring> Editor::findTextSnapshot() {
+    captureText();
+    return std::make_shared<const std::wstring>(cachedText);
+}
+void Editor::setReplaceFind(const std::wstring &query, SearchOptions options) {
+    wcsncpy_s(findBuffer.data(), findBuffer.size(), query.c_str(), _TRUNCATE);
+    replaceFindFlags = FR_DOWN | (options.matchCase ? FR_MATCHCASE : 0) | (options.wholeWord ? FR_WHOLEWORD : 0);
+}
+void Editor::setFindResults(std::shared_ptr<const MatchIndex> results, uint32_t active) {
+    clearFindHighlights();
+    searchResults = std::move(results);
+    activeSearch = active;
+    SendMessageW(input, EM_HIDESELECTION, searchResults != nullptr, 0);
+    projectFindMarkers();
+    paintScrollbars(input);
+}
+void Editor::revealFind(uint32_t start, uint32_t length) {
+    CHARRANGE selected{(LONG)start, (LONG)(start + length)};
+    SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&selected);
+    SendMessageW(input, EM_SCROLLCARET, 0, 0);
+    if (live && synchronized) PostMessageW(owner, EditorScroll, 0, 0);
+}
+void Editor::presentFind() {
+    paintFindHighlights();
+    UpdateWindow(input);
+}
+// Temporary TOM background effects do not enter the document's undo stream.
+static void temporaryFindBackground(ITextDocument *tom, LONG start, LONG end, LONG color) {
+    if (end <= start) return;
+    Microsoft::WRL::ComPtr<ITextRange> range;
+    Microsoft::WRL::ComPtr<ITextFont> font;
+    if (SUCCEEDED(tom->Range(start, end, &range)) && SUCCEEDED(range->GetFont(&font))) {
+        font->Reset(tomApplyTmp);
+        font->SetBackColor(color);
+        font->Reset(tomApplyNow);
+    }
+}
+void Editor::clearFindHighlights() {
+    if (searchFormatTo <= searchFormatFrom) return;
+    Microsoft::WRL::ComPtr<IRichEditOle> ole;
+    SendMessageW(input, EM_GETOLEINTERFACE, 0, (LPARAM)ole.GetAddressOf());
+    Microsoft::WRL::ComPtr<ITextDocument> tom;
+    if (ole && SUCCEEDED(ole.As(&tom))) {
+        bool old = updating; updating = true;
+        auto modified = SendMessageW(input, EM_GETMODIFY, 0, 0);
+        tom->Undo(tomSuspend, nullptr);
+        temporaryFindBackground(tom.Get(), searchFormatFrom, searchFormatTo, dark ? RGB(16, 19, 25) : RGB(250, 251, 253));
+        tom->Undo(tomResume, nullptr);
+        SendMessageW(input, EM_SETMODIFY, modified, 0);
+        updating = old;
+    }
+    searchFormatFrom = searchFormatTo = 0;
+}
+void Editor::projectFindMarkers() {
+    searchMarkerRows.clear();
+    searchActiveRow = -1;
+    if (!searchResults) return;
+    auto track = scrollTrack(input, SB_VERT);
+    int extent = std::max(1L, track.bottom - track.top - 1), previous = -1;
+    for (auto line : searchResults->lines) {
+        int y = (int)((uint64_t)line * extent / std::max(1u, searchResults->totalLines));
+        if (y != previous) searchMarkerRows.push_back(y);
+        previous = y;
+    }
+    if (activeSearch != UINT32_MAX && !searchResults->lines.empty()) {
+        auto line = SendMessageW(input, EM_EXLINEFROMCHAR, 0, activeSearch);
+        searchActiveRow = (int)(line * extent / std::max(1u, searchResults->totalLines));
+    }
+}
+void Editor::paintFindHighlights() {
+    if (paintingFind || !searchResults || preview || !ready) return;
+    paintingFind = true;
+    clearFindHighlights();
+    Microsoft::WRL::ComPtr<IRichEditOle> ole;
+    SendMessageW(input, EM_GETOLEINTERFACE, 0, (LPARAM)ole.GetAddressOf());
+    Microsoft::WRL::ComPtr<ITextDocument> tom;
+    if (ole && SUCCEEDED(ole.As(&tom))) {
+        RECT rect; GetClientRect(input, &rect);
+        POINT a{0, 0}, b{rect.right, rect.bottom};
+        auto from = (LONG)SendMessageW(input, EM_CHARFROMPOS, 0, (LPARAM)&a);
+        auto to = (LONG)SendMessageW(input, EM_CHARFROMPOS, 0, (LPARAM)&b) + 1;
+        // Keep the horizontal viewport's starting character: returning to the
+        // line start would miss matches far to the right on very long lines.
+        to = std::min(to + 1, from + 32768);
+        bool old = updating; updating = true;
+        auto modified = SendMessageW(input, EM_GETMODIFY, 0, 0);
+        tom->Undo(tomSuspend, nullptr);
+        auto &hits = searchResults->offsets;
+        auto length = searchResults->length;
+        auto it = std::lower_bound(hits.begin(), hits.end(), from >= (LONG)length ? from - length + 1 : 0);
+        for (; it != hits.end() && *it < (uint32_t)std::max(0L, to); ++it) {
+            LONG end = (LONG)(*it + length);
+            temporaryFindBackground(tom.Get(), (LONG)*it, end,
+                                    dark ? RGB(89, 72, 30) : RGB(255, 233, 151));
+            searchFormatFrom = std::min(from, (LONG)*it);
+            searchFormatTo = std::max(searchFormatTo, end);
+        }
+        if (activeSearch != UINT32_MAX && activeSearch < (uint32_t)std::max(0L, to) &&
+            activeSearch + length > (uint32_t)std::max(0L, from))
+            temporaryFindBackground(tom.Get(), (LONG)activeSearch, (LONG)(activeSearch + length),
+                                    dark ? RGB(140, 85, 24) : RGB(255, 182, 75));
+        tom->Undo(tomResume, nullptr);
+        SendMessageW(input, EM_SETMODIFY, modified, 0);
+        updating = old;
+    }
+    paintingFind = false;
+    InvalidateRect(input, nullptr, FALSE);
 }
 bool Editor::dialogMessage(MSG &msg) {
     return findDialog && IsDialogMessageW(findDialog, &msg);
 }
 void Editor::findReplace(bool replacing) {
+    if (!replacing) { find(); return; }
+    SendMessageW(owner, EditorReplace, 0, 0);
     if (!ready || saving)
         return;
     if (preview)
@@ -1400,7 +1648,7 @@ void Editor::findReplace(bool replacing) {
         DestroyWindow(findDialog);
     findState = {sizeof(findState)};
     findState.hwndOwner = panel;
-    findState.Flags = FR_DOWN;
+    findState.Flags = replaceFindFlags;
     findState.lpstrFindWhat = findBuffer.data();
     findState.wFindWhatLen = (WORD)findBuffer.size();
     findState.lpstrReplaceWith = replaceBuffer.data();
@@ -1507,17 +1755,19 @@ bool Editor::smartEnter() {
     SendMessageW(input, EM_EXGETSEL, 0, (LPARAM)&range);
     if (range.cpMin != range.cpMax)
         return false;
-    LONG line = (LONG)SendMessageW(input, EM_EXLINEFROMCHAR, 0, range.cpMin),
-         start = (LONG)SendMessageW(input, EM_LINEINDEX, line, 0);
+    auto paragraph = sourceParagraph(input, range.cpMin);
+    if (!paragraph)
+        return false;
+    LONG start = paragraph->cpMin;
     auto state = fenceAt(start);
     if (!state)
         return false;
-    auto length = (size_t)SendMessageW(input, EM_LINELENGTH, range.cpMin, 0);
+    auto length = (size_t)(paragraph->cpMax - start);
     if (length > 32766)
         return false;
     std::wstring text(length + 2, L'\0');
-    *(WORD *)text.data() = (WORD)(length + 1);
-    auto n = SendMessageW(input, EM_GETLINE, line, (LPARAM)text.data());
+    TEXTRANGEW get{{start, paragraph->cpMax}, text.data()};
+    auto n = SendMessageW(input, EM_GETTEXTRANGE, 0, (LPARAM)&get);
     text.resize((size_t)n);
     // Rich Edit includes its paragraph terminator, even on the final line.
     if (text.ends_with(L'\r'))
@@ -1598,6 +1848,15 @@ void Editor::tableAction(TableAction action) {
             L"Edit table", MB_OK);
 }
 double Editor::sourcePosition() const {
+    SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE | SIF_POS};
+    if (GetScrollInfo(input, SB_VERT, &info)) {
+        int last = info.nMax - (int)info.nPage + 1;
+        // The first visible line at the source's end can still precede tall
+        // rendered tables/images. Match document ends at this boundary only.
+        // Rich Edit can clamp one pixel below the inclusive scrollbar limit.
+        if (last > info.nMin && info.nPos > info.nMin && info.nPos >= last - 1)
+            return (double)liveLength;
+    }
     LONG line = (LONG)SendMessageW(input, EM_GETFIRSTVISIBLELINE, 0, 0);
     LONG start = (LONG)SendMessageW(input, EM_LINEINDEX, line, 0);
     LONG next = (LONG)SendMessageW(input, EM_LINEINDEX, line + 1, 0);
@@ -1711,10 +1970,12 @@ void Editor::highlight() {
             TEXTRANGEW get{{start, end}, text.data()};
             text.resize((size_t)SendMessageW(input, EM_GETTEXTRANGE, 0, (LPARAM)&get));
             color(start, end, dark ? RGB(229, 233, 240) : RGB(32, 41, 56));
-            auto state = fenceAt(lineStart);
+            auto paragraph = sourceParagraph(input, lineStart);
+            auto logicalStart = paragraph ? paragraph->cpMin : lineStart;
+            auto state = fenceAt(logicalStart);
 
             if (highlighting && state)
-                for (auto &span : syntaxSpans(text, *state, start != lineStart)) {
+                for (auto &span : syntaxSpans(text, *state, start != logicalStart)) {
                     COLORREF colors[] = {dark ? RGB(144, 185, 255) : RGB(39, 95, 199),
                                          dark ? RGB(220, 176, 132) : RGB(152, 74, 20),
                                          dark ? RGB(143, 170, 144) : RGB(72, 114, 76)};
@@ -1737,6 +1998,7 @@ void Editor::highlight() {
     SendMessageW(input, WM_SETREDRAW, TRUE, 0);
     tom->Undo(tomResume, nullptr);
     updating = old;
+    paintFindHighlights();
     InvalidateRect(input, nullptr, FALSE);
 }
 void Editor::checkpoint() {
@@ -2261,6 +2523,7 @@ void Editor::toolsPoll() {
     }
 }
 bool Editor::key(WPARAM key) {
+    if ((key == VK_ESCAPE || key == VK_F3) && SendMessageW(owner, EditorFindKey, key, 0)) return true;
     bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
     if (GetKeyState(VK_MENU) < 0)
         return false;
@@ -2426,24 +2689,59 @@ void Editor::paintScrollbars(HWND window, HDC target) const {
         if (!(style & (axis == SB_VERT ? WS_VSCROLL : WS_HSCROLL)))
             continue;
         auto track = scrollTrack(window, axis);
-        FillRect(dc, &track, bg);
         SCROLLBARINFO state{sizeof(state)};
-        if (GetScrollBarInfo(window, axis == SB_VERT ? OBJID_VSCROLL : OBJID_HSCROLL, &state) &&
-            (state.rgstate[0] & STATE_SYSTEM_UNAVAILABLE))
-            continue;
+        bool unavailable = GetScrollBarInfo(window, axis == SB_VERT ? OBJID_VSCROLL : OBJID_HSCROLL, &state) &&
+                           (state.rgstate[0] & STATE_SYSTEM_UNAVAILABLE);
         SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE};
-        if (!GetScrollInfo(window, axis, &info) || info.nMax - info.nMin + 1 <= (int)info.nPage)
-            continue;
+        bool visible = !unavailable && GetScrollInfo(window, axis, &info) &&
+                       info.nMax - info.nMin + 1 > (int)info.nPage;
         auto thumb = scrollThumb(window, axis);
         bool active = scrollWindow == window && scrollAxis == axis;
+        RECT bounds{};
+        GetWindowRect(window, &bounds);
+        MapWindowPoints(nullptr, panel, (POINT *)&bounds, 2);
+        std::array<int64_t, 14> key{track.left, track.top, track.right, track.bottom,
+                                   thumb.left, thumb.top, thumb.right, thumb.bottom,
+                                   bounds.left, bounds.top, visible, active, dark, dpi};
+        auto &cached = paintedScrollbars[(window == input ? 0 : 2) + (axis == SB_VERT ? 0 : 1)];
+        bool markers = window == input && axis == SB_VERT && searchResults;
+        if (!target && !markers && cached == key)
+            continue;
+        // Each track is a narrow surface: never expose the erased track before
+        // the thumb, including on wheel messages at either scroll boundary.
+        ChromePaint buffered(dc, track);
+        auto trackDC = buffered.dc();
+        if (!target) {
+            if (markers) cached.reset();
+            else cached = key;
+        }
+#ifdef VMD_TESTING
+        ++scrollbarPaints;
+#endif
+        FillRect(trackDC, &track, bg);
+        if (!visible)
+            continue;
+        if (window == input && axis == SB_VERT && searchResults) {
+            auto marker = CreateSolidBrush(RGB(231, 181, 75));
+            for (auto y : searchMarkerRows) {
+                RECT tick{track.left, track.top + y, track.right, track.top + y + std::max(1, MulDiv(2, dpi, 96))};
+                FillRect(trackDC, &tick, marker);
+            }
+            DeleteObject(marker);
+            if (searchActiveRow >= 0) {
+                int y = track.top + searchActiveRow;
+                RECT tick{track.left, y, track.right, y + std::max(2, MulDiv(3, dpi, 96))};
+                marker = CreateSolidBrush(RGB(231, 150, 50)); FillRect(trackDC, &tick, marker); DeleteObject(marker);
+            }
+        }
         auto brush = CreateSolidBrush(active ? (dark ? RGB(144, 185, 255) : RGB(39, 95, 199))
                                              : (dark ? RGB(146, 158, 175) : RGB(102, 117, 138)));
-        auto oldBrush = SelectObject(dc, brush);
-        auto oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        auto oldBrush = SelectObject(trackDC, brush);
+        auto oldPen = SelectObject(trackDC, GetStockObject(NULL_PEN));
         int diameter = std::max(2, MulDiv(6, dpi, 96));
-        RoundRect(dc, thumb.left, thumb.top, thumb.right, thumb.bottom, diameter, diameter);
-        SelectObject(dc, oldPen);
-        SelectObject(dc, oldBrush);
+        RoundRect(trackDC, thumb.left, thumb.top, thumb.right, thumb.bottom, diameter, diameter);
+        SelectObject(trackDC, oldPen);
+        SelectObject(trackDC, oldBrush);
         DeleteObject(brush);
     }
     if ((style & WS_VSCROLL) && (style & WS_HSCROLL)) {
@@ -2455,6 +2753,88 @@ void Editor::paintScrollbars(HWND window, HDC target) const {
     RestoreDC(dc, saved);
     if (!target)
         ReleaseDC(panel, dc);
+    if (window == input && !target)
+        paintLineNumbers();
+}
+void Editor::paintLineNumbers(HDC target) const {
+    if (!input || preview || !(GetWindowLongW(input, GWL_STYLE) & WS_VISIBLE))
+        return;
+    RECT client{};
+    GetClientRect(input, &client);
+    MapWindowPoints(input, panel, (POINT *)&client, 2);
+    RECT gutter{MulDiv(12, dpi, 96), client.top, client.left, client.bottom};
+    POINT scroll{};
+    SendMessageW(input, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
+    std::array<uint64_t, 8> state{revision, (uint64_t)scroll.y, (uint64_t)client.left,
+                                 (uint64_t)client.top, (uint64_t)client.right,
+                                 (uint64_t)client.bottom, dpi, dark};
+    // Rich Edit sends paint/timer/scroll messages even at an unchanged boundary.
+    // Only a parent paint (exposure) or a changed viewport/text needs presentation.
+    if (!target && (paintedLineNumbers == state || !IsWindowVisible(input)))
+        return;
+    HDC destination = target ? target : GetDC(panel);
+    if (!destination)
+        return;
+    {
+        ChromePaint buffered(destination, gutter);
+        HDC dc = buffered.dc();
+        int saved = SaveDC(dc);
+        IntersectClipRect(dc, gutter.left, gutter.top, gutter.right, gutter.bottom);
+        FillRect(dc, &gutter, background);
+        SelectObject(dc, mono);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, dark ? RGB(146, 158, 175) : RGB(102, 117, 138));
+        Microsoft::WRL::ComPtr<IRichEditOle> ole;
+        SendMessageW(input, EM_GETOLEINTERFACE, 0, (LPARAM)ole.GetAddressOf());
+        Microsoft::WRL::ComPtr<ITextDocument> document;
+        Microsoft::WRL::ComPtr<ITextRange> range;
+        LONG first = (LONG)SendMessageW(input, EM_GETFIRSTVISIBLELINE, 0, 0);
+        LONG at = (LONG)SendMessageW(input, EM_LINEINDEX, first, 0);
+        if (at >= 0 && ole && SUCCEEDED(ole.As(&document)) &&
+            SUCCEEDED(document->Range(at, at, &range))) {
+            LONG number = 0, start = 0, end = 0;
+            // TOM paragraph indices count hard line breaks, never display wraps.
+            if (SUCCEEDED(range->GetIndex(tomParagraph, &number)) &&
+                SUCCEEDED(range->Expand(tomParagraph, nullptr))) {
+                range->GetStart(&start);
+                range->GetEnd(&end);
+                TEXTMETRICW metrics{};
+                GetTextMetricsW(dc, &metrics);
+                for (LONG line = first; ; ++line) {
+                    LONG offset = (LONG)SendMessageW(input, EM_LINEINDEX, line, 0);
+                    if (offset < 0)
+                        break;
+                    POINTL point{};
+                    SendMessageW(input, EM_POSFROMCHAR, (WPARAM)&point, offset);
+                    LONG y = client.top + point.y;
+                    if (y >= client.bottom)
+                        break;
+                    if (offset >= end) {
+                        ++number;
+                        range->SetRange(offset, offset);
+                        range->Expand(tomParagraph, nullptr);
+                        range->GetStart(&start);
+                        range->GetEnd(&end);
+                    }
+                    if (offset != start)
+                        continue;
+                    auto label = std::to_wstring(number);
+                    RECT row{gutter.left, y, gutter.right - MulDiv(10, dpi, 96),
+                             y + metrics.tmHeight};
+                    DrawTextW(dc, label.c_str(), (int)label.size(), &row,
+                              DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+                }
+            }
+        }
+        RestoreDC(dc, saved);
+    }
+    if (!target)
+        paintedLineNumbers = state;
+#ifdef VMD_TESTING
+    ++lineNumberPaints;
+#endif
+    if (!target)
+        ReleaseDC(panel, destination);
 }
 void Editor::dragScrollbar(POINT point) {
     if (!scrollWindow)
@@ -2486,6 +2866,10 @@ LRESULT CALLBACK Editor::inputProc(HWND window, UINT msg, WPARAM wp, LPARAM lp, 
     auto editor = (Editor *)data;
     try {
         bool scrollable = window == editor->input || window == editor->warningList;
+        // Owner-drawn buttons paint every pixel in one buffered operation.
+        // The native erase would otherwise expose an empty button first.
+        if (!scrollable && msg == WM_ERASEBKGND)
+            return 1;
         if (scrollable && msg == WM_NCPAINT)
             return 0; // The native non-client area is outside the window region.
         if (window == editor->input && msg == WM_DROPFILES) {
@@ -2556,9 +2940,20 @@ LRESULT CALLBACK Editor::inputProc(HWND window, UINT msg, WPARAM wp, LPARAM lp, 
             SendMessageW(window, EM_EXGETSEL, 0, (LPARAM)&before);
             editor->localMutation = true;
         }
+        if (window == editor->input && !editor->updating &&
+            (track || msg == WM_KEYDOWN || msg == WM_SETTEXT || msg == EM_SETTEXTEX || msg == EM_UNDO || msg == EM_REDO))
+            editor->clearFindHighlights();
         auto result = DefSubclassProc(window, msg, wp, lp);
-        if (scrollable && (msg == WM_SIZE || msg == WM_STYLECHANGED || msg == WM_WINDOWPOSCHANGED))
+        if (window == editor->input && msg == WM_SETFOCUS)
+            SendMessageW(window, EM_HIDESELECTION, FALSE, 0);
+        if (window == editor->input && !editor->updating &&
+            (msg == WM_VSCROLL || msg == WM_HSCROLL || msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL ||
+             msg == WM_SIZE || msg == EM_SETSCROLLPOS || msg == WM_KEYUP))
+            editor->paintFindHighlights();
+        if (scrollable && (msg == WM_SIZE || msg == WM_STYLECHANGED || msg == WM_WINDOWPOSCHANGED)) {
             editor->updateScrollRegion(window);
+            if (window == editor->input) editor->projectFindMarkers();
+        }
         if (scrollable &&
             (msg == WM_PAINT || msg == WM_TIMER || msg == WM_NCACTIVATE || msg == WM_SETREDRAW ||
              msg == EM_SETREADONLY || msg == WM_WINDOWPOSCHANGED || msg == WM_STYLECHANGED ||
@@ -2632,6 +3027,7 @@ LRESULT Editor::message(UINT msg, WPARAM wp, LPARAM lp) {
             paintScrollbars(window, dc);
             RestoreDC(dc, saved);
         }
+        paintLineNumbers(dc);
         if (msg == WM_PAINT)
             EndPaint(panel, &paint);
         return 0;
@@ -2757,7 +3153,8 @@ LRESULT Editor::message(UINT msg, WPARAM wp, LPARAM lp) {
             return TRUE;
         }
         RECT r = item.rcItem;
-        auto dc = item.hDC;
+        ChromePaint buffered(item.hDC, r);
+        auto dc = buffered.dc();
         POINT point;
         GetCursorPos(&point);
         ScreenToClient(item.hwndItem, &point);
@@ -2795,7 +3192,7 @@ LRESULT Editor::message(UINT msg, WPARAM wp, LPARAM lp) {
             changed();
             return 0;
         }
-        if (LOWORD(wp) == 100 && HIWORD(wp) == EN_VSCROLL && live && synchronized && !syncing) {
+        if (LOWORD(wp) == 100 && HIWORD(wp) == EN_VSCROLL && live && synchronized && !syncing && !updating) {
             PostMessageW(owner, EditorScroll, 0, 0);
             SetTimer(panel, 5, 150, nullptr);
             return 0;
@@ -2860,8 +3257,30 @@ LRESULT Editor::message(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND: {
         RECT r;
         GetClientRect(panel, &r);
+        int saved = SaveDC((HDC)wp);
+        for (auto window : {input, warningList}) {
+            if (!window || !IsWindowVisible(window))
+                continue;
+            RECT bounds{};
+            GetWindowRect(window, &bounds);
+            MapWindowPoints(nullptr, panel, (POINT *)&bounds, 2);
+            for (int axis : {SB_VERT, SB_HORZ}) {
+                auto track = scrollTrack(window, axis);
+                OffsetRect(&track, bounds.left, bounds.top);
+                ExcludeClipRect((HDC)wp, track.left, track.top, track.right, track.bottom);
+            }
+        }
+        if (input && !preview && IsWindowVisible(input)) {
+            RECT client{};
+            GetClientRect(input, &client);
+            MapWindowPoints(input, panel, (POINT *)&client, 2);
+            // The gutter supplies its own buffered background. Never erase
+            // its numbers between scroll/layout and the next gutter paint.
+            ExcludeClipRect((HDC)wp, MulDiv(12, dpi, 96), client.top, client.left, client.bottom);
+        }
         if (background)
             FillRect((HDC)wp, &r, background);
+        RestoreDC((HDC)wp, saved);
         return 1;
     }
     case WM_CTLCOLORLISTBOX:
@@ -2909,6 +3328,11 @@ void Editor::verify() {
     require(activity.hides == 0, "preview layout keeps toolbar buttons visible");
     require(activity.moves == 0, "preview layout keeps toolbar geometry stable");
     require(activity.paints == 0, "preview layout does not repaint unchanged toolbar buttons");
+    paintLineNumbers();
+    auto gutterPaints = lineNumberPaints;
+    for (int refresh = 0; refresh < 20; ++refresh)
+        paintScrollbars(input);
+    require(lineNumberPaints == gutterPaints, "unchanged scrollbar refreshes do not repaint line numbers");
     // Exercise parent-owned tracks without involving document parsing or undo.
     std::wstring overflow;
     for (int i = 0; i < 150; ++i)
@@ -2986,6 +3410,24 @@ void Editor::verify() {
                     "dragged scrollbar matches reader accent palette");
             SendMessageW(panel, WM_LBUTTONUP, 0, MAKELPARAM(end.x, end.y));
             require(!scrollWindow && GetCapture() != panel, "parent-owned scrollbar releases capture");
+            if (axis == SB_VERT) {
+                for (int boundary : {SB_TOP, SB_BOTTOM}) {
+                    SendMessageW(input, WM_VSCROLL, boundary, 0);
+                    UpdateWindow(input);
+                    paintLineNumbers();
+                    auto boundaryPaints = lineNumberPaints;
+                    auto boundaryScrollbarPaints = scrollbarPaints;
+                    for (int wheel = 0; wheel < 12; ++wheel) {
+                        SendMessageW(input, WM_MOUSEWHEEL,
+                                     MAKEWPARAM(0, boundary == SB_TOP ? WHEEL_DELTA : -WHEEL_DELTA), 0);
+                        UpdateWindow(input);
+                    }
+                    require(lineNumberPaints == boundaryPaints,
+                            "wheel input at source edges does not repaint unchanged line numbers");
+                    require(scrollbarPaints == boundaryScrollbarPaints,
+                            "wheel input at source edges does not repaint unchanged scrollbars");
+                }
+            }
             POINT origin{};
             SendMessageW(input, EM_SETSCROLLPOS, 0, (LPARAM)&origin);
             SendMessageW(input, EM_LINESCROLL, 0, 2);
@@ -3282,6 +3724,39 @@ void Editor::verify() {
         keys[VK_MENU] = keys[VK_RMENU] = 0x80;
         SetKeyboardState(keys);
         require(!key('E') && !key('2'), "AltGr combinations remain available for typing");
+    }
+    {
+        SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"Find find\nOther Find");
+        captureText();
+        auto originalText = cachedText;
+        SendMessageW(input, EM_EMPTYUNDOBUFFER, 0, 0);
+        CHARRANGE selected{0, 0}; SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&selected);
+        SendMessageW(input, WM_CHAR, L'X', 1);
+        captureText();
+        auto before = cachedText;
+        auto oldRevision = revision;
+        auto dirty = SendMessageW(input, EM_GETMODIFY, 0, 0);
+        auto canUndo = SendMessageW(input, EM_CANUNDO, 0, 0);
+        std::atomic_bool cancel = false;
+        auto hits = std::make_shared<MatchIndex>(indexMatches(before, L"find", cancel));
+        SendMessageW(input, EM_EXGETSEL, 0, (LPARAM)&selected);
+        POINT oldScroll{}; SendMessageW(input, EM_GETSCROLLPOS, 0, (LPARAM)&oldScroll);
+        setFindResults(hits, hits->offsets.front());
+        presentFind();
+        CHARRANGE after{}; SendMessageW(input, EM_EXGETSEL, 0, (LPARAM)&after);
+        POINT newScroll{}; SendMessageW(input, EM_GETSCROLLPOS, 0, (LPARAM)&newScroll);
+        require(selected.cpMin == after.cpMin && selected.cpMax == after.cpMax && oldScroll.x == newScroll.x && oldScroll.y == newScroll.y,
+                "Find background formatting preserves editor selection and scroll");
+        require(revision == oldRevision && SendMessageW(input, EM_GETMODIFY, 0, 0) == dirty &&
+                SendMessageW(input, EM_CANUNDO, 0, 0) == canUndo, "Find formatting preserves revision modified flag and undo availability");
+        setFindResults(nullptr, UINT32_MAX);
+        SendMessageW(input, EM_UNDO, 0, 0); captureText();
+        require(cachedText == originalText, "undo after Find removes the typed character rather than formatting");
+        SendMessageW(input, EM_REDO, 0, 0); captureText();
+        require(cachedText == before, "redo after Find restores the typed character");
+        setFindResults(hits, hits->offsets.front());
+        SendMessageW(input, WM_CHAR, L'Y', 1);
+        require(!searchResults && activeSearch == UINT32_MAX, "editing immediately invalidates Find highlights");
     }
     for (size_t size : {1024u * 1024u, 10u * 1024u * 1024u}) {
         std::wstring large;

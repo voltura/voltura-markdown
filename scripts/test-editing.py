@@ -280,7 +280,7 @@ for accept in (False, True):
         point = round(40 * scale) | (round(8 * scale) << 16)
         u.SendMessageW(canvas, 0x0201, 1, point)
         u.SendMessageW(canvas, 0x0202, 0, point)
-        destination_line = navigation_source[: navigation_source.rindex(destination_markup)].count("\n")
+        destination_line = u.SendMessageW(edit, 0x0436, 0, navigation_source.rindex(destination_markup))
         wait(
             lambda: u.SendMessageW(edit, 0x00CE, 0, 0) >= destination_line - 1,
             "preview heading link moves source to destination",
@@ -323,14 +323,14 @@ for accept in (False, True):
         time.sleep(0.7)
         for marker in ("<tbody>", "<tfoot>", "<p>HTML caption"):
             position = scroll_source.index(marker)
-            target_line = scroll_source[:position].count("\n")
+            target_line = u.SendMessageW(edit, 0x0436, 0, position)
             u.SendMessageW(edit, 0x00B6, 0, target_line - u.SendMessageW(edit, 0x00CE, 0, 0))
             wait(
                 lambda: abs(u.SendMessageW(hwnd, 0x8028, 0, 0) - 1 - position) < 3,
                 "preview anchors ignore hidden markup and retain table row-group locations",
             )
         section = scroll_source.index("## Aligned section")
-        line = scroll_source[:section].count("\n")
+        line = u.SendMessageW(edit, 0x0436, 0, section)
         u.SendMessageW(edit, 0x00B6, 0, line - u.SendMessageW(edit, 0x00CE, 0, 0))
         wait(
             lambda: abs(u.SendMessageW(hwnd, 0x8028, 0, 0) - 1 - section) < 3,
@@ -345,10 +345,69 @@ for accept in (False, True):
         print(
             "PASS: source and preview align across hidden markup, reordered footers, table bands, and tall images in both directions"
         )
+        wrapped_source = (
+            "# Wrapped source\n\n"
+            + ("A long protocol paragraph with `inline code` and readable words. " * 30 + "\n\n") * 8
+            + "### AI Assistant\n\n"
+            + "Following paragraph.\n\n" * 80
+        )
+        set_text(edit, wrapped_source)
+        time.sleep(0.8)
+        wrapped_lines = u.SendMessageW(edit, 0x00BA, 0, 0)
+        assert wrapped_lines > wrapped_source.count("\n") + 40, "split source must wrap long paragraphs"
+        assert text(edit) == wrapped_source, "soft wrapping must not alter source"
+        heading = wrapped_source.index("### AI Assistant")
+        heading_line = u.SendMessageW(edit, 0x0436, 0, heading)
+        u.SendMessageW(edit, 0x00B6, 0, heading_line - u.SendMessageW(edit, 0x00CE, 0, 0))
+        wait(lambda: abs(u.SendMessageW(hwnd, 0x8028, 0, 0) - 1 - heading) < 3,
+             "wrapped source heading aligns with preview")
+        for direction in (0, 1, 0):
+            u.SendMessageW(hwnd, 0x0115, direction, 0)
+            time.sleep(0.1)
+        assert u.SendMessageW(edit, 0x00CE, 0, 0) < heading_line
+        command(panel, 12)
+        wait(lambda: u.SendMessageW(edit, 0x00BA, 0, 0) == wrapped_source.count("\n") + 1,
+             "full-width source restores unwrapped lines")
+        command(panel, 12)
+        wait(lambda: u.SendMessageW(edit, 0x00BA, 0, 0) == wrapped_lines, "split source wraps again")
+        assert text(edit) == wrapped_source, "view changes preserve source"
+        capture("wrapped-source.png")
+        print("PASS: split source wraps long paragraphs, synchronizes both ways, and preserves text")
+        set_text(edit, scroll_source)
+        time.sleep(0.8)
         for mode in ("dark", "light"):
             if mode == "light":
                 command(hwnd, 103)
                 time.sleep(0.15)
+            # Let lazy layouts settle before reaching the final bottom boundary.
+            for settle in range(4):
+                u.SendMessageW(hwnd, 0x0115, 7, 0)  # SB_BOTTOM
+                time.sleep(0.3)
+            bottom_position = u.SendMessageW(hwnd, 0x8028, 0, 0)
+            u.SendMessageW(edit, 0x0115, 6, 0)  # Source SB_TOP.
+            wait(lambda: u.SendMessageW(hwnd, 0x8028, 0, 0) == 1, "source returns preview to top")
+            u.SendMessageW(edit, 0x0115, 7, 0)  # Source SB_BOTTOM.
+            wait(
+                lambda: u.SendMessageW(hwnd, 0x8028, 0, 0) == bottom_position,
+                f"{mode} source bottom reaches preview bottom across tall images and tables",
+            )
+            for step in range(5):
+                u.SendMessageW(edit, 0x020A, ((-120) & 0xFFFF) << 16, 0)
+                time.sleep(0.03)
+                assert u.SendMessageW(hwnd, 0x8028, 0, 0) == bottom_position, (
+                    f"{mode} source wheel moved preview away from bottom"
+                )
+            bottom_samples = []
+            for step in range(30):
+                u.SendMessageW(canvas, 0x020A, ((-120) & 0xFFFF) << 16, 0)
+                for sample in range(20):
+                    time.sleep(0.01)
+                    position = u.SendMessageW(hwnd, 0x8028, 0, 0)
+                    bottom_samples.append(position)
+            assert all(position == bottom_position for position in bottom_samples), (
+                f"{mode} preview moved at bottom: {bottom_position} -> "
+                f"{min(bottom_samples)}..{max(bottom_samples)} (last {bottom_samples[-1]})"
+            )
             for step in range(80):
                 # Exercise both source-driven and preview-driven rapid scrolling.
                 u.SendMessageW(hwnd, 0x0115, 1 if step % 20 < 10 else 0, 0)
@@ -366,7 +425,7 @@ for accept in (False, True):
         command(panel, 9)
         time.sleep(0.1)
         capture("editor-dark.png")
-        for action, title in ((50, "Find"), (51, "Replace")):
+        for action, title in ((51, "Replace"),):
             command(panel, action)
             find = dialog(title)
             check_dialog_theme(find, True)
@@ -389,7 +448,7 @@ for accept in (False, True):
                 wait(lambda: text(edit) == source, "themed Replace All undo")
             command(find, 2)
             wait(lambda: not u.IsWindowVisible(find), "close find dialog")
-        print("PASS: Find and Replace follow dark/light theme while open")
+        print("PASS: Replace follows dark/light theme while open")
         command(panel, 3)
         unsaved = dialog("Unsaved Markdown")
         check_dialog_theme(unsaved, True)
@@ -405,7 +464,17 @@ for accept in (False, True):
             for action, title in pickers:
                 command(panel, action)
                 picker = dialog(title)
-                check_dialog_theme(picker, night)
+                if title == "Open":
+                    wait(
+                        lambda: any(
+                            class_name(h) == "SHELLDLL_DefView"
+                            for h in windows(process.pid, picker)
+                        ),
+                        "Explorer-style Open dialog",
+                    )
+                    assert not u.GetPropW(picker, "VolturaDialogColors")
+                else:
+                    check_dialog_theme(picker, night)
                 mode = "dark" if night else "light"
                 capture(title.lower().replace(" ", "-") + "-" + mode + ".png", picker)
                 if title == "Print":
@@ -417,7 +486,7 @@ for accept in (False, True):
                     command(picker, 2)
                 wait(lambda: not u.IsWindowVisible(picker), "cancel " + title)
         command(hwnd, 103)
-        print("PASS: save confirmation and file/print pickers follow both app themes")
+        print("PASS: Explorer-style Open and themed save/print pickers in both app themes")
         command(hwnd, 103)
         time.sleep(0.15)
         capture("editor-light.png")
@@ -454,6 +523,13 @@ for accept in (False, True):
         )
         at = len(text(edit))
         u.SendMessageW(edit, 0x00B1, at, at)
+        for night in (True, False):
+            command(hwnd, 103)
+            command(panel, 15)
+            image_dialog = dialog("Insert image")
+            check_dialog_theme(image_dialog, night)
+            capture("image-" + ("dark" if night else "light") + ".png", image_dialog)
+            command(image_dialog, 2)
         command(panel, 15)
         image_dialog = dialog("Insert image")
         set_text(u.GetDlgItem(image_dialog, 201), "Local image")

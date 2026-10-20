@@ -186,6 +186,7 @@ struct App {
         finishRenderer();
     }
     HWND hwnd = nullptr, canvas = nullptr, tooltip = nullptr, search = nullptr, backButton = nullptr;
+    std::array<HWND, 4> findButtons{};
     std::array<HWND, 7> buttons{};
     std::array<HWND, 3> zoomButtons{};
     float top = 78;
@@ -258,6 +259,8 @@ struct App {
         resetLayout(false);
         positions();
         ShowWindow(canvas, SW_SHOWNA);
+        if (searching && doc)
+            find(false, false);
         SetWindowTextW(hwnd, doc && !doc->path.empty()
                                  ? (doc->path.filename().wstring() + L" — Voltura Markdown").c_str()
                                  : L"Voltura Markdown");
@@ -296,6 +299,7 @@ struct App {
         cancelSearch();
         searching = false;
         ShowWindow(search, SW_HIDE);
+        updateFindControls();
         editOriginal = doc;
         editor = std::make_unique<Editor>(hwnd, *doc, dark, (unsigned)dpi, create);
         visibility(true);
@@ -488,7 +492,7 @@ struct App {
     void invalidateHeader() {
         RECT r;
         GetClientRect(hwnd, &r);
-        r.bottom = (LONG)(78 * scale());
+        r.bottom = (LONG)(headerBottom() * scale());
         InvalidateRect(hwnd, &r, FALSE);
     }
     void paintHeader() {
@@ -516,15 +520,16 @@ struct App {
             auto box = CreateSolidBrush(dark ? RGB(28, 34, 45) : RGB(255, 255, 255));
             auto oldBrush = SelectObject(dc, box);
             auto oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
-            float boxWidth = searchBoxWidth();
-            RoundRect(dc, (int)(28 * scale()), (int)(20 * scale()), (int)((28 + boxWidth) * scale()),
-                      (int)(54 * scale()), (int)(8 * scale()), (int)(8 * scale()));
+            float boxWidth = searchBoxWidth(), sy = searchY();
+            RoundRect(dc, (int)(28 * scale()), (int)(sy * scale()), (int)((28 + boxWidth) * scale()),
+                      (int)((sy + 34) * scale()), (int)(8 * scale()), (int)(8 * scale()));
             SelectObject(dc, oldBrush);
             SelectObject(dc, oldPen);
             DeleteObject(box);
-            RECT countBounds{(LONG)((28 + boxWidth - searchCountWidth()) * scale()), (LONG)(20 * scale()),
-                             (LONG)((20 + boxWidth) * scale()), (LONG)(54 * scale())};
-            DrawTextW(dc, searchStatus.c_str(), (int)searchStatus.size(), &countBounds,
+            RECT countBounds{(LONG)((28 + boxWidth - searchActionsWidth() - searchCountWidth()) * scale()),
+                             (LONG)(sy * scale()), (LONG)((20 + boxWidth - searchActionsWidth()) * scale()),
+                             (LONG)((sy + 34) * scale())};
+            DrawTextW(dc, searchDisplayStatus.c_str(), (int)searchDisplayStatus.size(), &countBounds,
                       DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             if (showSearchHint()) {
                 RECT hintBounds{(LONG)(28 * scale()), (LONG)(55 * scale()), (LONG)((20 + boxWidth) * scale()),
@@ -583,6 +588,9 @@ struct App {
         }
         if (!a)
             return DefWindowProcW(w, msg, wp, lp);
+#ifdef VMD_TESTING
+        if (msg == WM_APP + 45) { a->printCanvas(); return 0; }
+#endif
         if (msg == WM_PAINT) {
             a->paint();
             return 0;
@@ -597,6 +605,8 @@ struct App {
             }
         }
         if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL)
+            return a->message(msg, wp, lp);
+        if (msg == WM_CONTEXTMENU)
             return a->message(msg, wp, lp);
         if (msg == WM_MOUSELEAVE) {
             a->codePointerX = a->codePointerY = -1;
@@ -617,20 +627,20 @@ struct App {
     void fill(D2D1_RECT_F r, D2D1_COLOR_F c, float radius = 0) {
         colour(c);
         if (radius)
-            target->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), brush.Get());
+            drawingTarget()->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), brush.Get());
         else
-            target->FillRectangle(r, brush.Get());
+            drawingTarget()->FillRectangle(r, brush.Get());
     }
     void line(float x, float y, float x2, float y2, D2D1_COLOR_F c, float stroke = 1) {
         colour(c);
-        target->DrawLine({x, y}, {x2, y2}, brush.Get(), stroke);
+        drawingTarget()->DrawLine({x, y}, {x2, y2}, brush.Get(), stroke);
     }
     void label(std::wstring_view s, D2D1_RECT_F r, D2D1_COLOR_F c, float size = 14) {
         ComPtr<IDWriteTextFormat> f;
         write->CreateTextFormat(L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
                                 DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"", &f);
         colour(c);
-        target->DrawTextW(s.data(), (UINT32)s.size(), f.Get(), r, brush.Get());
+        drawingTarget()->DrawTextW(s.data(), (UINT32)s.size(), f.Get(), r, brush.Get());
     }
     bool device() {
         if (target)
@@ -848,6 +858,7 @@ struct App {
         return lines * size * 1.48 + (source ? 0 : 16 * zoom);
     }
     void resetLayout(bool keep = true) {
+        queueFindMarkers();
         codeButtons.clear();
         pressedCode = copiedCode = SIZE_MAX;
         KillTimer(hwnd, 19);
@@ -941,6 +952,7 @@ struct App {
         }
         out.height += 14 * zoom;
         heights.set(index, out.height);
+        queueFindMarkers();
         maxWidth = std::max(maxWidth, out.width + left());
         cacheCost += out.cost;
         auto [found, inserted] = cache.emplace(index, std::move(out));
@@ -972,6 +984,7 @@ struct App {
         }
         auto out = nativeLayout(blocks()[index], contentWidth(), index);
         heights.set(index, out.height);
+        queueFindMarkers();
         maxWidth = std::max(maxWidth, out.width + left());
         cacheCost += out.cost;
         auto [it, _] = cache.emplace(index, std::move(out));
@@ -1051,7 +1064,7 @@ struct App {
                 image = images->raster(image, w * dpi / 96.f, h * dpi / 96.f, &out.imagePending);
                 D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
                     D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-                if (SUCCEEDED(target->CreateBitmap(D2D1::SizeU(image->width, image->height),
+                if (SUCCEEDED(drawingTarget()->CreateBitmap(D2D1::SizeU(image->width, image->height),
                                                    image->pixels.data(), image->width * 4, props,
                                                    &out.bitmap))) {
                     float shift = b.align == 2 ? (available - w) / 2 : b.align == 3 ? available - w : 0;
@@ -1497,9 +1510,14 @@ struct App {
         bars();
     }
     void scrollTo(double destination) {
+        double clamped = std::clamp(destination, 0., std::max(0., heights.total() - (height - top - bottom)));
+        // Repeated wheel input at an edge must not restart animation or round-trip
+        // through Rich Edit's integer scroll positions when the preview cannot move.
+        if (clamped == (scrollAnimating ? scrollTarget : scroll))
+            return;
         BOOL animations = TRUE;
         SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
-        scrollTarget = std::clamp(destination, 0., std::max(0., heights.total() - (height - top - bottom)));
+        scrollTarget = clamped;
 #ifdef VMD_TESTING
         if (scrollBenchmark && benchmarkAnimations)
             animations = TRUE;
@@ -1634,6 +1652,10 @@ struct App {
     }
     void drawScrollbars(const Palette &colors) {
         if (heights.total() > height - top - bottom) {
+            if (searching && !editorSearch()) {
+                for (auto y : findMarkers) fill(D2D1::RectF(width, y, width + 12, y + 2 / scale()), rgb(0xe7b54b));
+                if (activeFindMarker >= 0) fill(D2D1::RectF(width, activeFindMarker, width + 12, activeFindMarker + 3 / scale()), rgb(0xe79632));
+            }
             auto r = verticalThumb();
             fill(r, scrollDrag == 1 ? colors.accent : colors.muted, 3);
         }
@@ -1674,35 +1696,71 @@ struct App {
         return D2D1::RectF(bounds.left + inset, bounds.top + 12 * zoom, bounds.right - inset,
                            bounds.top + 46 * zoom);
     }
-    void paint() {
+    ID2D1RenderTarget *drawingTarget() {
 #ifdef VMD_TESTING
-        auto paintStarted = std::chrono::steady_clock::now();
+        if (captureTarget) return captureTarget.Get();
 #endif
-        PAINTSTRUCT ps;
-        BeginPaint(canvas, &ps);
-        if (!device()) {
-            EndPaint(canvas, &ps);
-            return;
+        return target.Get();
+    }
+#ifdef VMD_TESTING
+    ComPtr<ID2D1DCRenderTarget> captureTarget;
+    void printCanvas() {
+        if (!target || captureTarget || metricsFile.empty()) return;
+        RECT r; GetClientRect(canvas, &r);
+        BITMAPINFO info{};
+        info.bmiHeader = {sizeof(BITMAPINFOHEADER), r.right, -r.bottom, 1, 32, BI_RGB};
+        void *pixels = nullptr;
+        HDC dc = CreateCompatibleDC(nullptr);
+        HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+        auto previous = SelectObject(dc, bitmap);
+        auto props = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), dpi, dpi);
+        HRESULT captured = d2d->CreateDCRenderTarget(&props, &captureTarget);
+        if (SUCCEEDED(captured)) captured = captureTarget->BindDC(dc, &r);
+        if (SUCCEEDED(captured)) {
+            auto oldBrush = brush;
+            clearLayouts();
+            captureTarget->CreateSolidColorBrush(rgb(0), &brush);
+            captureTarget->SetTransform(D2D1::Matrix3x2F::Translation(0, -top));
+            bool painted;
+            captured = renderFrame(painted);
+            clearLayouts();
+            brush = oldBrush;
         }
-        if (zoomLayoutPending) {
-            zoomLayoutPending = false;
-            // Publish the new zoom with measured look-ahead extents, so the next timer
-            // cannot immediately resize the scrollbar from the estimated heights.
-            measureAhead(false);
+        if (!metricsFile.empty()) {
+            std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+            out << "{\"capture_hresult\":" << (int64_t)captured << "}\n";
         }
+        captureTarget.Reset();
+        GdiFlush();
+        if (SUCCEEDED(captured) && pixels) {
+            BITMAPFILEHEADER file{0x4d42};
+            file.bfOffBits = sizeof(file) + sizeof(info.bmiHeader);
+            file.bfSize = file.bfOffBits + r.right * r.bottom * 4;
+            std::ofstream out(std::filesystem::path(metricsFile + L".canvas.bmp"), std::ios::binary);
+            out.write((const char *)&file, sizeof(file));
+            out.write((const char *)&info.bmiHeader, sizeof(info.bmiHeader));
+            out.write((const char *)pixels, r.right * r.bottom * 4);
+        }
+        SelectObject(dc, previous);
+        DeleteObject(bitmap);
+        DeleteDC(dc);
+    }
+#endif
+    HRESULT renderFrame(bool &paintedDocument) {
         auto colors = palette(dark);
         ComPtr<ID2D1SolidColorBrush> linkBrush;
-        target->BeginDraw();
-        target->Clear(colors.bg);
+        drawingTarget()->BeginDraw();
+        drawingTarget()->Clear(colors.bg);
         codeButtons.clear();
         codeButtonScroll = scroll;
         codeButtonHorizontal = horizontal;
         std::array<ComPtr<ID2D1SolidColorBrush>, 5> syntaxBrushes;
         const unsigned darkSyntax[] = {0xc5a5ff, 0xa8d8a0, 0x93a18c, 0xf0be88, 0x8cd5ef};
         const unsigned lightSyntax[] = {0x7436a8, 0x256330, 0x5c6b52, 0x955014, 0x176480};
-        bool paintedDocument = false;
+        paintedDocument = false;
         if (doc && !blocks().empty()) {
-            target->PushAxisAlignedClip(D2D1::RectF(0, top, width, height - bottom),
+            drawingTarget()->PushAxisAlignedClip(D2D1::RectF(0, top, width, height - bottom),
                                         D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             try {
                 size_t i = heights.find(scroll);
@@ -1741,15 +1799,15 @@ struct App {
                         if (!l.plain && b.kind == Kind::Image) {
                             auto bounds = blockBounds(i, l, (float)y);
                             if (l.bitmap)
-                                target->DrawBitmap(l.bitmap.Get(), bounds);
+                                drawingTarget()->DrawBitmap(l.bitmap.Get(), bounds);
                             else {
                                 bounds.bottom = bounds.top + 48 * zoom;
                                 fill(bounds, colors.code, 6);
-                                target->PushAxisAlignedClip(bounds, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                                drawingTarget()->PushAxisAlignedClip(bounds, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
                                 label(b.length ? std::wstring_view(text()).substr(b.start, b.length)
                                                : L"Image",
                                       imageLabelBounds(bounds), colors.muted, 14 * zoom);
-                                target->PopAxisAlignedClip();
+                                drawingTarget()->PopAxisAlignedClip();
                             }
                         }
                         for (auto rect : l.tableHeaders) {
@@ -1765,11 +1823,11 @@ struct App {
                             rect.top += (float)y;
                             rect.bottom += (float)y;
                             colour(colors.border);
-                            target->DrawRectangle(rect, brush.Get());
+                            drawingTarget()->DrawRectangle(rect, brush.Get());
                         }
                         for (auto &p : l.parts) {
                             if (p.bitmap) {
-                                target->DrawBitmap(p.bitmap.Get(),
+                                drawingTarget()->DrawBitmap(p.bitmap.Get(),
                                                    D2D1::RectF(x + p.x, (float)y + p.y, x + p.x + p.width,
                                                                (float)y + p.y + p.height));
                                 continue;
@@ -1794,12 +1852,24 @@ struct App {
                                 cap.bottom += py;
                                 fill(cap, colors.panel, 3 * zoom);
                                 colour(colors.border);
-                                target->DrawRoundedRectangle(D2D1::RoundedRect(cap, 3 * zoom, 3 * zoom),
+                                drawingTarget()->DrawRoundedRectangle(D2D1::RoundedRect(cap, 3 * zoom, 3 * zoom),
                                                              brush.Get(), zoom);
                             }
-                            if (searchMatch)
-                                drawSelection(p, px, py, anchor, caret, rgb(0xe7b54b, .35f));
-                            if (anchor != caret)
+                            if (searching && !editorSearch() && matchIndex) {
+                                auto &hits = matchIndex->offsets;
+                                BOOL trailing, inside;
+                                DWRITE_HIT_TEST_METRICS first{}, last{};
+                                p.layout->HitTestPoint(std::max(0.f, -px), std::max(0.f, top - py), &trailing, &inside, &first);
+                                p.layout->HitTestPoint(std::max(0.f, width - px), std::max(0.f, height - bottom - py), &trailing, &inside, &last);
+                                uint32_t visibleFrom = p.start + std::min(first.textPosition, last.textPosition);
+                                uint32_t visibleTo = p.start + std::max(first.textPosition + first.length, last.textPosition + last.length);
+                                auto it = std::lower_bound(hits.begin(), hits.end(), visibleFrom >= matchIndex->length ? visibleFrom - matchIndex->length + 1 : 0);
+                                for (; it != hits.end() && *it < visibleTo; ++it)
+                                    drawSelection(p, px, py, *it, *it + matchIndex->length, rgb(0xe7b54b, .30f));
+                            }
+                            if (searchMatch && !editorSearch())
+                                drawSelection(p, px, py, anchor, caret, rgb(0xe79632, .65f));
+                            if (anchor != caret && !searchMatch)
                                 drawSelection(p, px, py, std::min(anchor, caret), std::max(anchor, caret),
                                               colors.selection);
                             colour(colors.fg);
@@ -1807,7 +1877,7 @@ struct App {
                                 for (auto token : p.codeTokens) {
                                     auto slot = (size_t)token.color;
                                     if (!syntaxBrushes[slot])
-                                        target->CreateSolidColorBrush(
+                                        drawingTarget()->CreateSolidColorBrush(
                                             rgb(dark ? darkSyntax[slot] : lightSyntax[slot]),
                                             &syntaxBrushes[slot]);
                                     p.layout->SetDrawingEffect(syntaxBrushes[slot].Get(),
@@ -1819,12 +1889,12 @@ struct App {
                                     if (run.link.empty() || end <= begin)
                                         continue;
                                     if (!linkBrush)
-                                        target->CreateSolidColorBrush(colors.accent, &linkBrush);
+                                        drawingTarget()->CreateSolidColorBrush(colors.accent, &linkBrush);
                                     p.layout->SetDrawingEffect(linkBrush.Get(),
                                                                {begin - p.start, end - begin});
                                 }
                             }
-                            target->DrawTextLayout({px, py}, p.layout.Get(), brush.Get(),
+                            drawingTarget()->DrawTextLayout({px, py}, p.layout.Get(), brush.Get(),
                                                    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
                             p.layout->SetDrawingEffect(nullptr, {0, p.length});
                             if (p.headingDividerWidth > 0) {
@@ -1846,13 +1916,13 @@ struct App {
                         auto back = D2D1::RoundedRect(D2D1::RectF(r.left + 12 * zoom, r.top + 7 * zoom,
                                                                   r.left + 23 * zoom, r.top + 19 * zoom),
                                                       1, 1);
-                        target->DrawRoundedRectangle(back, brush.Get(), 1.4f * zoom);
+                        drawingTarget()->DrawRoundedRectangle(back, brush.Get(), 1.4f * zoom);
                         auto front = D2D1::RoundedRect(D2D1::RectF(r.left + 7 * zoom, r.top + 12 * zoom,
                                                                    r.left + 18 * zoom, r.top + 24 * zoom),
                                                        1, 1);
                         fill(front.rect, colors.panel, zoom);
                         colour(colors.muted);
-                        target->DrawRoundedRectangle(front, brush.Get(), 1.4f * zoom);
+                        drawingTarget()->DrawRoundedRectangle(front, brush.Get(), 1.4f * zoom);
                         bool copied = copiedCode == i && GetTickCount64() < copiedCodeUntil;
                         if (hovered || copied) {
                             auto tip = D2D1::RectF(std::max(0.f, r.left - 183 * zoom), r.top,
@@ -1873,10 +1943,10 @@ struct App {
             } catch (const std::exception &) {
                 PostMessageW(hwnd, WM_COMMAND, 110, 0);
             }
-            target->PopAxisAlignedClip();
+            drawingTarget()->PopAxisAlignedClip();
             bars();
         } else if (!loading) {
-            drawEmptyState(target.Get(), D2D1::RectF(0, top, width, height - bottom), dark);
+            drawEmptyState(drawingTarget(), D2D1::RectF(0, top, width, height - bottom), dark);
         }
         if (!notice.empty()) {
             fill(D2D1::RectF(20, height - 43, width - 20, height - 8), colors.panel, 6);
@@ -1896,12 +1966,31 @@ struct App {
             write->CreateEllipsisTrimmingSign(format.Get(), &ellipsis);
             format->SetTrimming(&trimming, ellipsis.Get());
             colour(colors.fg);
-            target->DrawTextW(hoveredLink.data(), (UINT32)hoveredLink.size(), format.Get(),
+            drawingTarget()->DrawTextW(hoveredLink.data(), (UINT32)hoveredLink.size(), format.Get(),
                               D2D1::RectF(8, height - bottom - 25, right - 8, height - bottom - 3),
                               brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
         drawScrollbars(colors);
-        HRESULT hr = target->EndDraw();
+        return drawingTarget()->EndDraw();
+    }
+    void paint() {
+#ifdef VMD_TESTING
+        auto paintStarted = std::chrono::steady_clock::now();
+#endif
+        PAINTSTRUCT ps;
+        BeginPaint(canvas, &ps);
+        if (!device()) {
+            EndPaint(canvas, &ps);
+            return;
+        }
+        if (zoomLayoutPending) {
+            zoomLayoutPending = false;
+            // Publish the new zoom with measured look-ahead extents, so the next timer
+            // cannot immediately resize the scrollbar from the estimated heights.
+            measureAhead(false);
+        }
+        bool paintedDocument = false;
+        HRESULT hr = renderFrame(paintedDocument);
         // Exercise the recovery from an EndDraw device-loss result without requiring a real GPU reset.
 #ifdef VMD_TESTING
         if (promotionPending && failRendererFirstFrame)
@@ -1985,7 +2074,7 @@ struct App {
 #endif
         EndPaint(canvas, &ps);
 #ifdef VMD_TESTING
-        if (!metricsFile.empty() && searchMatch && paintedFindGeneration != findGeneration && SUCCEEDED(hr)) {
+        if (!editorSearch() && !metricsFile.empty() && searchMatch && paintedFindGeneration != findGeneration && SUCCEEDED(hr)) {
             paintedFindGeneration = findGeneration;
             std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
             out << "{\"search_match_paint_ms\":"
@@ -1995,7 +2084,7 @@ struct App {
                 << ",\"search_anchor\":" << anchor << "}\n";
         }
 #endif
-        if (SUCCEEDED(hr) && paintedDocument && countPending) {
+        if (SUCCEEDED(hr) && paintedDocument && countPending && !editorSearch()) {
             countPending = false;
             startCount(countStart, countBackwards);
         }
@@ -2337,6 +2426,17 @@ struct App {
         return DefWindowProcW(window, msg, wp, lp);
     }
     HWND nextTabControl(HWND current, bool reverse) {
+        if (searching) {
+            std::vector<HWND> controls{search};
+            for (auto control : {findButtons[3], findButtons[0], findButtons[1], findButtons[2]})
+                if (IsWindowVisible(control) && IsWindowEnabled(control)) controls.push_back(control);
+            auto found = std::find(controls.begin(), controls.end(), current);
+            if (!current || found != controls.end()) {
+                if (!current) return reverse ? controls.back() : controls.front();
+                auto i = (size_t)(found - controls.begin());
+                return controls[(i + controls.size() + (reverse ? -1 : 1)) % controls.size()];
+            }
+        }
         auto first = GetNextDlgTabItem(hwnd, nullptr, FALSE);
         auto last = GetNextDlgTabItem(hwnd, nullptr, TRUE);
         if (IsWindowVisible(associationPanel)) {
@@ -2399,7 +2499,7 @@ struct App {
         chromeWidth = width;
         canvasLeft = 0;
         height = std::max(1.f, r.bottom / scale() - 12);
-        top = 78;
+        top = headerBottom();
         float start = width - (fullscreen ? 7 : 6) * 38 - 20;
         for (int i = 0; i < 7; ++i)
             MoveWindow(buttons[i], (int)((start + i * 38) * scale()), (int)(20 * scale()),
@@ -2410,11 +2510,11 @@ struct App {
             MoveWindow(canvas, 0, (int)(top * scale()), r.right,
                        std::max<LONG>(1, r.bottom - (int)(top * scale())), FALSE);
         if (editor && !informationView) {
-            editor->position((int)(78 * scale()));
+            editor->position((int)(headerBottom() * scale()));
             bool visible = editor->isPreview() || editor->isLive();
             ShowWindow(canvas, visible ? SW_SHOWNA : SW_HIDE);
             if (visible) {
-                auto bounds = editor->previewBounds((int)(78 * scale()));
+                auto bounds = editor->previewBounds((int)(headerBottom() * scale()));
                 canvasLeft = bounds.left / scale();
                 top = bounds.top / scale();
                 width = std::max(1.f, (bounds.right - bounds.left) / scale() - 12);
@@ -2437,33 +2537,49 @@ struct App {
         positionZoomOverlay();
         invalidateHeader();
         positionSearch();
+        queueFindMarkers();
         if (backButton)
             MoveWindow(backButton, (int)(20 * scale()), (int)(20 * scale()), (int)(34 * scale()),
                        (int)(34 * scale()), TRUE);
     }
+    bool editorSearch() const { return editor && !informationView; }
+    float searchActionsWidth() const { return editorSearch() ? 128.f : 96.f; }
+    float searchCountWidth() const { return 116.f; }
+    bool searchSecondRow() const {
+        return searching && chromeWidth - (fullscreen ? 7 : 6) * 38 - 68 <
+                                120 + 24 + searchCountWidth() + searchActionsWidth();
+    }
+    float headerBottom() const { return searchSecondRow() ? 118.f : 78.f; }
+    float searchY() const { return searchSecondRow() ? 70.f : 20.f; }
     float searchBoxWidth() const {
-        return std::max(100.f, chromeWidth - (fullscreen ? 7 : 6) * 38 - 20 - 48);
+        return std::max(100.f, chromeWidth - (searchSecondRow() ? 56.f : (fullscreen ? 7 : 6) * 38 + 68.f));
     }
-    float searchCountWidth() const {
-        return std::min(searchBoxWidth() * .55f,
-                        std::clamp((float)searchStatus.size() * 8 + 12, 96.f, 180.f));
-    }
-    bool showSearchHint() const {
-        return searching && countReady && searchTotal > 1 && searchBoxWidth() >= 350;
-    }
+    bool showSearchHint() const { return false; }
     void positionSearch() {
-        if (!search)
-            return;
+        if (!search) return;
         HDC dc = GetDC(search);
         auto oldFont = SelectObject(dc, uiFont ? uiFont : GetStockObject(DEFAULT_GUI_FONT));
         TEXTMETRICW metrics{};
         GetTextMetricsW(dc, &metrics);
-        SelectObject(dc, oldFont);
-        ReleaseDC(search, dc);
+        SelectObject(dc, oldFont); ReleaseDC(search, dc);
         int fieldHeight = metrics.tmHeight + 2 * GetSystemMetricsForDpi(SM_CYBORDER, (UINT)dpi);
-        MoveWindow(search, (int)(36 * scale()), (int)(37 * scale()) - fieldHeight / 2,
-                   (int)(std::max(24.f, searchBoxWidth() - searchCountWidth() - 24) * scale()), fieldHeight,
-                   TRUE);
+        float edge = 28 + searchBoxWidth() - searchActionsWidth();
+        MoveWindow(search, (int)(36 * scale()), (int)((searchY() + 17) * scale()) - fieldHeight / 2,
+                   (int)(std::max(24.f, searchBoxWidth() - searchCountWidth() - searchActionsWidth() - 24) * scale()),
+                   fieldHeight, TRUE);
+        for (size_t i = 0; i < findButtons.size(); ++i) {
+            float x = edge + (i == 3 ? 0.f : (float)(i + (editorSearch() ? 1 : 0)) * 32);
+            MoveWindow(findButtons[i], (int)(x * scale()), (int)((searchY() + 2) * scale()),
+                       (int)(30 * scale()), (int)(30 * scale()), TRUE);
+        }
+        updateFindControls();
+    }
+    void updateFindControls() {
+        for (size_t i = 0; i < findButtons.size(); ++i) {
+            ShowWindow(findButtons[i], showControls && searching && (i != 3 || editorSearch()) ? SW_SHOWNA : SW_HIDE);
+            if (i < 2)
+                EnableWindow(findButtons[i], GetWindowTextLengthW(search) > 0 && (!countReady || searchTotal > 0));
+        }
     }
     void visibility(bool show) {
         if (show == showControls)
@@ -2473,7 +2589,7 @@ struct App {
         // Remember the cursor before hiding so that message cannot reveal us again.
         if (GetCursorPos(&lastPointer))
             pointerKnown = true;
-        auto batch = BeginDeferWindowPos((int)buttons.size() + 2);
+        auto batch = BeginDeferWindowPos((int)buttons.size() + 3);
         auto stage = [&](HWND control, bool visible) {
             if (control && batch)
                 batch = DeferWindowPos(batch, control, nullptr, 0, 0, 0, 0,
@@ -2491,7 +2607,9 @@ struct App {
                 ShowWindow(buttons[i], show && (i != 6 || fullscreen) ? SW_SHOWNA : SW_HIDE);
             ShowWindow(backButton, show && informationView && !searching ? SW_SHOWNA : SW_HIDE);
             ShowWindow(search, show && searching ? SW_SHOWNA : SW_HIDE);
+            updateFindControls();
         }
+        updateFindControls();
         zoomVisibility();
         invalidateHeader();
     }
@@ -2529,6 +2647,7 @@ struct App {
             InvalidateRect(backButton, nullptr, FALSE);
         if (search)
             InvalidateRect(search, nullptr, FALSE);
+        for (auto button : findButtons) InvalidateRect(button, nullptr, FALSE);
         if (associationPanel) {
             InvalidateRect(associationPanel, nullptr, FALSE);
             for (auto button : associationButtons)
@@ -2650,6 +2769,17 @@ struct App {
         SendMessageW(search, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, 0);
         SendMessageW(search, EM_SETLIMITTEXT, 4096, 0);
         SetWindowSubclass(search, childProc, 1, (DWORD_PTR)this);
+        const wchar_t *findNames[] = {L"Previous match (Shift+Enter)", L"Next match (Enter)",
+                                      L"Close Find (Esc)", L"Find options"};
+        for (size_t i = 0; i < findButtons.size(); ++i) {
+            findButtons[i] = CreateWindowExW(0, L"BUTTON", findNames[i], WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 1, 1, hwnd, (HMENU)(INT_PTR)(202 + i), nullptr, nullptr);
+            SetWindowSubclass(findButtons[i], childProc, 1, (DWORD_PTR)this);
+            TOOLINFOW tip{sizeof(tip)};
+            tip.uFlags = TTF_IDISHWND | TTF_SUBCLASS; tip.hwnd = hwnd;
+            tip.uId = (UINT_PTR)findButtons[i]; tip.lpszText = const_cast<wchar_t *>(findNames[i]);
+            SendMessageW(tooltip, TTM_ADDTOOLW, 0, (LPARAM)&tip);
+        }
         backButton = CreateWindowExW(0, L"BUTTON", L"Back (Esc)", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0,
                                      1, 1, hwnd, (HMENU)106, nullptr, nullptr);
         SetWindowSubclass(backButton, childProc, 1, (DWORD_PTR)this);
@@ -2679,6 +2809,10 @@ struct App {
     }
     static LRESULT CALLBACK childProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
         auto a = (App *)data;
+#ifdef VMD_TESTING
+        if (w == a->search && msg == WM_PAINT)
+            ++a->searchPaints;
+#endif
         if (msg == WM_ERASEBKGND)
             return 1;
         if (msg == WM_GETDLGCODE && w == a->search)
@@ -2707,7 +2841,7 @@ struct App {
                 return 0;
             }
             if (wp == VK_F1 || wp == VK_ESCAPE || wp == VK_F11 || wp == VK_F3 ||
-                (ctrl && (wp == 'O' || wp == 'F' || w != a->search))) {
+                (ctrl && (wp == 'O' || wp == 'F' || wp == 'H' || w != a->search))) {
                 a->key(wp);
                 return 0;
             }
@@ -2743,7 +2877,7 @@ struct App {
         dialog.lpstrFile = path;
         dialog.nMaxFile = 32768;
         dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        if (themedOpenFile(&dialog))
+        if (GetOpenFileNameW(&dialog))
             open(path);
     }
     void reap() {
@@ -2920,7 +3054,11 @@ struct App {
         scroll = ratio * std::max(0., heights.total() - (height - top - bottom));
         bars();
         invalidate();
-        SetFocus(hwnd);
+        if (searching) {
+            find(false, false);
+            SetFocus(search);
+        } else
+            SetFocus(hwnd);
     }
     bool zoomCharacter(WPARAM character) {
         // Use translated characters so Shift and keyboard layouts produce the actual symbol.
@@ -2971,7 +3109,7 @@ struct App {
             visibility(true);
         }
         ShowWindow(buttons[6], fullscreen && showControls ? SW_SHOW : SW_HIDE);
-        SetFocus(hwnd);
+        SetFocus(searching ? search : hwnd);
     }
     HMENU createMenu() {
         bool hasFile = doc && !doc->path.empty() && !loading;
@@ -2995,12 +3133,15 @@ struct App {
                     {122, L"Use Windows theme", false, true, prefs.theme < 0},
                     {125, L"Help\tF1", false, !loading},
                     {123, L"About / open-source licenses", false, !loading}};
+        return createPopup(menuRows);
+    }
+    HMENU createPopup(std::vector<MenuRow> &rows) {
         HMENU popup = CreatePopupMenu();
         MENUINFO info{sizeof(info)};
         info.fMask = MIM_STYLE;
         info.dwStyle = MNS_NOCHECK;
         SetMenuInfo(popup, &info);
-        for (auto &row : menuRows) {
+        for (auto &row : rows) {
             MENUITEMINFOW item{sizeof(item)};
             item.fMask = MIIM_ID | MIIM_FTYPE | MIIM_STATE | MIIM_DATA | MIIM_STRING;
             item.wID = row.id;
@@ -3129,6 +3270,32 @@ struct App {
         if (id)
             command(id);
     }
+    void linkMenu(POINT point) {
+        POINT client = point;
+        if (!ScreenToClient(hwnd, &client))
+            return;
+        auto destination = linkAt(client.x / scale() - canvasLeft, client.y / scale());
+        if (destination.empty())
+            return;
+        std::vector<MenuRow> rows{{1, L"Copy link"}};
+        auto popup = createPopup(rows);
+        HBRUSH background = CreateSolidBrush(dark ? RGB(28, 34, 45) : RGB(255, 255, 255));
+        MENUINFO info{sizeof(info)};
+        info.fMask = MIM_BACKGROUND;
+        info.hbrBack = background;
+        SetMenuInfo(popup, &info);
+        menuOpen = true;
+        auto id = TrackPopupMenu(popup, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NOANIMATION,
+                                 point.x, point.y, 0, hwnd, nullptr);
+        menuOpen = false;
+        DestroyMenu(popup);
+        DeleteObject(background);
+        if (id == 1) {
+            notice = copyText(hwnd, destination) ? L"Link copied."
+                                                  : L"The clipboard is unavailable. Try again.";
+            invalidate();
+        }
+    }
     void command(int id) {
         if (id == 160) {
             beginEdit(true);
@@ -3250,6 +3417,29 @@ struct App {
         case 107:
             requestClose();
             break;
+        case 202:
+        case 203:
+            find(true, id == 202); SetFocus(search); break;
+        case 204:
+            closeSearch(); break;
+        case 205: {
+            std::vector<MenuRow> rows{{206, L"Match case", false, true, findOptions.matchCase},
+                                      {207, L"Whole word", false, true, findOptions.wholeWord}};
+            auto popup = createPopup(rows);
+            RECT r; GetWindowRect(findButtons[3], &r);
+            auto choice = TrackPopupMenu(popup, TPM_RETURNCMD | TPM_LEFTALIGN, r.left, r.bottom, 0, hwnd, nullptr);
+            DestroyMenu(popup);
+            if (choice) command(choice);
+            SetFocus(search); break;
+        }
+        case 206:
+        case 207:
+            if (editorSearch()) {
+                if (id == 206) findOptions.matchCase = !findOptions.matchCase;
+                else findOptions.wholeWord = !findOptions.wholeWord;
+                cancelSearch(); find(false);
+            }
+            break;
         case 110:
             if (notice != L"Windows could not draw part of this document.") {
                 notice = L"Windows could not draw part of this document.";
@@ -3325,7 +3515,7 @@ Use the **back arrow** or <kbd>Escape</kbd> to return to your reading position.
 - **Drag and drop:** drop a Markdown file into the window.
 - **Reveal controls:** move the pointer. Hover over an icon to see its name.
 - **Scroll:** <kbd>↑</kbd>/<kbd>↓</kbd> move vertically; <kbd>←</kbd>/<kbd>→</kbd> move horizontally across wide tables and code.
-- **Links:** colored link text shows its destination on hover. Click a heading link to navigate within the document; synchronized Live preview follows the destination in source too.
+- **Links:** colored link text shows its destination on hover. Right-click a link and choose **Copy link** to copy its destination, even when the reader cannot open it. Click a heading link to navigate within the document; synchronized Live preview follows the destination in source too.
 - **Code blocks:** click the copy icon in the upper-right corner to copy the complete block, including indentation and line breaks. Hover for **Copy code to clipboard**; **Copied!** confirms success.
 - Fenced code with a recognized language label uses basic syntax coloring: PowerShell, JavaScript/TypeScript, C#, C/C++, Python, JSON/JSONC, SQL, and shell/Bash. Other labels remain plain text. Inline code has a subtle background.
 - HTML tables support merged cells, captions, nested tables, images, and alignment hints. HTML images respect width/height, pictures can select light/dark sources, and simple SVG badges retain sharp text at different zoom levels. Adjacent Markdown badges wrap together.
@@ -3336,7 +3526,7 @@ Use the **back arrow** or <kbd>Escape</kbd> to return to your reading position.
 - **Find text:** press <kbd>Ctrl</kbd>+<kbd>F</kbd>.
 - **Next / previous match:** press <kbd>Enter</kbd> / <kbd>Shift</kbd>+<kbd>Enter</kbd>, or <kbd>F3</kbd> / <kbd>Shift</kbd>+<kbd>F3</kbd>.
 
-The search field shows your current match and total, such as **3 of 12**. The first hit appears before background counting finishes. A navigation hint appears for multiple hits when there is room, and matches keep two text lines of context above them where possible.
+The search field shows your current match and total, such as **3/12**. The first hit appears before background counting finishes. Previous/next buttons navigate matches, yellow scrollbar marks show their locations, and matches keep two text lines of context above them where possible.
 - **Copy text:** drag to select, then press <kbd>Ctrl</kbd>+<kbd>C</kbd>. <kbd>Ctrl</kbd>+<kbd>A</kbd> selects all.
 - **Zoom in:** press <kbd>+</kbd> or <kbd>Ctrl</kbd>+<kbd>+</kbd>.
 - **Zoom out:** press <kbd>-</kbd> or <kbd>Ctrl</kbd>+<kbd>-</kbd>.
@@ -3409,6 +3599,7 @@ In the **three-dot menu**:
         searching = false;
         KillTimer(hwnd, 3);
         ShowWindow(search, SW_HIDE);
+        updateFindControls();
         doc = std::move(information);
         positions();
         ShowWindow(canvas, SW_SHOWNA);
@@ -3432,6 +3623,7 @@ In the **three-dot menu**:
         searching = false;
         KillTimer(hwnd, 3);
         ShowWindow(search, SW_HIDE);
+        updateFindControls();
         ShowWindow(backButton, SW_HIDE);
         doc = std::move(savedView->document);
         if (editor && (editor->isPreview() || editor->isLive()) && editor->previewDocument())
@@ -3468,22 +3660,74 @@ In the **three-dot menu**:
         }
     }
     void showSearch() {
-        if (editor && !informationView) {
-            editor->find();
-            return;
+        if (editorSearch()) {
+            if (editor->busy()) return;
+            editor->prepareFind();
         }
+        bool reopening = !searching;
         searching = true;
+        positions();
         if (informationView)
             ShowWindow(backButton, SW_HIDE);
         visibility(true);
         ShowWindow(search, SW_SHOW);
+        updateFindControls();
         SetFocus(search);
         SendMessageW(search, EM_SETSEL, 0, -1);
+        if (reopening && GetWindowTextLengthW(search)) find(false);
         invalidateHeader();
+        invalidate();
+    }
+    void closeSearch() {
+        cancelSearch();
+        searchDisplayStatus.clear();
+        KillTimer(hwnd, 23);
+        searchMatch = false;
+        searching = false;
+        ShowWindow(search, SW_HIDE);
+        updateFindControls();
+        positions();
+        if (informationView) ShowWindow(backButton, SW_SHOWNA);
+        if (editorSearch()) editor->focus(); else SetFocus(hwnd);
+        invalidate();
+    }
+    SearchOptions findOptions;
+    std::shared_ptr<const MatchIndex> matchIndex;
+    std::shared_ptr<const std::wstring> findSnapshot;
+    uint64_t findRevision = 0;
+    bool revealFind = true;
+    std::vector<float> findMarkers;
+    float activeFindMarker = -1;
+    void queueFindMarkers() {
+        if (matchIndex && !editorSearch()) SetTimer(hwnd, 21, 30, nullptr);
+    }
+    double matchDocumentY(uint32_t at) {
+        auto &bs = blocks();
+        if (bs.empty()) return 0;
+        auto i = blockAtPosition(bs, at);
+        // Use the same measured/estimated height index as the scrollbar. Never force layout.
+        return heights.before(i) + heights.values[i] *
+            std::clamp(double(at - bs[i].start) / std::max(1u, bs[i].length), 0., 1.);
+    }
+    void projectFindMarkers() {
+        findMarkers.clear(); activeFindMarker = -1;
+        if (!searching || editorSearch() || !matchIndex || !doc || blocks().empty()) return;
+        float track = std::max(1.f, height - top - bottom);
+        std::vector<bool> rows((size_t)std::ceil(track * scale()) + 1);
+        for (auto at : matchIndex->offsets) {
+            auto row = (size_t)std::clamp(std::llround(matchDocumentY(at) / std::max(1., heights.total()) * (rows.size()-1)),
+                                        0LL, (long long)rows.size()-1);
+            rows[row] = true;
+        }
+        for (size_t i = 0; i < rows.size(); ++i) if (rows[i]) findMarkers.push_back(top + i / scale());
+        if (searchMatch) activeFindMarker = top + (float)(matchDocumentY(anchor) / std::max(1., heights.total()) * track);
         invalidate();
     }
     void cancelCount() {
         ++countGeneration;
+        matchIndex.reset(); findSnapshot.reset(); findMarkers.clear(); activeFindMarker = -1;
+        KillTimer(hwnd, 21);
+        if (editorSearch()) editor->setFindResults(nullptr, UINT32_MAX);
         if (countCancel)
             countCancel->store(true);
         countCancel.reset();
@@ -3492,39 +3736,52 @@ In the **three-dot menu**:
         searchIndex = 0;
         countQuery.clear();
         if (!searchStatus.empty()) {
-            float previousWidth = searchCountWidth();
             searchStatus.clear();
-            if (previousWidth != searchCountWidth())
-                positionSearch();
+            invalidateHeader();
+        }
+        if (!searching || !GetWindowTextLengthW(search)) {
+            searchDisplayStatus.clear();
+            KillTimer(hwnd, 23);
             invalidateHeader();
         }
     }
     void cancelSearch(bool resetCount = true) {
         ++findGeneration;
         KillTimer(hwnd, 3);
+        KillTimer(hwnd, 22);
         if (findCancel)
             findCancel->store(true);
-        if (resetCount)
+        if (resetCount) {
+            KillTimer(hwnd, 23);
             cancelCount();
+        }
     }
     void refreshSearchStatus() {
-        float previousWidth = searchCountWidth();
         int64_t total = (int64_t)searchTotal;
         int64_t current = searchMatch && total ? (searchIndex % total + total) % total + 1 : 0;
         searchStatus =
-            countReady ? std::to_wstring(current) + L" of " + std::to_wstring(searchTotal) : L"Counting…";
-        if (previousWidth != searchCountWidth())
-            positionSearch();
+            countReady ? std::to_wstring(current) + L"/" + std::to_wstring(searchTotal) : L"…";
+        // Retain the previous completed status during debounce and fast searches.
+        // A delayed progress indicator avoids blank/ellipsis/result flashes per key.
+        if (countReady) {
+            searchDisplayStatus = !searchTotal ? L"0/0 · No matches" : searchStatus;
+            KillTimer(hwnd, 23);
+        } else if (searchDisplayStatus.empty()) {
+            searchDisplayStatus = L"…";
+        }
+        updateFindControls();
         invalidateHeader();
     }
-    void find(bool advance, bool backwards = false) {
+    void find(bool advance, bool backwards = false, bool reveal = true) {
+        if (!searching) return;
+        if (editorSearch() && editor->isPreview()) editor->prepareFind();
+        revealFind = reveal;
 #ifdef VMD_TESTING
         if (!metricsFile.empty())
             findStarted = std::chrono::steady_clock::now();
 #endif
         cancelSearch(false);
-        if (!doc)
-            return;
+        if (!doc && !editorSearch()) return;
         int n = GetWindowTextLengthW(search);
         query.resize(n + 1);
         GetWindowTextW(search, query.data(), n + 1);
@@ -3547,13 +3804,20 @@ In the **three-dot menu**:
             cancelCount();
             countQuery = query;
             countCancel = std::make_shared<std::atomic_bool>(false);
+            if (editorSearch()) {
+                findSnapshot = editor->findTextSnapshot();
+                findRevision = editor->textRevision();
+            }
 #ifdef VMD_TESTING
             if (!metricsFile.empty())
                 countBegan = findStarted;
 #endif
             refreshSearchStatus();
+            SetTimer(hwnd, 23, 250, nullptr);
         }
         auto document = doc;
+        auto snapshot = findSnapshot;
+        auto options = editorSearch() ? findOptions : SearchOptions{};
         bool raw = source;
         auto q = query;
         auto gen = findGeneration;
@@ -3568,10 +3832,11 @@ In the **three-dot menu**:
         workers.reserve(workers.size() + 1);
         auto result = std::make_unique<SearchResult>(
             SearchResult{gen, documentGen, raw, -1, (uint32_t)q.size(), step, start, backwards, countGen});
-        workers.push_back({std::thread([document, raw, q, start, gen, cancel, done, destination, documentGen,
+        result->editing = editorSearch(); result->revision = findRevision;
+        workers.push_back({std::thread([document, snapshot, options, raw, q, start, gen, cancel, done, destination, documentGen,
                                         backwards, step, countGen, result = std::move(result)]() mutable {
-                               auto &s = raw || document->plainSource ? document->source : document->text;
-                               int found = findMatch(s, q, start, backwards, *cancel);
+                               auto &s = snapshot ? *snapshot : (raw || document->plainSource ? document->source : document->text);
+                               int found = findMatch(s, q, start, backwards, *cancel, options);
                                if (!cancel->load()) {
                                    result->found = found;
                                    auto r = result.release();
@@ -3591,28 +3856,36 @@ In the **three-dot menu**:
         uint32_t start = 0;
         bool backwards = false;
         uint64_t countGen = 0;
+        bool editing = false;
+        uint64_t revision = 0;
     };
     struct CountResult {
         uint64_t gen, documentGen;
         bool source;
         MatchCount count;
         bool backwards;
+        std::shared_ptr<const MatchIndex> index;
+        bool editing = false;
+        uint64_t revision = 0;
     };
     uint64_t findGeneration = 0, countGeneration = 0, searchTotal = 0;
 #ifdef VMD_TESTING
     uint64_t paintedFindGeneration = 0;
+    unsigned searchPaints = 0;
     std::chrono::steady_clock::time_point findStarted, countBegan;
 #endif
     int64_t searchIndex = 0;
     bool countStarted = false, countReady = false, countPending = false, countBackwards = false;
     uint32_t countStart = 0;
-    std::wstring countQuery, searchStatus;
+    std::wstring countQuery, searchStatus, searchDisplayStatus;
     std::shared_ptr<std::atomic_bool> findCancel, countCancel;
     void startCount(uint32_t start, bool backwards) {
         if (countStarted || !countCancel)
             return;
         countStarted = true;
         auto document = doc;
+        auto snapshot = findSnapshot;
+        auto options = editorSearch() ? findOptions : SearchOptions{};
         auto q = countQuery;
         auto cancel = countCancel;
         auto done = std::make_shared<std::atomic_bool>(false);
@@ -3621,13 +3894,15 @@ In the **three-dot menu**:
         HWND destination = hwnd;
         workers.reserve(workers.size() + 1);
         auto result = std::make_unique<CountResult>(CountResult{gen, documentGen, raw, {}, backwards});
-        workers.push_back({std::thread([document, q, cancel, done, gen, documentGen, raw, destination, start,
+        result->editing = editorSearch(); result->revision = findRevision;
+        workers.push_back({std::thread([document, snapshot, options, q, cancel, done, gen, documentGen, raw, destination, start,
                                         backwards, result = std::move(result)]() mutable {
                                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                               auto &s = raw || document->plainSource ? document->source : document->text;
-                               auto count = countMatches(s, q, start, *cancel);
+                               auto &s = snapshot ? *snapshot : (raw || document->plainSource ? document->source : document->text);
+                               auto index = std::make_shared<MatchIndex>(indexMatches(s, q, *cancel, options));
                                if (!cancel->load()) {
-                                   result->count = count;
+                                   result->count = {index->offsets.size(), (uint64_t)(std::lower_bound(index->offsets.begin(), index->offsets.end(), start) - index->offsets.begin())};
+                                   result->index = std::move(index);
                                    auto r = result.release();
                                    if (!PostMessageW(destination, WM_APP + 5, 0, (LPARAM)r))
                                        delete r;
@@ -3637,8 +3912,14 @@ In the **three-dot menu**:
                            cancel, done});
     }
     void countResult(std::unique_ptr<CountResult> r) {
-        if (r->gen != countGeneration || r->documentGen != generation || r->source != source || !countCancel)
-            return;
+        if (r->gen != countGeneration || !countCancel || r->editing != editorSearch() ||
+            (r->editing ? r->revision != editor->textRevision() : (r->documentGen != generation || r->source != source))) return;
+        matchIndex = r->index;
+        if (editorSearch()) {
+            editor->setFindResults(matchIndex, searchMatch ? anchor : UINT32_MAX);
+            editor->presentFind();
+        } else queueFindMarkers();
+        invalidate();
         searchTotal = r->count.total;
         searchIndex += (int64_t)r->count.beforeStart - (r->backwards ? 1 : 0);
         countReady = true;
@@ -3654,10 +3935,10 @@ In the **three-dot menu**:
 #endif
     }
     void searchResult(std::unique_ptr<SearchResult> r) {
-        if (r->gen != findGeneration || r->documentGen != generation || r->source != source)
-            return;
+        if (r->gen != findGeneration || r->editing != editorSearch() ||
+            (r->editing ? r->revision != editor->textRevision() : (r->documentGen != generation || r->source != source))) return;
         if (r->found < 0) {
-            notice = L"No matches";
+            notice.clear();
             searchMatch = false;
             searchTotal = 0;
             countReady = true;
@@ -3668,9 +3949,22 @@ In the **three-dot menu**:
         notice.clear();
         anchor = (uint32_t)r->found;
         caret = anchor + r->length;
-        searchMatch = true;
+        searchMatch = !editorSearch() || revealFind;
         searchIndex += r->step;
-        jump(anchor, true);
+        if (editorSearch()) {
+            auto first = std::make_shared<MatchIndex>(); first->length = r->length; first->offsets.push_back(anchor);
+            editor->setFindResults(matchIndex ? matchIndex : first, revealFind ? anchor : UINT32_MAX);
+            if (revealFind) editor->revealFind(anchor, r->length);
+            editor->presentFind();
+#ifdef VMD_TESTING
+            if (!metricsFile.empty()) {
+                std::ofstream out(std::filesystem::path(metricsFile), std::ios::app);
+                out << "{\"search_match_paint_ms\":" << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - findStarted).count()
+                    << ",\"count_started\":" << (countStarted ? "true" : "false") << ",\"search_anchor\":" << anchor << "}\n";
+            }
+#endif
+        } else jump(anchor, true);
+        queueFindMarkers();
         refreshSearchStatus();
         invalidate();
         // Begin the lower-priority count only after the first highlighted frame is presented.
@@ -3678,6 +3972,10 @@ In the **three-dot menu**:
             countStart = r->start;
             countBackwards = r->backwards;
             countPending = true;
+        }
+        if (editorSearch() && countPending) {
+            countPending = false;
+            startCount(countStart, countBackwards);
         }
     }
     void jump(uint32_t position, bool context = false) {
@@ -3802,6 +4100,9 @@ In the **three-dot menu**:
             beginEdit();
             return;
         }
+        if (key == VK_ESCAPE && searching) { closeSearch(); return; }
+        if (ctrl && key == 'F') { showSearch(); return; }
+        if (key == VK_F3) { if (!searching) showSearch(); find(true, shift); return; }
         if (editor && !informationView && editor->key(key))
             return;
         if (key == VK_F1) {
@@ -3817,6 +4118,7 @@ In the **three-dot menu**:
                 cancelSearch();
                 searching = false;
                 ShowWindow(search, SW_HIDE);
+                updateFindControls();
                 if (informationView)
                     ShowWindow(backButton, SW_SHOW);
                 SetFocus(hwnd);
@@ -3969,12 +4271,14 @@ In the **three-dot menu**:
         bool active = (item.CtlID == 102 && source) || (item.CtlID == 104 && fullscreen);
         COLORREF bg = dark ? RGB(28, 34, 45) : RGB(255, 255, 255),
                  fg = dark ? RGB(210, 221, 238) : RGB(57, 75, 98);
+        if (item.itemState & ODS_DISABLED) fg = dark ? RGB(91, 101, 116) : RGB(153, 161, 173);
         if (hover || active)
             bg = dark ? RGB(46, 59, 78) : RGB(230, 237, 250);
         if (item.itemState & ODS_SELECTED)
             bg = dark ? RGB(63, 82, 112) : RGB(209, 223, 248);
         bool associationButton = item.CtlID >= 150 && item.CtlID <= 152;
-        auto background = CreateSolidBrush(item.CtlID >= 140 && item.CtlID <= 142 ? RGB(255, 0, 255)
+        auto background = CreateSolidBrush((item.CtlID >= 202 && item.CtlID <= 205) ? (dark ? RGB(28, 34, 45) : RGB(255, 255, 255))
+                                           : item.CtlID >= 140 && item.CtlID <= 142 ? RGB(255, 0, 255)
                                            : associationButton ? (dark ? RGB(28, 34, 45) : RGB(255, 255, 255))
                                            : dark              ? RGB(16, 19, 25)
                                                                : RGB(250, 251, 253));
@@ -4073,7 +4377,14 @@ In the **three-dot menu**:
         case 106:
             path({{5, -7}, {-3, 0}, {5, 7}});
             break;
+        case 202:
+            path({{-6, 3}, {0, -3}, {6, 3}}); break;
+        case 203:
+            path({{-6, -3}, {0, 3}, {6, -3}}); break;
+        case 205:
+            path({{-7, -5}, {7, -5}}); path({{-7, 0}, {7, 0}}); path({{-7, 5}, {7, 5}}); break;
         case 107:
+        case 204:
             path({{-6, -6}, {6, 6}});
             path({{6, -6}, {-6, 6}});
             break;
@@ -4433,10 +4744,10 @@ In the **three-dot menu**:
                         RECT searchBounds;
                         GetWindowRect(search, &searchBounds);
                         MapWindowPoints(nullptr, hwnd, (POINT *)&searchBounds, 2);
-                        check(searchBounds.left >= 28 * scale() &&
+                        check(!IsWindowVisible(search) || (searchBounds.left >= 28 * scale() &&
                                   searchBounds.right <=
                                       (28 + searchBoxWidth() - searchCountWidth()) * scale() &&
-                                  searchBounds.top >= 20 * scale() && searchBounds.bottom <= 54 * scale(),
+                                  searchBounds.top >= searchY() * scale() && searchBounds.bottom <= (searchY() + 34) * scale()),
                               "search_edit_right_edge_stays_inside_rounded_field_at_each_dpi");
                         double sum = 0;
                         bool indexValid = true;
@@ -4516,6 +4827,44 @@ In the **three-dot menu**:
                     UpdateWindow(canvas);
                     canvasProc(canvas, WM_MOUSELEAVE, 0, 0);
                     check(hoveredLink.empty(), "link_destination_clears_on_mouse_leave");
+                    // Exercise the native popup through the canvas, without opening any destination.
+                    KillTimer(hwnd, 10);
+                    auto savedAnchor = anchor, savedCaret = caret;
+                    POINT point{(LONG)((x + canvasLeft) * scale()), (LONG)(y * scale())};
+                    ClientToScreen(hwnd, &point);
+                    for (const auto &destination : {L"https://example.com/path", L"src/document.h",
+                                                    L"#heading", L"docs/\u00e5 file.md"}) {
+                        doc->blocks.front().runs.front().link = destination;
+                        SetTimer(hwnd, 20, 30, [](HWND window, UINT, UINT_PTR timer, DWORD) {
+                            KillTimer(window, timer);
+                            PostMessageW(window, WM_KEYDOWN, VK_DOWN, 0);
+                            PostMessageW(window, WM_KEYDOWN, VK_RETURN, 0);
+                        });
+                        SetTimer(hwnd, 21, 2000, [](HWND window, UINT, UINT_PTR timer, DWORD) {
+                            KillTimer(window, timer);
+                            EndMenu();
+                        });
+                        canvasProc(canvas, WM_CONTEXTMENU, (WPARAM)canvas,
+                                   MAKELPARAM(point.x, point.y));
+                        KillTimer(hwnd, 20);
+                        KillTimer(hwnd, 21);
+                        std::wstring copied;
+                        if (OpenClipboard(hwnd)) {
+                            if (auto data = GetClipboardData(CF_UNICODETEXT))
+                                if (auto value = (const wchar_t *)GlobalLock(data)) {
+                                    copied = value;
+                                    GlobalUnlock(data);
+                                }
+                            CloseClipboard();
+                        }
+                        check(copied == destination && notice == L"Link copied." &&
+                                  anchor == savedAnchor && caret == savedCaret && scroll == 0,
+                              theme ? "dark_context_menu_copies_exact_link_without_navigation"
+                                    : "light_context_menu_copies_exact_link_without_navigation");
+                    }
+                    doc->blocks.front().runs.front().link = L"https://example.com/path";
+                    notice.clear();
+                    SetTimer(hwnd, 10, 120, nullptr);
                     source = true;
                     check(linkAt(x, y).empty(), "source_view_does_not_preview_links");
                     source = false;
@@ -5144,9 +5493,9 @@ In the **three-dot menu**:
             {
                 std::atomic_bool cancel = false;
                 auto expected = countMatches(doc->text, L"Voltura", 0, cancel).total;
-                check(searchTotal == expected && searchStatus == L"1 of " + std::to_wstring(expected),
+                check(searchTotal == expected && searchStatus == L"1/" + std::to_wstring(expected),
                       "background_count_shows_current_match_and_total");
-                check(showSearchHint() == (expected > 1 && searchBoxWidth() >= 350),
+                check(!showSearchHint(),
                       "search_shortcut_hint_only_for_multiple_hits_with_room");
                 verificationCountGeneration = countGeneration;
                 find(true);
@@ -5159,7 +5508,7 @@ In the **three-dot menu**:
             }
             check(countReady && countGeneration == verificationCountGeneration &&
                       searchStatus ==
-                          std::to_wstring(searchTotal > 1 ? 2 : 1) + L" of " + std::to_wstring(searchTotal),
+                          std::to_wstring(searchTotal > 1 ? 2 : 1) + L"/" + std::to_wstring(searchTotal),
                   "next_match_updates_ordinal_without_recounting");
             find(true, true);
             break;
@@ -5169,7 +5518,7 @@ In the **three-dot menu**:
                 return;
             }
             check(countGeneration == verificationCountGeneration &&
-                      searchStatus == L"1 of " + std::to_wstring(searchTotal),
+                      searchStatus == L"1/" + std::to_wstring(searchTotal),
                   "previous_match_updates_ordinal_without_recounting");
             {
                 auto savedAnchor = anchor, savedCaret = caret;
@@ -5205,13 +5554,13 @@ In the **three-dot menu**:
                 searchMatch = true;
                 searchIndex = 2;
                 refreshSearchStatus();
-                check(searchStatus == L"3 of 12", "search_status_formats_current_and_total");
+                check(searchStatus == L"3/12", "search_status_formats_current_and_total");
                 searchIndex = 12;
                 refreshSearchStatus();
-                check(searchStatus == L"1 of 12", "search_status_wraps_forward");
+                check(searchStatus == L"1/12", "search_status_wraps_forward");
                 searchIndex = -1;
                 refreshSearchStatus();
-                check(searchStatus == L"12 of 12", "search_status_wraps_backwards");
+                check(searchStatus == L"12/12", "search_status_wraps_backwards");
                 auto savedWidth = width;
                 width = 460;
                 check(!showSearchHint(), "shortcut_hint_yields_space_in_narrow_window");
@@ -5221,7 +5570,7 @@ In the **three-dot menu**:
                 cancelSearch();
                 searchResult(
                     std::make_unique<SearchResult>(SearchResult{findGeneration, generation, source, -1, 7}));
-                check(searchStatus == L"0 of 0" && !searchMatch && !showSearchHint(),
+                check(searchStatus == L"0/0" && !searchMatch && !showSearchHint(),
                       "no_results_show_zero_count_without_shortcut_hint");
                 cancelSearch();
             }
@@ -5468,14 +5817,32 @@ In the **three-dot menu**:
             return (LRESULT)(dark ? darkBrush : lightBrush);
         }
         case WM_COMMAND:
+            if (LOWORD(wp) >= 202 && LOWORD(wp) <= 205) {
+                if (HIWORD(wp) == BN_CLICKED)
+                    command(LOWORD(wp));
+                return 0;
+            }
             if (LOWORD(wp) == 200 && HIWORD(wp) == EN_CHANGE) {
                 cancelSearch();
-                SetTimer(hwnd, 3, 180, nullptr);
+                if (searchMatch && !editorSearch())
+                    anchor = caret;
+                searchMatch = false;
+                invalidate();
+                updateFindControls();
+                if (GetWindowTextLengthW(search))
+                    SetTimer(hwnd, 3, 180, nullptr);
+                else
+                    find(false);
                 return 0;
             }
             command(LOWORD(wp));
             return 0;
         case EditorChanged:
+            if (searching && editorSearch()) {
+                cancelSearch(); searchMatch = false;
+                updateFindControls();
+                if (GetWindowTextLengthW(search)) SetTimer(hwnd, 22, 180, nullptr);
+            }
             invalidateHeader();
             return 0;
         case EditorScroll:
@@ -5500,25 +5867,70 @@ In the **three-dot menu**:
             auto pixels = target->GetPixelSize();
             return pixels.width == (UINT32)bounds.right && pixels.height == (UINT32)bounds.bottom;
         }
+        case WM_APP + 42:
+            return searchPaints;
+        case WM_APP + 44:
+            switch (wp) {
+            case 0: return countReady ? (LRESULT)searchTotal : -1;
+            case 1: return searchMatch ? anchor + 1 : 0;
+            case 2: return matchIndex ? (LRESULT)matchIndex->offsets.size() : 0;
+            case 3: return (LRESULT)findMarkers.size();
+            case 4: return searching;
+            case 5: return (int)findOptions.matchCase | ((int)findOptions.wholeWord << 1);
+            case 6: return source;
+            case 7: return (LRESULT)std::llround(scroll) + 1;
+            case 9: return searchDisplayStatus == L"0/0 · No matches";
+            case 8: {
+                if (!searchMatch || !doc || blocks().empty()) return 0;
+                auto i = blockAtPosition(blocks(), anchor);
+                auto found = cache.find(i);
+                if (found == cache.end()) return 0;
+                for (auto &p : found->second.parts) {
+                    if (!p.layout || anchor < p.start || anchor >= p.start + p.length) continue;
+                    FLOAT x, y;
+                    DWRITE_HIT_TEST_METRICS m{};
+                    p.layout->HitTestTextPosition(anchor - p.start, FALSE, &x, &y, &m);
+                    double screenY = top + heights.before(i) - scroll + p.y + y;
+                    double screenX = documentLeft() + p.x + x;
+                    return screenY >= top && screenY + m.height <= height - bottom &&
+                           screenX >= 0 && screenX < width;
+                }
+                return 0;
+            }
+            default: return 0;
+            }
 #endif
+        case EditorFind:
+            showSearch(); return 0;
+        case EditorReplace:
+            if (searching) {
+                std::wstring value(GetWindowTextLengthW(search) + 1, L'\0');
+                GetWindowTextW(search, value.data(), (int)value.size()); value.pop_back();
+                editor->setReplaceFind(value, findOptions);
+                closeSearch();
+            }
+            return 0;
+        case EditorFindKey:
+            if (wp == VK_ESCAPE && !searching) return 0;
+            key(wp); return 1;
         case EditorLayout:
             if (editor) {
                 message(WM_SIZE, SIZE_RESTORED, 0);
-                if (!editor->isPreview())
-                    editor->focus();
+                if (searching) SetFocus(search);
+                else if (!editor->isPreview()) editor->focus();
             }
             return 0;
         case EditorPreview:
             if (editor && (editor->isPreview() || editor->isLive()) && !informationView &&
                 editor->previewDocument()) {
-                cancelSearch();
+                if (!searching) cancelSearch();
                 ++generation;
                 images->cancelPending();
                 doc = editor->previewDocument();
                 source = false;
                 VMD_TEST_ONLY(editorPreviewAwaitingPaint = true;)
                 rawBlocks.clear();
-                anchor = caret = 0;
+                if (!searching) anchor = caret = 0;
                 message(WM_SIZE, SIZE_RESTORED, 0);
                 resetLayout(editor->isLive());
                 syncPreviewToSource();
@@ -5545,6 +5957,8 @@ In the **three-dot menu**:
                     searchMatch = false;
                     resetLayout(editor->isPreview() || editor->isLive());
                     invalidate();
+                    if (searching)
+                        SetTimer(hwnd, 22, 180, nullptr);
                 }
 #ifdef VMD_TESTING
                 if (!metricsFile.empty()) {
@@ -5648,6 +6062,16 @@ In the **three-dot menu**:
             } else if (wp == 3) {
                 KillTimer(hwnd, 3);
                 find(false);
+            } else if (wp == 21) {
+                KillTimer(hwnd, 21); projectFindMarkers();
+            } else if (wp == 22) {
+                KillTimer(hwnd, 22); find(false, false, false);
+            } else if (wp == 23) {
+                KillTimer(hwnd, 23);
+                if (searching && !countReady && GetWindowTextLengthW(search)) {
+                    searchDisplayStatus = L"…";
+                    invalidateHeader();
+                }
             } else if (wp == 4)
                 animateScroll();
             else if (wp == 5 && loading && showControls && !searching) {
@@ -5745,12 +6169,16 @@ In the **three-dot menu**:
                          GET_WHEEL_DELTA_WPARAM(wp) / 120. * amount);
             }
             return 0;
-        case WM_MOUSEHWHEEL:
+        case WM_MOUSEHWHEEL: {
+            float before = horizontal;
             horizontal += GET_WHEEL_DELTA_WPARAM(wp) / 120.f * 54 * zoom;
             bars();
-            invalidate();
+            if (horizontal != before)
+                invalidate();
             return 0;
+        }
         case WM_VSCROLL: {
+            double before = scroll;
             SCROLLINFO s{sizeof(s), SIF_TRACKPOS};
             GetScrollInfo(hwnd, SB_VERT, &s);
             switch (LOWORD(wp)) {
@@ -5778,12 +6206,15 @@ In the **three-dot menu**:
                 break;
             }
             bars();
+            if (scroll == before)
+                return 0;
             if (editor && editor->isLive())
                 syncSourceToPreview();
             invalidate();
             return 0;
         }
         case WM_HSCROLL: {
+            float before = horizontal;
             SCROLLINFO s{sizeof(s), SIF_TRACKPOS};
             GetScrollInfo(hwnd, SB_HORZ, &s);
             switch (LOWORD(wp)) {
@@ -5805,7 +6236,8 @@ In the **three-dot menu**:
                 break;
             }
             bars();
-            invalidate();
+            if (horizontal != before)
+                invalidate();
             return 0;
         }
         case WM_LBUTTONDOWN: {
@@ -5921,6 +6353,10 @@ In the **three-dot menu**:
             }
             return 0;
         }
+        case WM_CONTEXTMENU:
+            if (GET_X_LPARAM(lp) != -1 || GET_Y_LPARAM(lp) != -1)
+                linkMenu({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            return 0;
         case WM_LBUTTONUP:
             if (pressedCode != SIZE_MAX) {
                 auto code = pressedCode;
@@ -6189,6 +6625,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (app.editor && app.editor->dialogMessage(message))
             continue;
+        if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && app.searching &&
+            (GetFocus() == app.search ||
+             std::find(app.findButtons.begin(), app.findButtons.end(), GetFocus()) != app.findButtons.end())) {
+            SetFocus(app.nextTabControl(GetFocus(), GetKeyState(VK_SHIFT) < 0));
+            continue;
+        }
         if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && app.editor && !app.informationView) {
             if (app.editor->tab(GetKeyState(VK_SHIFT) < 0))
                 continue;

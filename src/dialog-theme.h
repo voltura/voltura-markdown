@@ -24,6 +24,11 @@ struct DialogColors {
 inline LRESULT CALLBACK dialogThemeProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id,
                                         DWORD_PTR data) {
     auto self = reinterpret_cast<DialogColors *>(data);
+    // Insert helpers paint their own rounded controls, retaining the shared title bar theme.
+    if (GetPropW(dialog, L"VolturaFieldDialog") &&
+        (msg == WM_CTLCOLORDLG || msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLOREDIT ||
+         msg == WM_NOTIFY))
+        return DefSubclassProc(dialog, msg, wp, lp);
     if (msg == WM_CTLCOLORDLG || msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLOREDIT ||
         msg == WM_CTLCOLORBTN || msg == WM_CTLCOLORLISTBOX) {
         SetTextColor((HDC)wp, self->dark ? RGB(229, 233, 240) : RGB(32, 41, 56));
@@ -417,9 +422,6 @@ inline BOOL themedFileDialog(OPENFILENAMEW *dialog, bool saving) {
     dialog->lpstrInitialDir = previousDirectory;
     savingFileDialog = previousSaving;
     return result;
-}
-inline BOOL themedOpenFile(OPENFILENAMEW *dialog) {
-    return themedFileDialog(dialog, false);
 }
 inline BOOL themedSaveFile(OPENFILENAMEW *dialog) {
     return themedFileDialog(dialog, true);

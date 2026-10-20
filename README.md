@@ -13,7 +13,7 @@ Visit the [product website](https://markdown.voltura.se/) or open [Releases](htt
 | **`vmd.exe`** | Portable reader and editor. Download, keep in a suitable folder, and run. |
 | **`VolturaMarkdown-Setup-<version>-win-x64.exe`** | Per-user installation with a Start menu shortcut and Windows uninstall entry. |
 
-**1.3.3** includes self-signed, timestamped executables. GitHub's source archives do not contain a built app; download one of the executable assets above.
+**1.3.4** includes self-signed, timestamped executables. GitHub's source archives do not contain a built app; download one of the executable assets above.
 
 Setup requires no administrator access. Its optional **Choose as default Markdown reader** checkbox opens Windows Default apps so you can make the final choice.
 
@@ -53,7 +53,7 @@ The portable reader needs no companion DLLs, browser engine, .NET, or Visual C++
 ## Documentation
 
 - [User guide](docs/USER-GUIDE.md) · [Supported formats and limits](docs/COMPATIBILITY.md)
-- [Release notes](docs/releases/1.3.3.md) · [Changelog](CHANGELOG.md)
+- [Release notes](docs/releases/1.3.4.md) · [Changelog](CHANGELOG.md)
 - [Folder and document map](docs/REPOSITORY.md) · [Architecture](docs/ARCHITECTURE.md)
 - [Build and verify](docs/BUILDING.md) · [Code style](docs/CODE-STYLE.md) · [Performance](PERFORMANCE.md)
 - [Local releases and signing](docs/RELEASING.md) · [Product website](docs/PAGES.md)

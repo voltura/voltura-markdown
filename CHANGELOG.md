@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.4 - 2026-10-20
+
+- Add an integrated Find bar with match counts, previous/next controls, and match markers in the scrollbar.
+- Add case-sensitive and whole-word search in the editor, with visible match highlights and Replace handoff.
+- Improve split-editor wrapping, line numbers, and scrolling responsiveness.
+- Refine insert dialogs and use the Explorer-style Open dialog.
+- Add a context menu for document links.
+
+
 ## 1.3.3 — 2026-10-20
 
 - Improve heading conversion and navigation, outline labels, list editing, and table commands while preserving surrounding Markdown.
