@@ -51,7 +51,7 @@ class Images {
     Images(HWND hwnd, std::function<Image(const std::wstring &, const std::atomic_bool &)> loader);
 #endif
     ~Images();
-    void cancelPending();
+    void cancelPending(bool clearCache = false);
     std::shared_ptr<Image> get(const std::wstring &url, const std::wstring &base);
     std::shared_ptr<Image> raster(const std::shared_ptr<Image> &image, float pixelWidth, float pixelHeight,
                                   bool *pending = nullptr);

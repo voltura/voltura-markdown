@@ -8,8 +8,8 @@
 5 RCDATA "../third_party/lexbor/LICENSE"
 6 RCDATA "../third_party/lexbor/NOTICE"
 1 VERSIONINFO
-FILEVERSION 1,3,2,0
-PRODUCTVERSION 1,3,2,0
+FILEVERSION 1,3,3,0
+PRODUCTVERSION 1,3,3,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS VOS_NT_WINDOWS32
@@ -22,8 +22,8 @@ BEGIN
    VALUE "FileDescription", "Voltura Markdown"
    VALUE "CompanyName", "Voltura AB"
    VALUE "ProductName", "Voltura Markdown"
-   VALUE "FileVersion", "1.3.2"
-   VALUE "ProductVersion", "1.3.2"
+   VALUE "FileVersion", "1.3.3"
+   VALUE "ProductVersion", "1.3.3"
    VALUE "InternalName", "vmd"
    VALUE "OriginalFilename", "vmd.exe"
    VALUE "LegalCopyright", "Copyright (c) Voltura AB"

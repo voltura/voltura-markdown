@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.3 — 2026-10-20
+
+- Improve heading conversion and navigation, outline labels, list editing, and table commands while preserving surrounding Markdown.
+- Preserve local links when saving elsewhere, including HTML links, encoded filenames, and query strings.
+- Render and export image links, table images, nested image descriptions, HTML lists, and inline formatting more faithfully.
+- Correct photo orientation and image decoding, and refresh missing or changed images when reloading a document.
+- Improve syntax coloring for C#, C++, SQL, and PowerShell strings and comments.
+- Preserve typography and image sizing in printed output, and recover older drafts safely without accepting damaged UTF-8 data.
+
+
 ## 1.3.2 â€” 2026-10-20
 
 - Fixes duplicate heading links, list-heading anchors, explicit HTML heading identifiers, and HTML list numbering.

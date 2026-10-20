@@ -1,4 +1,5 @@
 #include "document.h"
+#include "lexbor/dom/interfaces/character_data.h"
 #include "lexbor/html/html.h"
 #include "md4c.h"
 extern "C" {
@@ -174,10 +175,12 @@ struct Parser {
     int current = -1;
     unsigned quote = 0, styles = 0;
     size_t headingContentStart = 0;
+    size_t markdownHeading = SIZE_MAX, markdownHeadingContent = 0;
     std::map<std::wstring, unsigned> headingIds;
     struct List {
         bool ordered;
         int64_t next;
+        int step = 1;
     };
     std::vector<List> lists;
     struct Span {
@@ -187,6 +190,7 @@ struct Parser {
     };
     std::vector<Span> spans;
     std::vector<std::pair<std::wstring, unsigned>> htmlStyles;
+    std::vector<std::pair<std::wstring, unsigned>> htmlLinks;
     struct HtmlBlock {
         std::wstring tag;
         unsigned heading, quote, styles;
@@ -208,6 +212,14 @@ struct Parser {
         unsigned styles;
     };
     std::vector<HtmlCell> htmlCells;
+    struct MarkdownCell {
+        int row = -1;
+        size_t cell = 0, firstChild = 0;
+        int alignment = 0;
+        unsigned styles = 0;
+        bool located = false;
+        bool promoted = false;
+    } markdownCell;
     std::vector<std::pair<std::wstring, int>> tableAlignments;
     struct HtmlTable {
         size_t first;
@@ -223,6 +235,7 @@ struct Parser {
     size_t markdownImages = 0;
     bool richTables = false;
     bool inCode = false, inImage = false, inHtml = false, separateRun = false;
+    unsigned imageDepth = 0;
     unsigned heading = 0;
     std::wstring attr(const MD_ATTRIBUTE &a) {
         return entity(fromUtf8({a.text, a.size}), cancel);
@@ -256,33 +269,136 @@ struct Parser {
             doc.text.append(prefix);
             prefix.clear();
         }
+        if (kind == Kind::Image && !link.empty())
+            block().runs.push_back({(uint32_t)doc.text.size(), 0, styles, link});
         if (kind == Kind::Heading)
             headingContentStart = doc.text.size();
+    }
+    Block cellParagraph(const Block &row, const Cell &cell, uint32_t length) {
+        Block child;
+        child.start = cell.start;
+        child.length = length;
+        child.align = (uint8_t)cell.align;
+        for (const auto &run : row.runs) {
+            auto begin = std::max(run.start, cell.start);
+            auto end = std::min(run.start + run.length, cell.start + length);
+            if (end > begin)
+                child.runs.push_back({begin, end - begin, run.style | (cell.header ? Bold : 0u), run.link});
+        }
+        return child;
+    }
+    std::shared_ptr<std::deque<Block>> cellContent(const Block &row, const Cell &cell, uint32_t length) {
+        auto content = std::make_shared<std::deque<Block>>();
+        uint32_t at = cell.start, limit = cell.start + length;
+        do {
+            check();
+            auto end = std::min(limit, at + 8192);
+            if (end < limit && end > at && doc.text[end - 1] >= 0xd800 && doc.text[end - 1] <= 0xdbff &&
+                doc.text[end] >= 0xdc00 && doc.text[end] <= 0xdfff)
+                --end;
+            auto segment = cell;
+            segment.start = at;
+            auto child = cellParagraph(row, segment, end - at);
+            child.codeStart = cell.start;
+            child.continuation = at != cell.start;
+            content->push_back(std::move(child));
+            at = end;
+        } while (at < limit);
+        return content;
+    }
+    void promoteMarkdownCell() {
+        if (markdownCell.row < 0 || markdownCell.promoted)
+            return;
+        markdownCell.promoted = true;
+        richTables = true;
+        auto &row = doc.blocks[markdownCell.row];
+        const auto &cell = row.cells[markdownCell.cell];
+        auto length = (uint32_t)doc.text.size() - cell.start;
+        auto content = length ? cellContent(row, cell, length) : nullptr;
+        // The child owns these runs until the completed cell is folded back into the row.
+        for (auto &run : row.runs)
+            if (run.start < cell.start && run.start + run.length > cell.start)
+                run.length = cell.start - run.start;
+        std::erase_if(row.runs, [&](const Run &run) { return run.start >= cell.start; });
+        current = -1;
+        alignment = cell.align;
+        if (cell.header)
+            styles |= Bold;
+        if (content) {
+            for (auto &child : *content)
+                doc.blocks.push_back(std::move(child));
+            current = (int)doc.blocks.size() - 1;
+            currentLocated = false;
+        }
+    }
+    void finishMarkdownCell() {
+        if (markdownCell.promoted) {
+            finish();
+            auto content = std::make_shared<std::deque<Block>>();
+            for (size_t i = markdownCell.firstChild; i < doc.blocks.size(); ++i)
+                content->push_back(std::move(doc.blocks[i]));
+            doc.blocks.erase(doc.blocks.begin() + markdownCell.firstChild, doc.blocks.end());
+            current = markdownCell.row;
+            auto &row = block();
+            row.cells[markdownCell.cell].content = std::move(content);
+            for (const auto &child : *row.cells[markdownCell.cell].content)
+                row.runs.insert(row.runs.end(), child.runs.begin(), child.runs.end());
+            alignment = markdownCell.alignment;
+            styles = markdownCell.styles;
+            currentLocated = markdownCell.located;
+        }
+        markdownCell = {};
+    }
+    void headingAnchor(Block &target, std::wstring id) {
+        if (target.anchor)
+            return;
+        bool unicode = false;
+        for (auto &c : id) {
+            if (c >= L'A' && c <= L'Z')
+                c += L'a' - L'A';
+            unicode |= c >= 128;
+        }
+        if (unicode) {
+            auto count = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, id.data(), (int)id.size(),
+                                       nullptr, 0, nullptr, nullptr, 0);
+            if (count) {
+                std::wstring lower(count, L'\0');
+                if (LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, id.data(), (int)id.size(),
+                                  lower.data(), count, nullptr, nullptr, 0))
+                    id = std::move(lower);
+            }
+        }
+        id.erase(std::remove_if(id.begin(), id.end(),
+                                [](wchar_t c) { return iswpunct(c) && c != L'-' && c != L'_'; }),
+                 id.end());
+        std::replace_if(id.begin(), id.end(), htmlSpace, L'-');
+        auto base = id;
+        auto &next = headingIds[base];
+        if (next) {
+            do {
+                id = base + L"-" + std::to_wstring(next++);
+            } while (headingIds.contains(id));
+            headingIds.emplace(id, 1);
+        } else
+            next = 1;
+        target.anchor = std::make_unique<std::wstring>(std::move(id));
     }
     void finish() {
         if (current < 0)
             return;
         auto &b = doc.blocks[current];
         b.length = (uint32_t)doc.text.size() - b.start;
-        if (b.kind == Kind::Heading && !b.anchor) {
-            std::wstring id = doc.text.substr(std::max<size_t>(b.start, headingContentStart));
-            for (auto &c : id)
-                c = (wchar_t)towlower(c);
-            id.erase(std::remove_if(id.begin(), id.end(),
-                                    [](wchar_t c) { return iswpunct(c) && c != L'-' && c != L'_'; }),
-                     id.end());
-            std::replace(id.begin(), id.end(), L' ', L'-');
-            auto base = id;
-            auto &next = headingIds[base];
-            if (next) {
-                do {
-                    id = base + L"-" + std::to_wstring(next++);
-                } while (headingIds.contains(id));
-                headingIds.emplace(id, 1);
-            } else
-                next = 1;
-            b.anchor = std::make_unique<std::wstring>(std::move(id));
+        Block *headingBlock = &b;
+        if (b.kind == Kind::Heading && b.continuation && markdownHeading == SIZE_MAX) {
+            for (auto it = doc.blocks.rbegin(); it != doc.blocks.rend(); ++it)
+                if (it->start == b.codeStart) {
+                    headingBlock = &*it;
+                    break;
+                }
         }
+        if (b.kind == Kind::Heading && markdownHeading == SIZE_MAX && !headingBlock->anchor)
+            headingAnchor(*headingBlock,
+                          doc.text.substr(std::max<size_t>(headingBlock->start, headingContentStart)));
         doc.text.push_back(L'\n');
         current = -1;
     }
@@ -361,6 +477,8 @@ struct Parser {
             finish();
             heading = ((MD_BLOCK_H_DETAIL *)d)->level;
             start(Kind::Heading);
+            markdownHeading = doc.blocks.size() - 1;
+            markdownHeadingContent = headingContentStart;
             break;
         case MD_BLOCK_CODE: {
             finish();
@@ -391,6 +509,7 @@ struct Parser {
         case MD_BLOCK_TR:
             finish();
             start(Kind::Table);
+            block().markdownTable = true;
             break;
         case MD_BLOCK_TH:
         case MD_BLOCK_TD: {
@@ -400,6 +519,9 @@ struct Parser {
             if (!b.cells.empty())
                 append(L"\t");
             block().cells.push_back({(uint32_t)doc.text.size(), 0, (int)((MD_BLOCK_TD_DETAIL *)d)->align});
+            block().cells.back().header = t == MD_BLOCK_TH;
+            markdownCell = {current,       block().cells.size() - 1, doc.blocks.size(), alignment, styles,
+                            currentLocated};
             break;
         }
         case MD_BLOCK_FOOTNOTE_DEF: {
@@ -441,10 +563,19 @@ struct Parser {
             finish();
             prefix.clear();
             break;
-        case MD_BLOCK_H:
+        case MD_BLOCK_H: {
             finish();
+            std::wstring title;
+            for (size_t i = markdownHeading; i < doc.blocks.size(); ++i) {
+                const auto &part = doc.blocks[i];
+                size_t begin = std::max<size_t>(part.start, markdownHeadingContent);
+                title.append(doc.text, begin, part.start + part.length - begin);
+            }
+            headingAnchor(doc.blocks[markdownHeading], std::move(title));
+            markdownHeading = SIZE_MAX;
             heading = 0;
             break;
+        }
         case MD_BLOCK_CODE:
             finish();
             inCode = false;
@@ -454,13 +585,24 @@ struct Parser {
             finish();
             inHtml = false;
             break;
-        case MD_BLOCK_P:
         case MD_BLOCK_TR:
+            if (current >= 0) {
+                auto &row = block();
+                if (std::any_of(row.cells.begin(), row.cells.end(),
+                                [](const Cell &cell) { return cell.content != nullptr; }))
+                    for (auto &cell : row.cells)
+                        if (!cell.content)
+                            cell.content = cellContent(row, cell, cell.length);
+            }
+            finish();
+            break;
+        case MD_BLOCK_P:
         case MD_BLOCK_FOOTNOTE_DEF:
             finish();
             break;
         case MD_BLOCK_TH:
         case MD_BLOCK_TD: {
+            finishMarkdownCell();
             auto &b = block();
             if (!b.cells.empty())
                 b.cells.back().length = (uint32_t)doc.text.size() - b.cells.back().start;
@@ -476,6 +618,13 @@ struct Parser {
         }
     }
     void spanEnter(MD_SPANTYPE t, void *d) {
+        if (inImage) {
+            if (t == MD_SPAN_IMG)
+                ++imageDepth;
+            return;
+        }
+        if (t == MD_SPAN_IMG)
+            promoteMarkdownCell();
         spans.push_back({t, styles, link});
         switch (t) {
         case MD_SPAN_EM:
@@ -504,6 +653,7 @@ struct Parser {
                     locate(input + marker);
             }
             inImage = true;
+            imageDepth = 1;
             start(Kind::Image);
             block().image = std::make_unique<ImageReference>(attr(((MD_SPAN_IMG_DETAIL *)d)->src));
             block().image->inlineGroup = inlineGroup;
@@ -521,6 +671,8 @@ struct Parser {
         }
     }
     void spanLeave(MD_SPANTYPE t) {
+        if (inImage && (t != MD_SPAN_IMG || --imageDepth))
+            return;
         if (t == MD_SPAN_IMG) {
             finish();
             inImage = false;
@@ -531,7 +683,9 @@ struct Parser {
             spans.pop_back();
         }
     }
-    std::wstring attribute(std::wstring_view tag, std::wstring_view name) {
+    std::wstring attribute(std::wstring_view tag, std::wstring_view name, bool *present = nullptr) {
+        if (present)
+            *present = false;
         size_t i = 1;
         while (i < tag.size() && !iswspace(tag[i]) && tag[i] != L'>')
             ++i;
@@ -548,6 +702,8 @@ struct Parser {
             std::wstring key(tag.substr(a, i - a));
             for (auto &c : key)
                 c = (wchar_t)towlower(c);
+            if (key == name && present)
+                *present = true;
             while (i < tag.size() && iswspace(tag[i]))
                 ++i;
             if (i == tag.size() || tag[i] != L'=')
@@ -646,6 +802,67 @@ struct Parser {
             if (error)
                 std::rethrow_exception(error);
             throw std::runtime_error("HTML parsing failed");
+        }
+        // Preserve presentation semantics across serialization into the native adapter.
+        auto root = lxb_dom_interface_node(tree->body);
+        for (auto node = root->first_child; node;) {
+            check();
+            if (node->type == LXB_DOM_NODE_TYPE_TEXT && node->parent) {
+                auto tag = node->parent->local_name;
+                // Lexbor serializes these text nodes verbatim. Escape them once
+                // so the adapter cannot reinterpret literal tags as native elements.
+                if (tag == LXB_TAG_SCRIPT || tag == LXB_TAG_STYLE || tag == LXB_TAG_XMP ||
+                    tag == LXB_TAG_IFRAME || tag == LXB_TAG_NOEMBED || tag == LXB_TAG_NOFRAMES ||
+                    tag == LXB_TAG_PLAINTEXT) {
+                    auto data = lxb_dom_interface_character_data(node);
+                    std::string escaped;
+                    for (size_t i = 0; i < data->data.length; ++i) {
+                        if ((i & 4095) == 0)
+                            check();
+                        auto c = data->data.data[i];
+                        if (c == '&')
+                            escaped += "&amp;";
+                        else if (c == '<')
+                            escaped += "&lt;";
+                        else if (c == '>')
+                            escaped += "&gt;";
+                        else
+                            escaped += (char)c;
+                    }
+                    if (lxb_dom_character_data_replace(data, (const lxb_char_t *)escaped.data(),
+                                                       escaped.size(), 0, data->data.length) != LXB_STATUS_OK)
+                        throw std::runtime_error("HTML literal text presentation failed");
+                }
+            }
+            if (node->type == LXB_DOM_NODE_TYPE_ELEMENT && node->local_name == LXB_TAG_OL) {
+                auto element = lxb_dom_interface_element(node);
+                if (lxb_dom_element_has_attribute(element, (const lxb_char_t *)"reversed", 8)) {
+                    size_t size = 0;
+                    auto raw = lxb_dom_element_get_attribute(element, (const lxb_char_t *)"start", 5, &size);
+                    auto value = raw ? fromUtf8({(const char *)raw, size}) : std::wstring();
+                    wchar_t *tail = nullptr;
+                    auto number = wcstoll(value.c_str(), &tail, 10);
+                    if (value.empty() || tail == value.c_str() || number < INT32_MIN || number > INT32_MAX) {
+                        size_t count = 0;
+                        for (auto child = node->first_child; child; child = child->next) {
+                            check();
+                            if (child->type == LXB_DOM_NODE_TYPE_ELEMENT && child->local_name == LXB_TAG_LI)
+                                ++count;
+                        }
+                        auto start = std::to_string(count);
+                        if (!lxb_dom_element_set_attribute(element, (const lxb_char_t *)"start", 5,
+                                                           (const lxb_char_t *)start.data(), start.size()))
+                            throw std::runtime_error("HTML list presentation failed");
+                    }
+                }
+            }
+            if (node->first_child)
+                node = node->first_child;
+            else {
+                while (node != root && !node->next)
+                    node = node->parent;
+                node = node == root ? nullptr : node->next;
+            }
         }
         // Tree construction (including implied end tags and table foster parenting)
         // belongs to the HTML5 parser, not the native presentation adapter.
@@ -1010,26 +1227,28 @@ struct Parser {
             ++quote;
         } else if (isList) {
             int64_t number = 1;
+            bool reversed = false;
             if (tag == L"ol") {
+                attribute(token, L"reversed", &reversed);
                 auto value = attribute(token, L"start");
                 wchar_t *tail = nullptr;
                 auto parsed = wcstoll(value.c_str(), &tail, 10);
-                if (!value.empty() && tail != value.c_str() && *tail == 0 && parsed >= INT32_MIN &&
-                    parsed <= INT32_MAX)
+                if (!value.empty() && tail != value.c_str() && parsed >= INT32_MIN && parsed <= INT32_MAX)
                     number = parsed;
             }
-            lists.push_back({tag == L"ol", number});
+            lists.push_back({tag == L"ol", number, reversed ? -1 : 1});
         } else if (tag == L"li") {
             if (!lists.empty() && lists.back().ordered) {
                 auto value = attribute(token, L"value");
                 wchar_t *tail = nullptr;
                 auto parsed = wcstoll(value.c_str(), &tail, 10);
-                if (!value.empty() && tail != value.c_str() && *tail == 0 && parsed >= INT32_MIN &&
-                    parsed <= INT32_MAX)
+                if (!value.empty() && tail != value.c_str() && parsed >= INT32_MIN && parsed <= INT32_MAX)
                     lists.back().next = parsed;
             }
-            prefix = !lists.empty() && lists.back().ordered ? std::to_wstring(lists.back().next++) + L".  "
-                                                            : L"•  ";
+            prefix =
+                !lists.empty() && lists.back().ordered ? std::to_wstring(lists.back().next) + L".  " : L"•  ";
+            if (!lists.empty() && lists.back().ordered)
+                lists.back().next += lists.back().step;
             start();
         } else if (tag == L"summary") {
             styles |= Bold;
@@ -1037,6 +1256,11 @@ struct Parser {
         } else if (tag == L"pre") {
             inCode = true;
             start(Kind::Code);
+            auto id = attribute(token, L"id");
+            if (!id.empty()) {
+                headingIds.try_emplace(id, 1);
+                block().anchor = std::make_unique<std::wstring>(std::move(id));
+            }
         }
         return true;
     }
@@ -1155,13 +1379,16 @@ struct Parser {
                 finish();
             } else if (tag == L"br") {
                 ++inlineGroup;
-                if (current >= 0)
-                    append(L"\n");
+                append(L"\n");
             } else if (tag == L"a") {
                 if (close) {
-                    link.clear();
-                    styles &= ~Underline;
+                    if (!htmlLinks.empty()) {
+                        link = std::move(htmlLinks.back().first);
+                        styles = (styles & ~Underline) | htmlLinks.back().second;
+                        htmlLinks.pop_back();
+                    }
                 } else {
+                    htmlLinks.emplace_back(link, styles & Underline);
                     link = attribute(token, L"href");
                     styles |= Underline;
                 }
@@ -1349,8 +1576,9 @@ struct Parser {
             return;
         }
         if (t == MD_TEXT_BR) {
-            ++inlineGroup;
-            append(L"\n");
+            if (!inImage)
+                ++inlineGroup;
+            append(inImage ? L" " : L"\n");
             return;
         }
         if (t == MD_TEXT_SOFTBR) {
@@ -1361,6 +1589,11 @@ struct Parser {
         if (t == MD_TEXT_ENTITY)
             append(entity(s, cancel));
         else if (t == MD_TEXT_HTML) {
+            if (inImage) {
+                append(s);
+                return;
+            }
+            promoteMarkdownCell();
             if (inHtml) {
                 if (htmlBuffer.empty())
                     htmlSource = sourcePosition;

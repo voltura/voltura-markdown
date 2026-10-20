@@ -1,4 +1,5 @@
 #include "document.h"
+#include "goal-image-regressions.h"
 #include "images.h"
 #include "shell.h"
 #include <chrono>
@@ -20,7 +21,7 @@ void require(bool ok, const char *message) {
 void check(HRESULT hr) {
     require(SUCCEEDED(hr), "WIC fixture setup failed");
 }
-void raster(const std::filesystem::path &path, REFGUID container) {
+void raster(const std::filesystem::path &path, REFGUID container, unsigned orientation = 0) {
     ComPtr<IWICImagingFactory> factory;
     check(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)));
     ComPtr<IWICStream> stream;
@@ -32,12 +33,26 @@ void raster(const std::filesystem::path &path, REFGUID container) {
     ComPtr<IWICBitmapFrameEncode> frame;
     check(encoder->CreateNewFrame(&frame, nullptr));
     check(frame->Initialize(nullptr));
-    check(frame->SetSize(8, 8));
+    unsigned height = orientation ? 4 : 8;
+    check(frame->SetSize(8, height));
     WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
     check(frame->SetPixelFormat(&format));
-    std::vector<BYTE> pixels(8 * 8 * 3, 180);
+    if (orientation) {
+        ComPtr<IWICMetadataQueryWriter> metadata;
+        check(frame->GetMetadataQueryWriter(&metadata));
+        PROPVARIANT value{};
+        value.vt = VT_UI2;
+        value.uiVal = (USHORT)orientation;
+        check(metadata->SetMetadataByName(container == GUID_ContainerFormatJpeg ? L"/app1/ifd/{ushort=274}"
+                                                                                : L"/ifd/{ushort=274}",
+                                          &value));
+    }
+    std::vector<BYTE> pixels(8 * height * 3, 180);
+    if (orientation)
+        for (size_t i = 0; i < pixels.size(); ++i)
+            pixels[i] = (BYTE)((i / 3) * 5);
     ComPtr<IWICBitmap> bitmap;
-    check(factory->CreateBitmapFromMemory(8, 8, GUID_WICPixelFormat24bppBGR, 24, (UINT)pixels.size(),
+    check(factory->CreateBitmapFromMemory(8, height, GUID_WICPixelFormat24bppBGR, 24, (UINT)pixels.size(),
                                           pixels.data(), &bitmap));
     check(frame->WriteSource(bitmap.Get(), nullptr));
     check(frame->Commit());
@@ -191,6 +206,10 @@ int wmain(int argc, wchar_t **argv) {
         raster(temp / L"test image.png", GUID_ContainerFormatPng);
         raster(temp / L"test.jpg", GUID_ContainerFormatJpeg);
         raster(temp / L"test.gif", GUID_ContainerFormatGif);
+        for (unsigned orientation = 1; orientation <= 9; ++orientation)
+            raster(temp / (L"orientation-" + std::to_wstring(orientation) + L".tif"),
+                   GUID_ContainerFormatTiff, orientation);
+        raster(temp / L"orientation-6.jpg", GUID_ContainerFormatJpeg, 6);
         std::ofstream(temp / L"test.svg") << "<svg xmlns='http://www.w3.org/2000/svg' width='16' "
                                              "height='8'><rect width='16' height='8' fill='#ff6600'/></svg>";
         std::ofstream(temp / L"classes.svg")
@@ -210,6 +229,7 @@ int wmain(int argc, wchar_t **argv) {
                "<text x='250' y='140' transform='scale(.1)' textLength='400'>visitors</text>"
                "<g transform='scale(.1)'><text x='750' y='140' textLength='300'>123</text></g>"
                "</g><rect width='100' height='20' fill='rgba(0,0,0,0)'/></svg>";
+        goalImageRegressions(temp);
         {
             std::atomic_bool cancel = false;
             auto badge = imageForExport(L"badge.svg", (temp / L"document.md").wstring(), cancel);

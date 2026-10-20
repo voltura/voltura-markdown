@@ -30,6 +30,7 @@
 #include <psapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -2856,7 +2857,7 @@ struct App {
             return;
         }
         VMD_TEST_ONLY(startupPhase("document_delivered");)
-        images->cancelPending();
+        images->cancelPending(true);
         doc = std::move(r->document);
         source = false;
         rawBlocks.clear();
@@ -3768,12 +3769,21 @@ In the **three-dot menu**:
                     if (position >= r.start && position < r.start + r.length && !r.link.empty()) {
                         if (r.link.starts_with(L"#")) {
                             auto id = r.link.substr(1);
-                            for (size_t i = 0; i < doc->blocks.size(); ++i)
-                                if (doc->blocks[i].anchor && *doc->blocks[i].anchor == id) {
-                                    jump(doc->blocks[i].start);
+                            std::wstring decoded(id.size() + 1, L'\0');
+                            DWORD length = (DWORD)decoded.size();
+                            if (SUCCEEDED(
+                                    UrlUnescapeW(id.data(), decoded.data(), &length, URL_UNESCAPE_AS_UTF8))) {
+                                decoded.resize(length);
+                                id = std::move(decoded);
+                            }
+                            visitBlocks(doc->blocks, [&](const Block &target) {
+                                if (target.anchor && *target.anchor == id) {
+                                    jump(target.start);
                                     invalidate();
-                                    break;
+                                    return false;
                                 }
+                                return true;
+                            });
                         } else if (!openLink(r.link, doc->path.wstring())) {
                             notice = L"This link cannot be opened by the reader.";
                             invalidate();
@@ -4121,6 +4131,38 @@ In the **three-dot menu**:
             check(doc && !source && !loading, "formatted_default");
             for (size_t i = 0; i < blocks().size(); ++i) {
                 auto &b = blocks()[i];
+                if (b.kind == Kind::Table && doc->path.filename() == L"markdown-table-images.md") {
+                    unsigned expectedImages = 0;
+                    bool waiting = false;
+                    for (const auto &cell : b.cells)
+                        if (cell.content)
+                            visitBlocks(*cell.content, [&](const Block &child) {
+                                if (child.image) {
+                                    ++expectedImages;
+                                    waiting |= !images->get(child.image->source(dark), doc->path.wstring());
+                                }
+                                return true;
+                            });
+                    if (waiting) {
+                        --verifyStage;
+                        return;
+                    }
+                    auto &rendered = layout(i);
+                    unsigned bitmaps = 0;
+                    bool links = true;
+                    double savedScroll = scroll;
+                    scroll = heights.before(i);
+                    for (const auto &part : rendered.parts)
+                        if (part.bitmap) {
+                            ++bitmaps;
+                            links &= linkAt(documentLeft() + part.x + part.width / 2,
+                                            top + part.y + part.height / 2) == L"https://example.com/table";
+                        }
+                    scroll = savedScroll;
+                    check(expectedImages == 1 && bitmaps == expectedImages,
+                          "markdown_table_images_render_inside_their_rows");
+                    check(links, "markdown_table_image_links_hit_their_destinations");
+                }
                 if (b.kind == Kind::Heading && text().substr(b.start, b.length) == L"Statistics") {
                     auto &heading = layout(i);
                     bool adjacent = i + 1 < blocks().size() && blocks()[i + 1].image;

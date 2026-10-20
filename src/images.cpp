@@ -7,6 +7,7 @@
 #include <fstream>
 #include <shlwapi.h>
 #include <stdexcept>
+#include <string_view>
 #include <wincodec.h>
 #include <winhttp.h>
 #include <wrl/client.h>
@@ -38,6 +39,19 @@ struct Http {
 void require(bool ok) {
     if (!ok)
         throw std::runtime_error("Image unavailable");
+}
+bool isHttps(std::wstring_view url) {
+    return url.size() >= 8 && CompareStringOrdinal(url.data(), 8, L"https://", 8, TRUE) == CSTR_EQUAL;
+}
+std::wstring imageUrl(std::wstring_view url) {
+    // Keep UNC/device prefixes intact so the local-path policy can reject them.
+    if (url.starts_with(L"\\\\") || url.starts_with(L"//"))
+        return std::wstring(url);
+    bool remote = isHttps(url);
+    std::wstring result(url.substr(0, url.find_first_of(remote ? L"#" : L"?#")));
+    if (remote)
+        result.replace(0, 8, L"https://");
+    return result;
 }
 std::vector<unsigned char> readImage(const std::wstring &path, const std::atomic_bool &cancel,
                                      Http &session) {
@@ -99,7 +113,7 @@ std::vector<unsigned char> readImage(const std::wstring &path, const std::atomic
                 DWORD length = (DWORD)combined.size();
                 require(SUCCEEDED(UrlCombineW(url.c_str(), next.c_str(), combined.data(), &length, 0)));
                 combined.resize(length);
-                url = std::move(combined);
+                url = imageUrl(combined);
                 continue;
             }
             require(status == 200);
@@ -132,7 +146,13 @@ Image decodeImage(std::vector<unsigned char> bytes, float rasterScale = 1,
                   std::shared_ptr<const std::vector<unsigned char>> source = {}) {
     Image out;
     std::string_view text((char *)bytes.data(), bytes.size());
-    bool svg = text.find("<svg") != text.npos;
+    auto markup = text;
+    if (markup.starts_with("\xef\xbb\xbf"))
+        markup.remove_prefix(3);
+    auto first = markup.find_first_not_of(" \t\r\n");
+    // Binary image metadata can contain literal SVG examples. XML must begin
+    // with markup, allowing its declaration, comments, and UTF-8 BOM.
+    bool svg = first != markup.npos && markup[first] == '<' && markup.find("<svg", first) != markup.npos;
     if (svg) {
         out.svgSource =
             source ? std::move(source) : std::make_shared<const std::vector<unsigned char>>(bytes);
@@ -175,6 +195,18 @@ Image decodeImage(std::vector<unsigned char> bytes, float rasterScale = 1,
                                                            WICDecodeMetadataCacheOnDemand, &decoder)));
         ComPtr<IWICBitmapFrameDecode> frame;
         require(SUCCEEDED(decoder->GetFrame(0, &frame)));
+        unsigned orientation = 1;
+        ComPtr<IWICMetadataQueryReader> metadata;
+        if (SUCCEEDED(frame->GetMetadataQueryReader(&metadata)))
+            for (auto query : {L"/app1/ifd/{ushort=274}", L"/ifd/{ushort=274}"}) {
+                PROPVARIANT value{};
+                auto status = metadata->GetMetadataByName(query, &value);
+                if (SUCCEEDED(status) && value.vt == VT_UI2 && value.uiVal >= 1 && value.uiVal <= 8)
+                    orientation = value.uiVal;
+                PropVariantClear(&value);
+                if (SUCCEEDED(status))
+                    break;
+            }
         UINT w, h;
         require(SUCCEEDED(frame->GetSize(&w, &h)) && w && h && w <= 65536 && h <= 65536 &&
                 (uint64_t)w * h <= 64000000);
@@ -185,9 +217,26 @@ Image decodeImage(std::vector<unsigned char> bytes, float rasterScale = 1,
         require(SUCCEEDED(factory->CreateBitmapScaler(&scaler)));
         require(SUCCEEDED(
             scaler->Initialize(frame.Get(), out.width, out.height, WICBitmapInterpolationModeFant)));
+        ComPtr<IWICBitmapSource> oriented = scaler;
+        if (orientation != 1) {
+            constexpr WICBitmapTransformOptions transforms[] = {
+                WICBitmapTransformRotate0,
+                WICBitmapTransformFlipHorizontal,
+                WICBitmapTransformRotate180,
+                WICBitmapTransformFlipVertical,
+                (WICBitmapTransformOptions)(WICBitmapTransformRotate270 | WICBitmapTransformFlipHorizontal),
+                WICBitmapTransformRotate90,
+                (WICBitmapTransformOptions)(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal),
+                WICBitmapTransformRotate270};
+            ComPtr<IWICBitmapFlipRotator> rotator;
+            require(SUCCEEDED(factory->CreateBitmapFlipRotator(&rotator)));
+            require(SUCCEEDED(rotator->Initialize(scaler.Get(), transforms[orientation - 1])));
+            require(SUCCEEDED(rotator->GetSize(&out.width, &out.height)));
+            oriented = rotator;
+        }
         ComPtr<IWICFormatConverter> converter;
         require(SUCCEEDED(factory->CreateFormatConverter(&converter)));
-        require(SUCCEEDED(converter->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
+        require(SUCCEEDED(converter->Initialize(oriented.Get(), GUID_WICPixelFormat32bppPBGRA,
                                                 WICBitmapDitherTypeNone, nullptr, 0,
                                                 WICBitmapPaletteTypeCustom)));
         out.pixels.resize((size_t)out.width * out.height * 4);
@@ -199,8 +248,8 @@ Image decodeImage(std::vector<unsigned char> bytes, float rasterScale = 1,
 }
 } // namespace
 Image imageForExport(const std::wstring &url, const std::wstring &base, const std::atomic_bool &cancel) {
-    std::wstring key = url;
-    if (!url.starts_with(L"https://")) {
+    std::wstring key = imageUrl(url);
+    if (!isHttps(key)) {
         require(url.find(L"://") == url.npos && !url.starts_with(L"data:"));
         std::wstring decoded(key.size() + 1, L'\0');
         DWORD count = (DWORD)decoded.size();
@@ -225,14 +274,14 @@ Images::Images(HWND h) : window(h) {}
 Images::Images(HWND h, std::function<Image(const std::wstring &, const std::atomic_bool &)> loader)
     : window(h), testLoader(std::move(loader)) {}
 #endif
-void Images::cancelPending() {
+void Images::cancelPending(bool clearCache) {
     auto next = std::make_shared<std::atomic_bool>(false);
     std::lock_guard lock(mutex);
     generationCancel->store(true);
     generationCancel = std::move(next);
     jobs.clear();
     for (auto it = cache.begin(); it != cache.end();) {
-        if (!it->second->ready && !it->second->failed)
+        if (clearCache || !it->second->ready || it->second->failed)
             it = cache.erase(it);
         else
             ++it;
@@ -305,8 +354,9 @@ void Images::run() {
     CoUninitialize();
 }
 std::shared_ptr<Image> Images::get(const std::wstring &url, const std::wstring &base) {
-    std::wstring key = url.substr(0, url.find(L'#'));
-    if (!url.starts_with(L"https://")) {
+    std::wstring key = imageUrl(url);
+    bool remote = isHttps(key);
+    if (!remote) {
         if (url.find(L"://") != url.npos || url.starts_with(L"data:"))
             return {};
         std::wstring decoded(key.size() + 1, 0);
@@ -340,7 +390,7 @@ std::shared_ptr<Image> Images::get(const std::wstring &url, const std::wstring &
         return {};
     // Network waits should not serialize an entire row of remote badges.
     // Local-only documents keep the existing two-worker footprint.
-    size_t workerCount = url.starts_with(L"https://") ? 6 : 2;
+    size_t workerCount = remote ? 6 : 2;
     while (workers.size() < workerCount)
         workers.emplace_back([this] { run(); });
     size_t total = 0;

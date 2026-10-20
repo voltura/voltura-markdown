@@ -111,7 +111,11 @@ TextEdit insertMarkdown(std::wstring_view s, size_t start, size_t end, Insert ki
     case Insert::Image: {
         std::wstring escapedLabel, escapedDestination;
         auto title = label.empty() ? (selected.empty() ? L"text" : selected) : std::wstring(label);
-        for (auto c : title) {
+        for (auto c : editText(title)) {
+            if (c == L'\n') {
+                escapedLabel += L"&#10;";
+                continue;
+            }
             if (std::wstring_view(L"[]\\&<>*_`~").find(c) != std::wstring_view::npos)
                 escapedLabel += L'\\';
             escapedLabel += c;
@@ -178,9 +182,70 @@ TextEdit insertMarkdown(std::wstring_view s, size_t start, size_t end, Insert ki
         auto right = s.find(L'\n', end > start && s[end - 1] == L'\n' ? end - 1 : end);
         if (right == s.npos)
             right = s.size();
+        std::vector<std::pair<size_t, size_t>> underlines;
+        if (kind == Insert::Heading) {
+            struct Headings {
+                std::string bytes;
+                std::vector<std::pair<size_t, size_t>> spans;
+                std::exception_ptr error;
+            } headings{toUtf8(s)};
+            MD_PARSER parser{};
+            parser.flags = MD_DIALECT_GITHUB;
+            parser.enter_block = [](MD_BLOCKTYPE type, void *detail, void *data) {
+                auto &state = *(Headings *)data;
+                if (type == MD_BLOCK_H) {
+                    auto &heading = *(MD_BLOCK_H_DETAIL *)detail;
+                    if (heading.is_setext) {
+                        try {
+                            state.spans.emplace_back(heading.source_begin, heading.source_end);
+                        } catch (...) {
+                            state.error = std::current_exception();
+                            return 1;
+                        }
+                    }
+                }
+                return 0;
+            };
+            parser.leave_block = [](MD_BLOCKTYPE, void *, void *) { return 0; };
+            parser.enter_span = parser.leave_span = [](MD_SPANTYPE, void *, void *) { return 0; };
+            parser.text = [](MD_TEXTTYPE, const char *, MD_SIZE, void *) { return 0; };
+            md_parse(headings.bytes.data(), (MD_SIZE)headings.bytes.size(), &parser, &headings);
+            if (headings.error)
+                std::rethrow_exception(headings.error);
+            std::sort(headings.spans.begin(), headings.spans.end());
+            size_t byte = 0, units = 0;
+            auto position = [&](size_t offset) {
+                units += fromUtf8(std::string_view(headings.bytes).substr(byte, offset - byte)).size();
+                byte = offset;
+                return units;
+            };
+            for (auto [begin, last] : headings.spans) {
+                auto line = begin ? headings.bytes.rfind('\n', begin - 1) : std::string::npos;
+                auto headingStart = position(line == std::string::npos ? 0 : line + 1);
+                auto newline = headings.bytes.find('\n', last);
+                if (newline == std::string::npos)
+                    continue;
+                auto underlineStart = position(newline);
+                auto tail = headings.bytes.find('\n', newline + 1);
+                auto underlineEnd = position(tail == std::string::npos ? headings.bytes.size() : tail);
+                if (headingStart <= right && underlineEnd >= result.start) {
+                    result.start = std::min(result.start, headingStart);
+                    right = std::max(right, underlineEnd);
+                    underlines.emplace_back(underlineStart, underlineEnd);
+                }
+            }
+        }
         result.length = right - result.start;
         std::wstring lines(s.substr(result.start, result.length));
-        if (lines.empty())
+        std::vector<size_t> setextEnds;
+        size_t removed = 0;
+        for (auto [begin, underlineEnd] : underlines) {
+            setextEnds.push_back(begin - result.start - removed);
+            removed += underlineEnd - begin;
+        }
+        for (auto it = underlines.rbegin(); it != underlines.rend(); ++it)
+            lines.erase(it->first - result.start, it->second - it->first);
+        if (lines.empty() && (kind != Insert::Heading || first))
             lines = kind == Insert::Heading ? L"Heading" : L"item";
         size_t at = 0;
         unsigned number = 1;
@@ -191,14 +256,39 @@ TextEdit insertMarkdown(std::wstring_view s, size_t start, size_t end, Insert ki
             auto line = lines.substr(at, next - at);
             std::wstring prefix;
             size_t indent = 0;
+            bool removedHeading = false;
             if (kind == Insert::Heading) {
                 while (indent < line.size() && indent < 3 && line[indent] == L' ')
                     ++indent;
+                size_t column = indent;
+                while (indent < line.size() && line[indent] == L'>') {
+                    ++indent;
+                    ++column;
+                    size_t padding = 0;
+                    if (indent < line.size() && line[indent] == L' ') {
+                        ++indent;
+                        ++column;
+                    } else if (indent < line.size() && line[indent] == L'\t') {
+                        auto width = 4 - column % 4;
+                        ++indent;
+                        column += width;
+                        padding = width - 1;
+                    }
+                    while (indent < line.size() && (line[indent] == L' ' || line[indent] == L'\t')) {
+                        size_t width = line[indent] == L'\t' ? 4 - column % 4 : 1;
+                        if (padding + width > 3)
+                            break;
+                        padding += width;
+                        column += width;
+                        ++indent;
+                    }
+                }
                 size_t n = indent;
                 while (n < line.size() && line[n] == L'#')
                     ++n;
                 if (n > indent && n - indent <= 6 &&
                     (n == line.size() || line[n] == L' ' || line[n] == L'\t')) {
+                    removedHeading = true;
                     auto tail = line.find_last_not_of(L" \t");
                     if (tail != line.npos && line[tail] == L'#') {
                         auto hashes = tail;
@@ -229,6 +319,33 @@ TextEdit insertMarkdown(std::wstring_view s, size_t start, size_t end, Insert ki
                 result.selection = indent + prefix.size();
             line.insert(indent, prefix);
             result.replacement += line;
+            if (kind == Insert::Heading && !first &&
+                (removedHeading || std::binary_search(setextEnds.begin(), setextEnds.end(), next))) {
+                auto remainder = next < lines.size() ? std::wstring_view(lines).substr(next + 1)
+                                 : right < s.size()  ? s.substr(right + 1)
+                                                     : std::wstring_view{};
+                auto following = remainder.substr(0, remainder.find(L'\n'));
+                auto marker = following.find_first_not_of(L" \t>");
+                if (marker != following.npos && (following[marker] == L'-' || following[marker] == L'=')) {
+                    // Test the actual two-line syntax: spaced rules and other
+                    // blocks need no extra blank line, but Setext underlines do.
+                    auto bytes = toUtf8(line + L"\n" + std::wstring(following));
+                    bool setext = false;
+                    MD_PARSER parser{};
+                    parser.flags = MD_DIALECT_GITHUB;
+                    parser.enter_block = [](MD_BLOCKTYPE type, void *detail, void *data) {
+                        if (type == MD_BLOCK_H && ((MD_BLOCK_H_DETAIL *)detail)->is_setext)
+                            *(bool *)data = true;
+                        return 0;
+                    };
+                    parser.leave_block = [](MD_BLOCKTYPE, void *, void *) { return 0; };
+                    parser.enter_span = parser.leave_span = [](MD_SPANTYPE, void *, void *) { return 0; };
+                    parser.text = [](MD_TEXTTYPE, const char *, MD_SIZE, void *) { return 0; };
+                    md_parse(bytes.data(), (MD_SIZE)bytes.size(), &parser, &setext);
+                    if (setext)
+                        result.replacement += L"\n" + line.substr(0, indent);
+                }
+            }
             if (next == lines.size())
                 break;
             result.replacement += L'\n';
@@ -421,6 +538,7 @@ std::vector<Diagnostic> validateDraft(const Document &doc, const std::atomic_boo
         std::exception_ptr error;
         size_t position = 0;
         bool code = false;
+        unsigned imageDepth = 0;
         wchar_t fence = 0;
         size_t fenceStart = 0, fenceLength = 0, codeEnd = 0;
         void locate(const char *s, size_t n) {
@@ -501,7 +619,7 @@ std::vector<Diagnostic> validateDraft(const Document &doc, const std::atomic_boo
         }
         void link(const MD_ATTRIBUTE &attribute, bool image) {
             auto previousPosition = position;
-            locate(attribute.text, attribute.size);
+            locate(attribute.raw_text, attribute.raw_size);
             size_t location = position;
             position = previousPosition;
             std::wstring target;
@@ -523,7 +641,7 @@ std::vector<Diagnostic> validateDraft(const Document &doc, const std::atomic_boo
                 target.assign(decoded.data(), size);
             if (fragmentOnly) {
                 if (!image && target.size() > 1 && !anchors.contains(target.substr(1)))
-                    issue(location, attribute.size, L"Heading link has no target: " + target);
+                    issue(location, attribute.raw_size, L"Heading link has no target: " + target);
                 return;
             }
             bool drivePath = target.size() >= 3 && iswalpha(target[0]) && target[1] == L':' &&
@@ -550,14 +668,16 @@ std::vector<Diagnostic> validateDraft(const Document &doc, const std::atomic_boo
             if (cancel.load())
                 return;
             if (cached->second.second)
-                issue(location, attribute.size, L"Could not check local target: " + target);
+                issue(location, attribute.raw_size, L"Could not check local target: " + target);
             else if (!cached->second.first)
-                issue(location, attribute.size, L"Local target does not exist: " + target);
+                issue(location, attribute.raw_size, L"Local target does not exist: " + target);
         }
     } state{doc, cancel, toUtf8(doc.source)};
-    for (auto &block : doc.blocks)
+    visitBlocks(doc.blocks, [&](const Block &block) {
         if (block.anchor)
             state.anchors.insert(*block.anchor);
+        return true;
+    });
     MD_PARSER parser{};
     parser.flags = MD_DIALECT_GITHUB;
     // All C callbacks contain exceptions so they cannot unwind through the C parser.
@@ -590,18 +710,24 @@ std::vector<Diagnostic> validateDraft(const Document &doc, const std::atomic_boo
         if (v.cancel.load())
             return 1;
         try {
-            if (type == MD_SPAN_A)
+            if (type == MD_SPAN_A && !v.imageDepth)
                 v.link(((MD_SPAN_A_DETAIL *)detail)->href, false);
-            if (type == MD_SPAN_IMG)
-                v.link(((MD_SPAN_IMG_DETAIL *)detail)->src, true);
+            if (type == MD_SPAN_IMG) {
+                if (!v.imageDepth)
+                    v.link(((MD_SPAN_IMG_DETAIL *)detail)->src, true);
+                ++v.imageDepth;
+            }
         } catch (...) {
             v.error = std::current_exception();
             return 1;
         }
         return 0;
     };
-    parser.leave_span = [](MD_SPANTYPE, void *, void *data) {
-        return ((Validation *)data)->cancel.load() ? 1 : 0;
+    parser.leave_span = [](MD_SPANTYPE type, void *, void *data) {
+        auto &v = *(Validation *)data;
+        if (type == MD_SPAN_IMG)
+            --v.imageDepth;
+        return v.cancel.load() ? 1 : 0;
     };
     parser.text = [](MD_TEXTTYPE, const char *text, MD_SIZE size, void *data) -> int {
         auto &v = *(Validation *)data;

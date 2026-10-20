@@ -319,6 +319,11 @@ typedef struct MD_BLOCK_LI_DETAIL {
 /* Detailed info for MD_BLOCK_H. */
 typedef struct MD_BLOCK_H_DETAIL {
     unsigned level;             /* Header level (1 - 6) */
+    /* Voltura source-editing metadata, in input code units. The end excludes
+     * the Setext underline. No source text is copied. */
+    MD_OFFSET source_begin;
+    MD_OFFSET source_end;
+    unsigned is_setext;
 } MD_BLOCK_H_DETAIL;
 
 /* Detailed info for MD_BLOCK_CODE. */

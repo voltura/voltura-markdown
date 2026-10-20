@@ -76,6 +76,7 @@ struct Block {
     uint8_t level = 0, align = 0;
     bool continuation : 1 = false;
     bool header : 1 = false;
+    bool markdownTable : 1 = false;
     uint32_t start = 0, length = 0;
     unsigned indent = 0, quote = 0;
     // Shared identity for bounded pieces of one fenced/indented code block.
@@ -101,6 +102,19 @@ struct Document {
     double readMs = 0, parseMs = 0;
 #endif
 };
+// Visit semantic blocks, including table children. Return false to stop early.
+template <class Visitor> bool visitBlocks(const std::deque<Block> &blocks, const Visitor &visit) {
+    for (const auto &block : blocks) {
+        if (!visit(block))
+            return false;
+        if (block.table && block.table->captions && !visitBlocks(*block.table->captions, visit))
+            return false;
+        for (const auto &cell : block.cells)
+            if (cell.content && !visitBlocks(*cell.content, visit))
+                return false;
+    }
+    return true;
+}
 std::wstring fromUtf8(std::string_view s);
 std::string toUtf8(std::wstring_view s);
 std::wstring decode(std::string_view bytes, std::wstring *encoding = nullptr);

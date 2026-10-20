@@ -1,4 +1,5 @@
 #include "editor-tools.h"
+#include "image-layout.h"
 #include "images.h"
 #include "md4c.h"
 #include <algorithm>
@@ -14,6 +15,10 @@
 
 namespace vm {
 namespace {
+bool validRecoveryUtf8(std::string_view bytes) {
+    return bytes.empty() || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
+                                                (int)bytes.size(), nullptr, 0) > 0;
+}
 std::wstring_view trim(std::wstring_view s) {
     while (!s.empty() && iswspace(s.front()))
         s.remove_prefix(1);
@@ -37,13 +42,16 @@ std::wstring escape(std::wstring_view s) {
     }
     return out;
 }
+bool hasUrlScheme(std::wstring_view value) {
+    auto colon = value.find(L':'), boundary = value.find_first_of(L"/\\?#");
+    return colon != value.npos && (boundary == value.npos || colon < boundary);
+}
 std::wstring safeUrl(std::wstring_view value) {
     std::wstring test(value);
     std::transform(test.begin(), test.end(), test.begin(), towlower);
     if (test.find_first_of(L"\r\n\t") != test.npos)
         return {};
-    auto colon = test.find(L':');
-    if (colon != test.npos && !test.starts_with(L"https:") && !test.starts_with(L"http:") &&
+    if (hasUrlScheme(test) && !test.starts_with(L"https:") && !test.starts_with(L"http:") &&
         !test.starts_with(L"mailto:") && !test.starts_with(L"file:"))
         return {};
     return escape(value);
@@ -51,8 +59,7 @@ std::wstring safeUrl(std::wstring_view value) {
 std::wstring exportUrl(std::wstring_view value, const std::filesystem::path &document) {
     bool drive =
         value.size() > 2 && iswalpha(value[0]) && value[1] == ':' && (value[2] == '/' || value[2] == '\\');
-    if (value.empty() || value[0] == '#' || (!drive && value.find(':') != value.npos) ||
-        value.starts_with(L"//"))
+    if (value.empty() || value[0] == '#' || (!drive && hasUrlScheme(value)) || value.starts_with(L"//"))
         return safeUrl(value);
     auto split = value.find_first_of(L"#?");
     auto pathPart = std::wstring(value.substr(0, split));
@@ -84,6 +91,7 @@ std::vector<HeadingEntry> sourceOutline(std::wstring_view source) {
         std::vector<HeadingEntry> headings;
         bool heading = false;
         unsigned level = 0;
+        unsigned imageDepth = 0;
         size_t offset = SIZE_MAX, byte = 0, units = 0;
         std::wstring title;
         std::exception_ptr error;
@@ -94,8 +102,11 @@ std::vector<HeadingEntry> sourceOutline(std::wstring_view source) {
         auto &s = *(State *)data;
         if (type == MD_BLOCK_H) {
             s.heading = true;
-            s.level = ((MD_BLOCK_H_DETAIL *)detail)->level;
-            s.offset = SIZE_MAX;
+            auto &heading = *(MD_BLOCK_H_DETAIL *)detail;
+            s.level = heading.level;
+            auto at = heading.source_begin;
+            auto newline = at ? s.bytes.rfind('\n', at - 1) : std::string::npos;
+            s.offset = newline == std::string::npos ? 0 : newline + 1;
             s.title.clear();
         }
         return 0;
@@ -117,27 +128,40 @@ std::vector<HeadingEntry> sourceOutline(std::wstring_view source) {
         }
         return 0;
     };
-    parser.enter_span = parser.leave_span = [](MD_SPANTYPE, void *, void *) -> int { return 0; };
+    parser.enter_span = [](MD_SPANTYPE type, void *, void *data) -> int {
+        if (type == MD_SPAN_IMG)
+            ++((State *)data)->imageDepth;
+        return 0;
+    };
+    parser.leave_span = [](MD_SPANTYPE type, void *, void *data) -> int {
+        if (type == MD_SPAN_IMG)
+            --((State *)data)->imageDepth;
+        return 0;
+    };
     parser.text = [](MD_TEXTTYPE type, const char *text, MD_SIZE size, void *data) -> int {
         auto &s = *(State *)data;
         if (!s.heading)
             return 0;
         try {
-            auto pointer = (uintptr_t)text, begin = (uintptr_t)s.bytes.data();
-            if (s.offset == SIZE_MAX && pointer >= begin && pointer < begin + s.bytes.size()) {
-                auto at = (size_t)(pointer - begin);
-                auto newline = at ? s.bytes.rfind('\n', at - 1) : std::string::npos;
-                s.offset = newline == std::string::npos ? 0 : newline + 1;
-            }
-            if (s.title.size() < 512 && type != MD_TEXT_HTML) {
+            auto raw = std::string_view(text, size);
+            size_t tag = raw.starts_with("</") ? 2 : 1;
+            bool htmlBreak = !s.imageDepth && type == MD_TEXT_HTML && raw.starts_with("<") &&
+                             raw.size() > tag + 2 && (raw[tag] == 'b' || raw[tag] == 'B') &&
+                             (raw[tag + 1] == 'r' || raw[tag + 1] == 'R') &&
+                             std::string_view(" \t\r\n\f/>").find(raw[tag + 2]) != std::string_view::npos;
+            if (s.title.size() < 512 && (type != MD_TEXT_HTML || htmlBreak || s.imageDepth)) {
                 size_t bytes = std::min<size_t>(size, (512 - s.title.size()) * 4);
                 while (bytes < size && bytes && ((unsigned char)text[bytes] & 0xc0) == 0x80)
                     --bytes;
-                auto value = type == MD_TEXT_SOFTBR || type == MD_TEXT_BR
+                auto value = type == MD_TEXT_NULLCHAR ? L"\uFFFD"
+                             : type == MD_TEXT_SOFTBR || type == MD_TEXT_BR || htmlBreak
                                  ? L" "
                                  : fromUtf8(std::string_view(text, bytes));
                 if (type == MD_TEXT_ENTITY)
                     value = entity(value);
+                // Outline rows use tabs to separate command shortcut badges.
+                // Heading whitespace belongs to the label, never to that UI syntax.
+                std::replace(value.begin(), value.end(), L'\t', L' ');
                 size_t count = std::min(value.size(), 512 - s.title.size());
                 if (count && count < value.size() && value[count - 1] >= 0xd800 && value[count - 1] <= 0xdbff)
                     --count;
@@ -167,6 +191,23 @@ std::optional<TextEdit> continueMarkdown(std::wstring_view line, size_t caret) {
             ++p;
     }
     size_t quote = p;
+    if (caret == line.size() && p < prefix.size() &&
+        (prefix[p] == '*' || prefix[p] == '-' || prefix[p] == '_')) {
+        auto mark = prefix[p];
+        size_t count = 0, end = p;
+        for (; end < prefix.size(); ++end) {
+            if (prefix[end] == mark)
+                ++count;
+            else if (prefix[end] != ' ' && prefix[end] != '\t')
+                break;
+        }
+        if (end == prefix.size() && count >= 3) {
+            if (!quote)
+                return {};
+            auto next = L"\n" + std::wstring(prefix.substr(0, quote));
+            return TextEdit{caret, 0, next, next.size(), 0};
+        }
+    }
     std::wstring marker;
     if (p + 1 < prefix.size() && (prefix[p] == '-' || prefix[p] == '+' || prefix[p] == '*') &&
         (prefix[p + 1] == ' ' || prefix[p + 1] == '\t')) {
@@ -174,12 +215,6 @@ std::optional<TextEdit> continueMarkdown(std::wstring_view line, size_t caret) {
         p += 2;
         while (p < prefix.size() && (prefix[p] == ' ' || prefix[p] == '\t'))
             marker += prefix[p++];
-        if (p + 3 < prefix.size() && prefix[p] == '[' &&
-            (prefix[p + 1] == ' ' || prefix[p + 1] == 'x' || prefix[p + 1] == 'X') && prefix[p + 2] == ']' &&
-            (prefix[p + 3] == ' ' || prefix[p + 3] == '\t')) {
-            marker += L"[ ] ";
-            p += 4;
-        }
     } else {
         size_t digits = p;
         while (p < prefix.size() && prefix[p] >= '0' && prefix[p] <= '9')
@@ -189,8 +224,18 @@ std::optional<TextEdit> continueMarkdown(std::wstring_view line, size_t caret) {
             auto number = std::stoul(std::wstring(prefix.substr(digits, p - digits)));
             marker = std::to_wstring(std::min(number + 1, 999999999ul)) + prefix[p] + prefix[p + 1];
             p += 2;
+            while (p < prefix.size() && (prefix[p] == ' ' || prefix[p] == '\t'))
+                marker += prefix[p++];
         } else
             p = quote;
+    }
+    if (!marker.empty() && p + 3 < prefix.size() && prefix[p] == '[' &&
+        (prefix[p + 1] == ' ' || prefix[p + 1] == 'x' || prefix[p + 1] == 'X') && prefix[p + 2] == ']' &&
+        (prefix[p + 3] == ' ' || prefix[p + 3] == '\t')) {
+        marker += L"[ ]";
+        p += 3;
+        while (p < prefix.size() && (prefix[p] == ' ' || prefix[p] == '\t'))
+            marker += prefix[p++];
     }
     if (marker.empty() && quote == indent && !indent)
         return {};
@@ -219,8 +264,8 @@ TextEdit indentMarkdown(std::wstring_view s, size_t start, size_t end, bool outd
             size_t n = 0;
             while (n < line.size() && n < 4 && line[n] == ' ')
                 ++n;
-            if (!n && !line.empty() && line[0] == '\t')
-                n = 1;
+            if (n < 4 && n < line.size() && line[n] == '\t')
+                ++n;
             edit.replacement += line.substr(n);
         } else
             edit.replacement += L"    " + std::wstring(line);
@@ -248,23 +293,60 @@ std::optional<TextEdit> editTable(std::wstring_view s, size_t caret, TableAction
         auto e = s.find(L'\n', at);
         return s.substr(at, (e == s.npos ? s.size() : e) - at);
     };
+    auto boundary = [&](std::wstring_view line) {
+        if (scanFenceLine(line, {}).marker)
+            return true;
+        auto leading = line.find_first_not_of(L" ");
+        if (leading == line.npos || leading > 3)
+            return false;
+        line.remove_prefix(leading);
+        auto hashes = line.find_first_not_of(L"#");
+        return hashes >= 1 && hashes <= 6 &&
+               (hashes == line.size() || line[hashes] == L' ' || line[hashes] == L'\t');
+    };
     if (fence.marker && scanFenceLine(lineAt(start), fence).marker)
         return {};
     auto indentation = lineAt(start).find_first_not_of(L" ");
     if (indentation >= 4 || lineAt(start).substr(indentation).starts_with(L"\t"))
         return {};
-    if (lineAt(start).find('|') == s.npos)
+    auto tableLine = [&](std::wstring_view line) {
+        if (trim(line).empty() || boundary(line))
+            return false;
+        if (line.find('|') != line.npos)
+            return true;
+        // A table body may omit every separator: its first cell contains the
+        // line, and remaining cells are empty. Do not cross other block syntax.
+        auto bytes = "| A | B |\n| --- | --- |\n" + toUtf8(line);
+        MD_PARSER parser{};
+        parser.flags = MD_DIALECT_GITHUB;
+        parser.enter_block = [](MD_BLOCKTYPE type, void *, void *) {
+            return type != MD_BLOCK_DOC && type != MD_BLOCK_TABLE && type != MD_BLOCK_THEAD &&
+                           type != MD_BLOCK_TBODY && type != MD_BLOCK_TR && type != MD_BLOCK_TH &&
+                           type != MD_BLOCK_TD
+                       ? 1
+                       : 0;
+        };
+        parser.leave_block = [](MD_BLOCKTYPE, void *, void *) { return 0; };
+        parser.enter_span = parser.leave_span = [](MD_SPANTYPE, void *, void *) { return 0; };
+        parser.text = [](MD_TEXTTYPE, const char *, MD_SIZE, void *) { return 0; };
+        return md_parse(bytes.data(), (MD_SIZE)bytes.size(), &parser, nullptr) == 0;
+    };
+    if (!tableLine(lineAt(start)))
         return {};
+    auto caretLine = start;
     while (start) {
         auto p = start > 1 ? s.rfind(L'\n', start - 2) : s.npos;
         p = p == s.npos ? 0 : p + 1;
-        if (lineAt(p).find('|') == s.npos)
+        if (caretLine - p > 1024 * 1024)
+            return {};
+        if (!tableLine(lineAt(p)))
             break;
         start = p;
     }
     std::vector<std::vector<std::wstring>> rows;
+    std::vector<size_t> rowStarts;
     size_t end = start, active = 0, column = 0;
-    while (end < s.size() && lineAt(end).find('|') != s.npos) {
+    while (end < s.size() && tableLine(lineAt(end))) {
         if (end - start > 1024 * 1024 || rows.size() >= 10000 || lineAt(end).size() > 32768)
             return {};
         auto raw = lineAt(end), line = trim(raw);
@@ -275,8 +357,75 @@ std::optional<TextEdit> editTable(std::wstring_view s, size_t caret, TableAction
             ++rawOffset;
         }
         std::vector<size_t> pipes;
+        std::vector<std::pair<size_t, size_t>> protectedSpans;
+        if (line.find_first_of(L"<[") != line.npos) {
+            struct InlineSpans {
+                std::string bytes;
+                std::vector<std::pair<size_t, size_t>> spans;
+                std::exception_ptr error;
+                int add(const char *text, size_t size) {
+                    try {
+                        auto address = (uintptr_t)text, base = (uintptr_t)bytes.data();
+                        if (!size || address < base + 2 || address > base + bytes.size() ||
+                            size > base + bytes.size() - address)
+                            return 0;
+                        auto at = (size_t)(address - base);
+                        spans.emplace_back(at, at + size);
+                    } catch (...) {
+                        error = std::current_exception();
+                        return 1;
+                    }
+                    return 0;
+                }
+            } spans{"x " + toUtf8(line)};
+            MD_PARSER parser{};
+            // Force an inline context; table syntax is handled by the caller.
+            parser.flags = (MD_DIALECT_GITHUB & ~MD_FLAG_TABLES) | MD_FLAG_NOHTMLBLOCKS;
+            parser.enter_block = parser.leave_block = [](MD_BLOCKTYPE, void *, void *) { return 0; };
+            parser.leave_span = [](MD_SPANTYPE, void *, void *) { return 0; };
+            parser.enter_span = [](MD_SPANTYPE type, void *detail, void *data) {
+                auto &s = *(InlineSpans *)data;
+                const MD_ATTRIBUTE *destination = nullptr, *title = nullptr;
+                if (type == MD_SPAN_A) {
+                    destination = &((MD_SPAN_A_DETAIL *)detail)->href;
+                    title = &((MD_SPAN_A_DETAIL *)detail)->title;
+                } else if (type == MD_SPAN_IMG) {
+                    destination = &((MD_SPAN_IMG_DETAIL *)detail)->src;
+                    title = &((MD_SPAN_IMG_DETAIL *)detail)->title;
+                }
+                return destination ? s.add(destination->raw_text, destination->raw_size) ||
+                                         s.add(title->raw_text, title->raw_size)
+                                   : 0;
+            };
+            parser.text = [](MD_TEXTTYPE type, const char *text, MD_SIZE size, void *data) {
+                return type == MD_TEXT_HTML ? ((InlineSpans *)data)->add(text, size) : 0;
+            };
+            md_parse(spans.bytes.data(), (MD_SIZE)spans.bytes.size(), &parser, &spans);
+            if (spans.error)
+                std::rethrow_exception(spans.error);
+            // Link attributes arrive before their label's HTML; convert in source order.
+            std::sort(spans.spans.begin(), spans.spans.end());
+            size_t byte = 0, units = 0;
+            for (auto [spanStart, spanEnd] : spans.spans) {
+                if (spanStart < byte)
+                    continue;
+                units += fromUtf8(std::string_view(spans.bytes).substr(byte, spanStart - byte)).size();
+                auto length =
+                    fromUtf8(std::string_view(spans.bytes).substr(spanStart, spanEnd - spanStart)).size();
+                protectedSpans.emplace_back(units - 2, units - 2 + length);
+                units += length;
+                byte = spanEnd;
+            }
+        }
         size_t code = 0;
+        size_t protectedSpan = 0;
         for (size_t i = 0; i < line.size(); ++i) {
+            while (protectedSpan < protectedSpans.size() && protectedSpans[protectedSpan].second <= i)
+                ++protectedSpan;
+            if (protectedSpan < protectedSpans.size() && protectedSpans[protectedSpan].first == i) {
+                i = protectedSpans[protectedSpan].second - 1;
+                continue;
+            }
             if (line[i] == '\\' && !code) {
                 ++i;
                 continue;
@@ -319,6 +468,7 @@ std::optional<TextEdit> editTable(std::wstring_view s, size_t caret, TableAction
                 if (end + rawOffset + pipe < caret && pipe + 1 < line.size())
                     ++column;
         }
+        rowStarts.push_back(end);
         rows.push_back(std::move(cells));
         end += lineAt(end).size();
         if (end < s.size())
@@ -326,20 +476,30 @@ std::optional<TextEdit> editTable(std::wstring_view s, size_t caret, TableAction
         else
             break;
     }
-    if (rows.size() < 2 || rows[0].empty())
+    if ((caret >= end && end < s.size()) || rows.size() < 2 || rows[0].empty())
         return {};
-    size_t cols = rows[0].size();
-    if (rows[1].size() != cols)
+    auto delimiter = [&](const std::vector<std::wstring> &row) {
+        return std::all_of(row.begin(), row.end(), [&](const std::wstring &cell) {
+            auto t = trim(cell);
+            if (!t.empty() && t.front() == ':')
+                t.remove_prefix(1);
+            if (!t.empty() && t.back() == ':')
+                t.remove_suffix(1);
+            return !t.empty() && t.find_first_not_of('-') == t.npos;
+        });
+    };
+    size_t header = 0;
+    while (header + 1 < rows.size() &&
+           (rows[header].size() != rows[header + 1].size() || !delimiter(rows[header + 1])))
+        ++header;
+    if (header + 1 == rows.size() || active < header)
         return {};
-    for (auto &cell : rows[1]) {
-        auto t = trim(cell);
-        if (!t.empty() && t.front() == ':')
-            t.remove_prefix(1);
-        if (!t.empty() && t.back() == ':')
-            t.remove_suffix(1);
-        if (t.empty() || t.find_first_not_of('-') != t.npos)
-            return {};
+    if (header) {
+        start = rowStarts[header];
+        active -= header;
+        rows.erase(rows.begin(), rows.begin() + header);
     }
+    size_t cols = rows[0].size();
     if (cols > 256 || rows.size() > 10000)
         return {};
     for (auto &row : rows) {
@@ -375,8 +535,10 @@ std::optional<TextEdit> editTable(std::wstring_view s, size_t caret, TableAction
                                                           : L"---:";
     }
     TextEdit edit{start, end - start};
+    auto headerLine = lineAt(start);
+    auto indent = headerLine.substr(0, headerLine.find_first_not_of(L" \t"));
     for (auto &row : rows) {
-        edit.replacement += L"|";
+        edit.replacement += std::wstring(indent) + L"|";
         for (auto &cell : row)
             edit.replacement += L" " + cell + L" |";
         edit.replacement += L'\n';
@@ -387,6 +549,21 @@ std::optional<TextEdit> editTable(std::wstring_view s, size_t caret, TableAction
     return edit;
 }
 FenceState scanFenceLine(std::wstring_view line, FenceState state) {
+    // Container indentation uses four-column tab stops. Normalize only the
+    // structural prefix; tabs in code or info strings need no copy.
+    auto prefixEnd = line.find_first_not_of(L" \t>+-*0123456789.)");
+    auto prefix = line.substr(0, prefixEnd);
+    if (prefix.find(L'\t') != prefix.npos) {
+        std::wstring expanded;
+        for (auto c : prefix) {
+            if (c == L'\t')
+                expanded.append(4 - expanded.size() % 4, L' ');
+            else
+                expanded += c;
+        }
+        expanded += line.substr(prefix.size());
+        return scanFenceLine(expanded, state);
+    }
     auto raw = line;
     unsigned quotes = 0, indent = 0;
     if (state.marker) {
@@ -461,7 +638,8 @@ FenceState scanFenceLine(std::wstring_view line, FenceState state) {
             return {};
         return {line.front(), n, quotes, indent};
     }
-    if (state.marker == line.front() && n >= state.length && trim(line.substr(n)).empty())
+    if (state.marker == line.front() && n >= state.length &&
+        line.substr(n).find_first_not_of(L" \t\r") == line.npos)
         return {};
     return state;
 }
@@ -547,9 +725,10 @@ std::wstring replaceMatches(std::wstring_view source, std::wstring_view needle, 
     out.reserve(source.size());
     size_t at = 0;
     auto word = [](wchar_t c) {
-        WORD type = 0;
+        WORD type = 0, marks = 0;
         GetStringTypeW(CT_CTYPE1, &c, 1, &type);
-        return (type & (C1_ALPHA | C1_DIGIT)) || c == '_';
+        GetStringTypeW(CT_CTYPE3, &c, 1, &marks);
+        return (type & (C1_ALPHA | C1_DIGIT)) || (marks & (C3_NONSPACING | C3_VOWELMARK)) || c == '_';
     };
     while (at < source.size()) {
         if (cancel.load())
@@ -572,8 +751,7 @@ std::wstring replaceMatches(std::wstring_view source, std::wstring_view needle, 
 }
 std::wstring rebaseLocalLinks(std::wstring_view source, const std::filesystem::path &from,
                               const std::filesystem::path &to) {
-    if (from.empty() ||
-        std::filesystem::absolute(from).parent_path() == std::filesystem::absolute(to).parent_path())
+    if (from.empty() || std::filesystem::absolute(from) == std::filesystem::absolute(to))
         return std::wstring(source);
     struct State {
         std::string bytes;
@@ -581,44 +759,26 @@ std::wstring rebaseLocalLinks(std::wstring_view source, const std::filesystem::p
         std::filesystem::path sourceFile;
         std::map<size_t, std::pair<size_t, std::string>> replacements;
         std::exception_ptr error;
-    } state{toUtf8(source), std::filesystem::absolute(from).parent_path(),
-            std::filesystem::absolute(to).parent_path(), std::filesystem::absolute(from)};
-    MD_PARSER parser{};
-    parser.flags = MD_DIALECT_GITHUB;
-    parser.enter_block = parser.leave_block = [](MD_BLOCKTYPE, void *, void *) -> int { return 0; };
-    parser.leave_span = [](MD_SPANTYPE, void *, void *) -> int { return 0; };
-    parser.text = [](MD_TEXTTYPE, const char *, MD_SIZE, void *) -> int { return 0; };
-    parser.enter_span = [](MD_SPANTYPE type, void *detail, void *data) -> int {
-        auto &s = *(State *)data;
-        try {
-            if (type != MD_SPAN_A && type != MD_SPAN_IMG)
-                return 0;
-            auto attr =
-                type == MD_SPAN_A ? ((MD_SPAN_A_DETAIL *)detail)->href : ((MD_SPAN_IMG_DETAIL *)detail)->src;
-            auto begin = (uintptr_t)s.bytes.data(), pointer = (uintptr_t)attr.raw_text;
-            if (pointer < begin || pointer > begin + s.bytes.size() ||
-                attr.raw_size > begin + s.bytes.size() - pointer)
-                return 0;
-            std::wstring raw;
-            for (size_t i = 0; attr.substr_offsets[i] < attr.size; ++i) {
-                auto part = fromUtf8(std::string_view(attr.text + attr.substr_offsets[i],
-                                                      attr.substr_offsets[i + 1] - attr.substr_offsets[i]));
-                raw += attr.substr_types[i] == MD_TEXT_ENTITY ? entity(part) : part;
-            }
-            if (raw.empty() || raw[0] == '#' || raw.find(':') != raw.npos || raw.starts_with(L"//"))
-                return 0;
+        std::vector<std::vector<std::pair<size_t, size_t>>> htmlRegions;
+        bool htmlContinuation = false;
+        unsigned imageDepth = 0;
+        std::optional<std::wstring> destination(std::wstring raw) {
+            if (raw.empty() || raw[0] == '#' || hasUrlScheme(raw) || raw.starts_with(L"//"))
+                return {};
             auto suffix = raw.find_first_of(L"#?");
             auto path = raw.substr(0, suffix), fragment = suffix == raw.npos ? L"" : raw.substr(suffix);
+            if (!path.empty() && from == to)
+                return {};
             std::wstring decoded(path.size() + 1, L'\0');
             DWORD n = (DWORD)decoded.size();
             if (FAILED(UrlUnescapeW(path.data(), decoded.data(), &n, URL_UNESCAPE_AS_UTF8)))
-                return 0;
+                return {};
             decoded.resize(n);
             std::filesystem::path target(decoded);
             if (target.is_absolute())
-                return 0;
-            target = target.empty() ? s.sourceFile : (s.from / target).lexically_normal();
-            auto relative = target.lexically_relative(s.to);
+                return {};
+            target = target.empty() ? sourceFile : (from / target).lexically_normal();
+            auto relative = target.lexically_relative(to);
             auto destination = markdownFileDestination(relative.empty() ? target : relative);
             std::wstring encoded;
             for (auto c : destination) {
@@ -653,7 +813,68 @@ std::wstring rebaseLocalLinks(std::wstring_view source, const std::filesystem::p
                 else
                     encoded += c;
             }
-            s.replacements[(size_t)(pointer - begin)] = {attr.raw_size, toUtf8(encoded)};
+            return encoded;
+        }
+
+    } state{toUtf8(source), std::filesystem::absolute(from).parent_path(),
+            std::filesystem::absolute(to).parent_path(), std::filesystem::absolute(from)};
+    MD_PARSER parser{};
+    parser.flags = MD_DIALECT_GITHUB;
+    parser.enter_block = parser.leave_block = [](MD_BLOCKTYPE, void *, void *) -> int { return 0; };
+    parser.leave_span = [](MD_SPANTYPE type, void *, void *data) -> int {
+        auto &s = *(State *)data;
+        if (type == MD_SPAN_IMG && s.imageDepth)
+            --s.imageDepth;
+        return 0;
+    };
+    parser.text = [](MD_TEXTTYPE type, const char *text, MD_SIZE size, void *data) -> int {
+        auto &s = *(State *)data;
+        if (type != MD_TEXT_HTML || s.imageDepth) {
+            s.htmlContinuation = false;
+            return 0;
+        }
+        try {
+            auto pointer = (uintptr_t)text, begin = (uintptr_t)s.bytes.data();
+            if (pointer < begin || pointer > begin + s.bytes.size() ||
+                size > begin + s.bytes.size() - pointer)
+                return 0;
+            auto offset = (size_t)(pointer - begin);
+            if (!s.htmlContinuation)
+                s.htmlRegions.emplace_back();
+            s.htmlRegions.back().emplace_back(offset, size);
+            s.htmlContinuation = true;
+        } catch (...) {
+            s.error = std::current_exception();
+            return 1;
+        }
+        return 0;
+    };
+    parser.enter_span = [](MD_SPANTYPE type, void *detail, void *data) -> int {
+        auto &s = *(State *)data;
+        try {
+            if (s.imageDepth) {
+                if (type == MD_SPAN_IMG)
+                    ++s.imageDepth;
+                return 0;
+            }
+            if (type == MD_SPAN_IMG)
+                ++s.imageDepth;
+            if (type != MD_SPAN_A && type != MD_SPAN_IMG)
+                return 0;
+            auto attr =
+                type == MD_SPAN_A ? ((MD_SPAN_A_DETAIL *)detail)->href : ((MD_SPAN_IMG_DETAIL *)detail)->src;
+            auto begin = (uintptr_t)s.bytes.data(), pointer = (uintptr_t)attr.raw_text;
+            if (pointer < begin || pointer > begin + s.bytes.size() ||
+                attr.raw_size > begin + s.bytes.size() - pointer)
+                return 0;
+            std::wstring raw;
+            for (size_t i = 0; attr.substr_offsets[i] < attr.size; ++i) {
+                auto part = fromUtf8(std::string_view(attr.text + attr.substr_offsets[i],
+                                                      attr.substr_offsets[i + 1] - attr.substr_offsets[i]));
+                raw += attr.substr_types[i] == MD_TEXT_ENTITY ? entity(part) : part;
+            }
+            if (auto encoded = s.destination(std::move(raw)))
+                s.replacements[(size_t)(pointer - begin)] = {attr.raw_size, toUtf8(*encoded)};
         } catch (...) {
             s.error = std::current_exception();
             return 1;
@@ -663,6 +884,167 @@ std::wstring rebaseLocalLinks(std::wstring_view source, const std::filesystem::p
     md_parse(state.bytes.data(), (MD_SIZE)state.bytes.size(), &parser, &state);
     if (state.error)
         std::rethrow_exception(state.error);
+    std::string rawTag;
+    for (const auto &region : state.htmlRegions) {
+        struct Segment {
+            size_t logical, source, length;
+        };
+        std::vector<Segment> segments;
+        std::string assembled;
+        size_t previousEnd = region.front().first;
+        for (auto [offset, length] : region) {
+            if (previousEnd < offset &&
+                std::string_view(state.bytes).substr(previousEnd, offset - previousEnd).find('\n') !=
+                    std::string_view::npos &&
+                !assembled.empty() && assembled.back() != '\n')
+                assembled += '\n';
+            segments.push_back({assembled.size(), offset, length});
+            assembled.append(state.bytes, offset, length);
+            previousEnd = offset + length;
+        }
+        std::string_view html(assembled);
+        auto sourcePosition = [&](size_t logical) {
+            auto segment = std::upper_bound(segments.begin(), segments.end(), logical,
+                                            [](size_t at, const Segment &s) { return at < s.logical; });
+            if (segment == segments.begin())
+                return std::string::npos;
+            --segment;
+            return logical - segment->logical <= segment->length
+                       ? segment->source + logical - segment->logical
+                       : std::string::npos;
+        };
+        std::string lower(html);
+        for (auto &c : lower)
+            if (c >= 'A' && c <= 'Z')
+                c += 'a' - 'A';
+        auto space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f'; };
+        for (size_t at = 0; at < html.size();) {
+            if (!rawTag.empty()) {
+                auto close = lower.find("</" + rawTag, at);
+                if (close == lower.npos)
+                    break;
+                auto after = close + rawTag.size() + 2;
+                if (after < lower.size() && lower[after] != '>' && lower[after] != '/' &&
+                    !space(lower[after])) {
+                    at = after;
+                    continue;
+                }
+                at = close;
+                rawTag.clear();
+            }
+            at = html.find('<', at);
+            if (at == html.npos)
+                break;
+            if (html.substr(at, 4) == "<!--") {
+                auto end = html.find("-->", at + 4);
+                if (end == html.npos)
+                    break;
+                at = end + 3;
+                continue;
+            }
+            if (html.substr(at, 9) == "<![CDATA[") {
+                auto end = html.find("]]>", at + 9);
+                if (end == html.npos)
+                    break;
+                at = end + 3;
+                continue;
+            }
+            if (at + 1 < html.size() && (html[at + 1] == '!' || html[at + 1] == '?')) {
+                char quote = 0;
+                for (++at; at < html.size(); ++at) {
+                    auto c = html[at];
+                    if (quote) {
+                        if (c == quote)
+                            quote = 0;
+                    } else if (c == '"' || c == '\'')
+                        quote = c;
+                    else if (c == '>') {
+                        ++at;
+                        break;
+                    }
+                }
+                continue;
+            }
+            size_t name = at + 1, nameEnd = name;
+            while (nameEnd < lower.size() &&
+                   ((lower[nameEnd] >= 'a' && lower[nameEnd] <= 'z') ||
+                    (lower[nameEnd] >= '0' && lower[nameEnd] <= '9') || lower[nameEnd] == '-'))
+                ++nameEnd;
+            if (nameEnd == name) {
+                ++at;
+                continue;
+            }
+            auto tag = std::string_view(lower).substr(name, nameEnd - name);
+            size_t end = nameEnd;
+            char quote = 0;
+            for (; end < html.size(); ++end) {
+                auto c = html[end];
+                if (quote) {
+                    if (c == quote)
+                        quote = 0;
+                } else if (c == '"' || c == '\'')
+                    quote = c;
+                else if (c == '>')
+                    break;
+            }
+            if (end == html.size())
+                break;
+            if (tag == "script" || tag == "style" || tag == "textarea" || tag == "title")
+                rawTag = tag;
+            bool selected = false;
+            for (size_t p = nameEnd; p < end;) {
+                while (p < end && (space(html[p]) || html[p] == '/'))
+                    ++p;
+                auto attributeStart = p;
+                while (p < end && !space(html[p]) && html[p] != '=' && html[p] != '/')
+                    ++p;
+                auto attribute = std::string_view(lower).substr(attributeStart, p - attributeStart);
+                while (p < end && space(html[p]))
+                    ++p;
+                if (p == end || html[p] != '=')
+                    continue;
+                ++p;
+                while (p < end && space(html[p]))
+                    ++p;
+                char delimiter = p < end && (html[p] == '"' || html[p] == '\'') ? html[p++] : 0;
+                auto valueStart = p;
+                while (p < end && (delimiter ? html[p] != delimiter : !space(html[p])))
+                    ++p;
+                auto valueEnd = p;
+                if (delimiter && p < end)
+                    ++p;
+                bool wanted = (tag == "a" && attribute == "href") || (tag == "img" && attribute == "src") ||
+                              (tag == "source" && attribute == "srcset");
+                if (!wanted || selected)
+                    continue;
+                selected = true;
+                auto value = entity(fromUtf8(html.substr(valueStart, valueEnd - valueStart)));
+                std::wstring descriptor;
+                if (attribute == "srcset") {
+                    auto trimmed = trim(value);
+                    auto split = trimmed.find_first_of(L" \t\r\n\f");
+                    if (trimmed.find(',') != trimmed.npos ||
+                        (split != trimmed.npos && trim(trimmed.substr(split)) != L"1x"))
+                        continue;
+                    if (split != trimmed.npos)
+                        descriptor = L" 1x";
+                    value = trimmed.substr(0, split);
+                }
+                if (auto destination = state.destination(std::move(value))) {
+                    auto sourceStart = sourcePosition(valueStart), sourceEnd = sourcePosition(valueEnd);
+                    if (sourceStart == std::string::npos || sourceEnd == std::string::npos ||
+                        sourceEnd - sourceStart != valueEnd - valueStart)
+                        continue;
+                    std::wstring escaped;
+                    for (auto c : *destination)
+                        escaped += c == '\'' ? L"%27" : c == '"' ? L"%22" : std::wstring(1, c);
+                    escaped += descriptor;
+                    state.replacements[sourceStart] = {sourceEnd - sourceStart, toUtf8(escaped)};
+                }
+            }
+            at = end + 1;
+        }
+    }
     std::string result;
     size_t at = 0;
     for (auto &[offset, replacement] : state.replacements) {
@@ -691,6 +1073,13 @@ std::string exportHtml(const Document &d) {
         L"head><body>";
     auto inlineText = [&](const Block &b, size_t start, size_t length) {
         std::wstring out;
+        auto text = [&](size_t at, size_t count) {
+            auto value = escape(std::wstring_view(d.text).substr(at, count));
+            if (b.kind != Kind::Code)
+                for (size_t p = 0; (p = value.find(L'\n', p)) != value.npos; p += 4)
+                    value.replace(p, 1, L"<br>");
+            return value;
+        };
         size_t end = std::min(start + length, d.text.size()), at = start;
         for (auto &run : b.runs) {
             size_t a = std::max<size_t>(start, run.start),
@@ -698,7 +1087,7 @@ std::string exportHtml(const Document &d) {
             if (e <= a)
                 continue;
             if (a > at)
-                out += escape(std::wstring_view(d.text).substr(at, a - at));
+                out += text(at, a - at);
             auto link = exportUrl(run.link, d.path);
             if (!link.empty())
                 out += L"<a href=\"" + link + L"\">";
@@ -712,19 +1101,23 @@ std::string exportHtml(const Document &d) {
                 out += L"<del>";
             if (run.style & Mono)
                 out += L"<code>";
+            if (run.style & Keycap)
+                out += L"<kbd>";
             if (run.style & Subscript)
                 out += L"<sub>";
             if (run.style & Superscript)
                 out += L"<sup>";
             if (run.style & Small)
                 out += L"<small>";
-            out += escape(std::wstring_view(d.text).substr(a, e - a));
+            out += text(a, e - a);
             if (run.style & Small)
                 out += L"</small>";
             if (run.style & Superscript)
                 out += L"</sup>";
             if (run.style & Subscript)
                 out += L"</sub>";
+            if (run.style & Keycap)
+                out += L"</kbd>";
             if (run.style & Mono)
                 out += L"</code>";
             if (run.style & Strike)
@@ -740,7 +1133,7 @@ std::string exportHtml(const Document &d) {
             at = e;
         }
         if (at < end)
-            out += escape(std::wstring_view(d.text).substr(at, end - at));
+            out += text(at, end - at);
         return out;
     };
     std::function<void(const std::deque<Block> &)> render = [&](const std::deque<Block> &blocks) {
@@ -748,6 +1141,17 @@ std::string exportHtml(const Document &d) {
         bool codeOpen = false;
         uint32_t codeIdentity = 0;
         unsigned codeQuotes = 0;
+        std::wstring textTag;
+        uint32_t textIdentity = 0;
+        unsigned textQuotes = 0;
+        auto closeText = [&] {
+            if (textTag.empty())
+                return;
+            html += L"</" + textTag + L">";
+            for (unsigned q = 0; q < textQuotes; ++q)
+                html += L"</blockquote>";
+            textTag.clear();
+        };
         auto closeCode = [&] {
             if (!codeOpen)
                 return;
@@ -770,13 +1174,18 @@ std::string exportHtml(const Document &d) {
             groupIdentity = UINT32_MAX;
         };
         for (auto &b : blocks) {
+            bool textBlock =
+                (b.kind == Kind::Paragraph || b.kind == Kind::Heading) && !(b.image && b.image->inlineImages);
+            if (!textTag.empty() && (!textBlock || !b.continuation || b.codeStart != textIdentity))
+                closeText();
             if (codeOpen && (b.kind != Kind::Code || b.codeStart != codeIdentity))
                 closeCode();
             if (gridOpen && !b.table)
                 closeGrid();
-            bool markdownHeader = b.header && !b.continuation &&
-                                  std::none_of(b.cells.begin(), b.cells.end(),
-                                               [](const Cell &cell) { return cell.content != nullptr; });
+            bool markdownHeader =
+                b.header && !b.continuation &&
+                (b.markdownTable || std::none_of(b.cells.begin(), b.cells.end(),
+                                                 [](const Cell &cell) { return cell.content != nullptr; }));
             if (table && (b.kind != Kind::Table || markdownHeader)) {
                 html += L"</table>";
                 table = false;
@@ -894,12 +1303,21 @@ std::string exportHtml(const Document &d) {
                     codeQuotes = b.quote;
                     for (unsigned q = 0; q < b.quote; ++q)
                         html += L"<blockquote>";
-                    html += L"<pre>";
+                    html += L"<pre";
+                    if (b.anchor)
+                        html += L" id=\"" + escape(*b.anchor) + L"\"";
+                    html += L">";
                 }
                 html += inlineText(b, b.start, b.length);
-            } else if (b.kind == Kind::Rule)
+            } else if (b.kind == Kind::Rule) {
+                for (unsigned q = 0; q < b.quote; ++q)
+                    html += L"<blockquote>";
                 html += L"<hr>";
-            else if ((b.kind == Kind::Image && b.image) || (b.image && b.image->inlineImages)) {
+                for (unsigned q = 0; q < b.quote; ++q)
+                    html += L"</blockquote>";
+            } else if ((b.kind == Kind::Image && b.image) || (b.image && b.image->inlineImages)) {
+                for (unsigned q = 0; q < b.quote; ++q)
+                    html += L"<blockquote>";
                 html += b.align == 2   ? L"<p style=\"text-align:center\">"
                         : b.align == 3 ? L"<p style=\"text-align:right\">"
                                        : L"<p>";
@@ -939,23 +1357,31 @@ std::string exportHtml(const Document &d) {
                 else
                     emitImage(b);
                 html += L"</p>";
+                for (unsigned q = 0; q < b.quote; ++q)
+                    html += L"</blockquote>";
             } else {
                 auto tag = b.kind == Kind::Heading
                                ? L"h" + std::to_wstring(std::clamp((unsigned)b.level, 1u, 6u))
                            : b.kind == Kind::Code ? L"pre"
                                                   : L"p";
-                for (unsigned q = 0; q < b.quote; ++q)
-                    html += L"<blockquote>";
-                html += L"<" + tag;
-                if (b.anchor)
-                    html += L" id=\"" + escape(*b.anchor) + L"\"";
-                if (b.align == 2 || b.align == 3)
-                    html += b.align == 2 ? L" style=\"text-align:center\"" : L" style=\"text-align:right\"";
-                html += L">" + inlineText(b, b.start, b.length) + L"</" + tag + L">";
-                for (unsigned q = 0; q < b.quote; ++q)
-                    html += L"</blockquote>";
+                if (textTag.empty()) {
+                    textTag = tag;
+                    textIdentity = b.codeStart;
+                    textQuotes = b.quote;
+                    for (unsigned q = 0; q < b.quote; ++q)
+                        html += L"<blockquote>";
+                    html += L"<" + tag;
+                    if (b.anchor)
+                        html += L" id=\"" + escape(*b.anchor) + L"\"";
+                    if (b.align == 2 || b.align == 3)
+                        html +=
+                            b.align == 2 ? L" style=\"text-align:center\"" : L" style=\"text-align:right\"";
+                    html += L">";
+                }
+                html += inlineText(b, b.start, b.length);
             }
         }
+        closeText();
         closeCode();
         closeGrid();
         if (table)
@@ -1078,15 +1504,23 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
             for (auto &run : block.runs) {
                 range = {(LONG)run.start, (LONG)(run.start + run.length)};
                 SendMessageW(text, EM_EXSETSEL, 0, (LPARAM)&range);
-                format.dwMask = CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_SUBSCRIPT;
-                format.dwEffects = ((run.style & Bold) ? CFE_BOLD : 0) |
-                                   ((run.style & Italic) ? CFE_ITALIC : 0) |
-                                   ((run.style & Underline) ? CFE_UNDERLINE : 0) |
-                                   ((run.style & Strike) ? CFE_STRIKEOUT : 0) |
-                                   ((run.style & Subscript) ? CFE_SUBSCRIPT : 0);
+                auto inlineFormat = format;
+                inlineFormat.dwMask = CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_SUBSCRIPT |
+                                      CFM_SUPERSCRIPT | CFM_FACE | CFM_SIZE;
+                inlineFormat.dwEffects = ((run.style & Bold) ? CFE_BOLD : 0) |
+                                         ((run.style & Italic) ? CFE_ITALIC : 0) |
+                                         ((run.style & Underline) ? CFE_UNDERLINE : 0) |
+                                         ((run.style & Strike) ? CFE_STRIKEOUT : 0) |
+                                         ((run.style & Superscript) ? CFE_SUPERSCRIPT
+                                          : (run.style & Subscript) ? CFE_SUBSCRIPT
+                                                                    : 0);
+                if (run.style & Mono)
+                    wcscpy_s(inlineFormat.szFaceName, L"Consolas");
+                if (run.style & Small)
+                    inlineFormat.yHeight = MulDiv(inlineFormat.yHeight, 83, 100);
                 if (block.kind == Kind::Heading)
-                    format.dwEffects |= CFE_BOLD;
-                SendMessageW(text, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&format);
+                    inlineFormat.dwEffects |= CFE_BOLD;
+                SendMessageW(text, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&inlineFormat);
             }
         }
         auto rtfText = [](std::wstring_view value) {
@@ -1102,6 +1536,40 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
                 else
                     out += "\\u" + std::to_string((short)c) + "?";
             }
+            return out;
+        };
+        auto styledRtf = [&](uint32_t start, uint32_t length, const std::vector<Run> &runs) {
+            std::string out;
+            size_t at = start, end = (size_t)start + length;
+            auto plain = [&](size_t first, size_t last) {
+                return rtfText(std::wstring_view(document.text).substr(first, last - first));
+            };
+            for (const auto &run : runs) {
+                size_t first = std::max<size_t>(at, run.start),
+                       last = std::min<size_t>(end, (size_t)run.start + run.length);
+                if (first >= last)
+                    continue;
+                out += plain(at, first) + "{";
+                if (run.style & Bold)
+                    out += "\\b ";
+                if (run.style & Italic)
+                    out += "\\i ";
+                if (run.style & Underline)
+                    out += "\\ul ";
+                if (run.style & Strike)
+                    out += "\\strike ";
+                if (run.style & Mono)
+                    out += "\\f1 ";
+                if (run.style & Superscript)
+                    out += "\\super ";
+                else if (run.style & Subscript)
+                    out += "\\sub ";
+                if (run.style & Small)
+                    out += "\\fs18 ";
+                out += plain(first, last) + "}";
+                at = last;
+            }
+            out += plain(at, end);
             return out;
         };
         auto streamRtf = [&](LONG start, LONG end, const std::string &rtf) {
@@ -1158,14 +1626,15 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
                     height =
                         MulDiv(GetDeviceCaps(printer, VERTRES), 1440, GetDeviceCaps(printer, LOGPIXELSY)) -
                         1840;
-                double scale =
-                    std::min({15., (double)std::max(1, std::min(width, maximumWidth)) / image.width,
-                              (double)height / image.height});
+                auto [displayWidth, displayHeight] =
+                    imageDisplaySize(imageBlock, image.width, image.height,
+                                     std::max(1, std::min(width, maximumWidth)) / 15.f, 1);
+                double scale = std::min(15., std::max(1, height) / (double)displayHeight);
                 std::string rtf = "{\\pict\\dibitmap0\\wbmbitspixel24\\wbmplanes1\\wbmwidthbytes" +
                                   std::to_string(stride) + "\\picw" + std::to_string(image.width) + "\\pich" +
                                   std::to_string(image.height) + "\\picwgoal" +
-                                  std::to_string((int)(image.width * scale)) + "\\pichgoal" +
-                                  std::to_string((int)(image.height * scale)) + " ";
+                                  std::to_string((int)(displayWidth * scale)) + "\\pichgoal" +
+                                  std::to_string((int)(displayHeight * scale)) + " ";
                 constexpr char hex[] = "0123456789abcdef";
                 rtf.reserve(rtf.size() + dib.size() * 2 + 2);
                 for (auto b : dib) {
@@ -1183,7 +1652,7 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
             return imagesRtf;
         };
         auto cellRtf = [&](uint32_t start, uint32_t length, const std::shared_ptr<std::deque<Block>> &content,
-                           int maximumWidth) {
+                           const std::vector<Run> &runs, int maximumWidth) {
             std::vector<const Block *> pictures;
             std::function<void(const std::deque<Block> &)> collect = [&](const std::deque<Block> &blocks) {
                 for (auto &b : blocks) {
@@ -1206,11 +1675,11 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
             std::string rtf;
             uint32_t at = start, end = start + length;
             for (auto picture : pictures) {
-                rtf += rtfText(std::wstring_view(document.text).substr(at, picture->start - at));
+                rtf += styledRtf(at, picture->start - at, runs);
                 rtf += imageRtf(*picture, maximumWidth);
                 at = picture->start + picture->length;
             }
-            rtf += rtfText(std::wstring_view(document.text).substr(at, end - at));
+            rtf += styledRtf(at, end - at, runs);
             return rtf;
         };
         // Replace from the end so original rendered offsets remain valid for earlier blocks.
@@ -1218,7 +1687,7 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
             active();
             auto &block = document.blocks[i];
             if (block.table) {
-                std::string rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI;}}\\fs22 ";
+                std::string rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI;}{\\f1 Consolas;}}\\fs22 ";
                 int pageWidth =
                     MulDiv(GetDeviceCaps(printer, HORZRES), 1440, GetDeviceCaps(printer, LOGPIXELSX)) - 1440;
                 std::vector<const Cell *> ordered, activeCells;
@@ -1271,7 +1740,7 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
                             if (cell->header)
                                 rtf += "\\b ";
                             rtf += cellRtf(
-                                cell->start, cell->length, cell->content,
+                                cell->start, cell->length, cell->content, block.runs,
                                 std::max(1, MulDiv(pageWidth, cell->colSpan, block.table->columns) - 160));
                             if (cell->header)
                                 rtf += "\\b0 ";
@@ -1287,7 +1756,7 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
                 while (first && document.blocks[first - 1].kind == Kind::Table &&
                        !document.blocks[first - 1].table)
                     --first;
-                std::string rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI;}}\\fs22 ";
+                std::string rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI;}{\\f1 Consolas;}}\\fs22 ";
                 int pageWidth =
                     MulDiv(GetDeviceCaps(printer, HORZRES), 1440, GetDeviceCaps(printer, LOGPIXELSX)) - 1440;
                 for (size_t row = first; row <= i; ++row) {
@@ -1302,7 +1771,7 @@ void printDocument(const Document &document, HDC printer, const std::filesystem:
                         rtf += cell.align == 3 ? "\\qr " : cell.align == 2 ? "\\qc " : "\\ql ";
                         if (b.header)
                             rtf += "\\b ";
-                        rtf += cellRtf(cell.start, cell.length, cell.content,
+                        rtf += cellRtf(cell.start, cell.length, cell.content, b.runs,
                                        std::max(1, pageWidth / (int)b.cells.size() - 160));
                         if (b.header)
                             rtf += "\\b0 ";
@@ -1460,9 +1929,21 @@ std::vector<DraftRecovery::Draft> DraftRecovery::list() {
             if (value > MAXDWORD)
                 continue;
             DWORD pid = (DWORD)value;
-            HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+            HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (!process)
+                process = OpenProcess(SYNCHRONIZE, FALSE, pid);
             if (process) {
                 auto live = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+                if (live) {
+                    FILETIME created{}, exited{}, kernel{}, user{};
+                    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+                    // A PID may now belong to a different process. A snapshot
+                    // written before that process started cannot be its live draft.
+                    if (GetProcessTimes(process, &created, &exited, &kernel, &user) &&
+                        GetFileAttributesExW(entry.path().c_str(), GetFileExInfoStandard, &attributes) &&
+                        CompareFileTime(&attributes.ftLastWriteTime, &created) < 0)
+                        live = false;
+                }
                 CloseHandle(process);
                 if (live)
                     continue;
@@ -1478,6 +1959,8 @@ std::vector<DraftRecovery::Draft> DraftRecovery::list() {
             continue;
         std::string path(n, '\0');
         if (!in.read(path.data(), n))
+            continue;
+        if (!validRecoveryUtf8(path))
             continue;
         result.push_back({entry.path(), fromUtf8(path), {}});
     }
@@ -1498,6 +1981,10 @@ DraftRecovery::Draft DraftRecovery::read(const std::filesystem::path &snapshot) 
     if (!in.read(path.data(), n))
         throw std::runtime_error("This recovery snapshot is incomplete.");
     std::string text((std::istreambuf_iterator<char>(in)), {});
+    if (in.bad())
+        throw std::runtime_error("This recovery snapshot is incomplete.");
+    if (!validRecoveryUtf8(path) || !validRecoveryUtf8(text))
+        throw std::runtime_error("This recovery snapshot contains invalid UTF-8.");
     return {snapshot, fromUtf8(path), fromUtf8(text)};
 }
 } // namespace vm

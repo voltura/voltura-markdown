@@ -61,28 +61,84 @@ inline std::vector<CodeToken> codeTokens(std::wstring_view text, std::wstring_vi
                  : js   ? jswords
                         : cwords;
     std::vector<CodeToken> result;
+    bool shellWord = false;
     auto word = [](wchar_t c) { return iswalnum(c) || c == L'_' || c == L'$'; };
     for (size_t i = 0; i < text.size();) {
         size_t start = i;
         CodeColor color;
         wchar_t c = text[i];
         auto next = [&](wchar_t n) { return i + 1 < text.size() && text[i + 1] == n; };
-        bool blockComment =
-            (!py && !sh && !ps && !sql && c == L'/' && next(L'*')) || (ps && c == L'<' && next(L'#'));
+        if (sh && c == L'\\' && i + 1 < text.size()) {
+            // A continuation removes the newline; other escapes stay in the same word.
+            if (text[i + 1] != L'\n')
+                shellWord = true;
+            i += 2;
+            continue;
+        }
+        bool blockComment = (!py && !sh && !ps && c == L'/' && next(L'*')) || (ps && c == L'<' && next(L'#'));
         if (blockComment) {
             auto end = text.find(ps ? L"#>" : L"*/", i + 2);
             i = end == text.npos ? text.size() : end + 2;
             color = CodeColor::Comment;
-        } else if (((ps || py || sh) && c == L'#') || (!(ps || py || sh || sql) && c == L'/' && next(L'/')) ||
+        } else if (((ps || py || (sh && !shellWord)) && c == L'#') ||
+                   (!(ps || py || sh || sql) && c == L'/' && next(L'/')) ||
                    (sql && c == L'-' && next(L'-'))) {
             auto end = text.find(L'\n', i);
             i = end == text.npos ? text.size() : end;
             color = CodeColor::Comment;
         } else if (c == L'\'' || c == L'"' || (js && c == L'`')) {
+            if (ps && i && text[i - 1] == L'@') {
+                auto newline = text.find_first_not_of(L" \t\r", i + 1);
+                if (newline != text.npos && text[newline] == L'\n') {
+                    auto closing = text.find(std::wstring(L"\n") + c + L"@", newline);
+                    i = closing == text.npos ? text.size() : closing + 3;
+                    result.push_back({(uint32_t)start, (uint32_t)(i - start), CodeColor::String});
+                    continue;
+                }
+            }
+            if (cpp && lang != L"c" && c == L'"' && i && text[i - 1] == L'R') {
+                size_t prefixStart = i;
+                while (prefixStart && word(text[prefixStart - 1]))
+                    --prefixStart;
+                auto prefix = text.substr(prefixStart, i - prefixStart);
+                bool rawPrefix = prefix == L"R" || prefix == L"u8R" || prefix == L"uR" || prefix == L"UR" ||
+                                 prefix == L"LR";
+                size_t open = i + 1;
+                while (open < text.size() && open - i <= 17 && text[open] != L'(' && text[open] > L' ' &&
+                       text[open] < 127 && text[open] != L')' && text[open] != L'\\')
+                    ++open;
+                if (rawPrefix && open < text.size() && open - i <= 17 && text[open] == L'(') {
+                    auto closing = L")" + std::wstring(text.substr(i + 1, open - i - 1)) + L"\"";
+                    auto end = text.find(closing, open + 1);
+                    i = end == text.npos ? text.size() : end + closing.size();
+                    result.push_back({(uint32_t)start, (uint32_t)(i - start), CodeColor::String});
+                    continue;
+                }
+            }
             bool triple = py && i + 2 < text.size() && text[i + 1] == c && text[i + 2] == c;
+            bool verbatim =
+                cs && c == L'"' &&
+                ((i && text[i - 1] == L'@') || (i >= 2 && text[i - 1] == L'$' && text[i - 2] == L'@'));
+            if (cs && c == L'"' && !verbatim) {
+                size_t quotes = 1;
+                while (i + quotes < text.size() && text[i + quotes] == L'"')
+                    ++quotes;
+                if (quotes >= 3) {
+                    auto closing = text.find(text.substr(i, quotes), i + quotes);
+                    i = closing == text.npos ? text.size() : closing + quotes;
+                    result.push_back({(uint32_t)start, (uint32_t)(i - start), CodeColor::String});
+                    continue;
+                }
+            }
+            bool escapes = !sql && !verbatim && !((ps || sh) && c == L'\'');
             i += triple ? 3 : 1;
             while (i < text.size()) {
-                if (text[i] == (ps ? L'`' : L'\\') && i + 1 < text.size()) {
+                if (escapes && text[i] == (ps ? L'`' : L'\\') && i + 1 < text.size()) {
+                    i += 2;
+                    continue;
+                }
+                if ((sql || verbatim || (ps && c == L'\'')) && text[i] == c && i + 1 < text.size() &&
+                    text[i + 1] == c) {
                     i += 2;
                     continue;
                 }
@@ -95,11 +151,34 @@ inline std::vector<CodeToken> codeTokens(std::wstring_view text, std::wstring_vi
             }
             color = CodeColor::String;
         } else if (iswdigit(c) && (i == 0 || !word(text[i - 1]))) {
+            bool hex = c == L'0' && (next(L'x') || next(L'X'));
             ++i;
-            while (i < text.size() && (iswalnum(text[i]) || text[i] == L'.' || text[i] == L'_'))
-                ++i;
+            while (i < text.size()) {
+                auto digit = [&](wchar_t value) {
+                    return (value >= L'0' && value <= L'9') ||
+                           (hex && ((value >= L'a' && value <= L'f') || (value >= L'A' && value <= L'F')));
+                };
+                if (cpp && text[i] == L'\'' && i + 1 < text.size() && digit(text[i - 1]) &&
+                    digit(text[i + 1])) {
+                    ++i;
+                    continue;
+                }
+                if (iswalnum(text[i]) || text[i] == L'.' || text[i] == L'_') {
+                    ++i;
+                    continue;
+                }
+                bool exponent = hex ? (text[i - 1] == L'p' || text[i - 1] == L'P')
+                                    : (text[i - 1] == L'e' || text[i - 1] == L'E');
+                if ((text[i] == L'+' || text[i] == L'-') && exponent && i + 1 < text.size() &&
+                    iswdigit(text[i + 1])) {
+                    ++i;
+                    continue;
+                }
+                break;
+            }
             color = CodeColor::Number;
         } else if (word(c)) {
+            shellWord = true;
             ++i;
             while (i < text.size() && (word(text[i]) || (ps && text[i] == L'-')))
                 ++i;
@@ -114,9 +193,13 @@ inline std::vector<CodeToken> codeTokens(std::wstring_view text, std::wstring_vi
             else
                 continue;
         } else {
+            if (sh)
+                shellWord = !iswspace(c) && std::wstring_view(L";|&()<>").find(c) == std::wstring_view::npos;
             ++i;
             continue;
         }
+        if (sh && color != CodeColor::Comment)
+            shellWord = true;
         result.push_back({(uint32_t)start, (uint32_t)(i - start), color});
     }
     return result;

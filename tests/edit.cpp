@@ -1,6 +1,7 @@
 #include "edit.h"
 #include "bug-regressions.h"
 #include "editor.h"
+#include "goal-bug-regressions.h"
 #include <algorithm>
 #include <fstream>
 #include <iostream>
@@ -35,9 +36,13 @@ int main(int argc, char **argv) {
                 svg << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"160\" height=\"80\"><rect "
                        "width=\"160\" height=\"80\" fill=\"#0088cc\"/></svg>";
             }
-            std::wstring source =
-                L"# Voltura Markdown PDF\n\n**Bold**, *italic*, <u>underlined</u>, Unicode åäö.\n\n| Name | "
-                L"Value |\n| --- | ---: |\n| First | 42 |\n| Second | 84 |\n\n";
+            std::wstring source = L"# Voltura Markdown PDF\n\nBaseToken `MonoToken` <sup>SuperToken</sup> "
+                                  L"<sub>SubToken</sub> <small>SmallToken</small>.\n\n";
+            source += L"<img src='" + image.generic_wstring() + L"' width='40' height='20'>\n\n";
+            source += L"**Bold**, *italic*, <u>underlined</u>, Unicode åäö.\n\n| Name | "
+                      L"Value |\n| --- | ---: |\n| First | 42 |\n| Second | 84 |\n"
+                      L"| **TableBold** *TableItalic* `TableCode` | NormalCell |\n\n";
+            source += L"<table><tr><th>HeaderToken</th><td>DataToken</td></tr></table>\n\n";
             source += L"<table><caption>Native spanning table</caption><tbody>"
                       L"<tr><th rowspan=2>Spanned group</th><td>A</td></tr><tr><td>B</td></tr>"
                       L"<tr><td colspan=2>Spanned total</td></tr></tbody></table>\n\n";
@@ -76,6 +81,7 @@ int main(int argc, char **argv) {
     try {
         std::filesystem::create_directory(folder);
         bugRegressions(folder);
+        goalBugRegressions(folder);
         {
             unsigned failures = 0;
             auto check = [&](bool ok, const char *message) {
@@ -309,6 +315,35 @@ int main(int argc, char **argv) {
                 if (entry.path().extension() == L".draft")
                     snapshot = entry.path();
             auto orphan = snapshot.parent_path() / L"4294967294-test.draft";
+            auto reusedPid =
+                snapshot.parent_path() / (std::to_wstring(GetCurrentProcessId()) + L"-old-session.draft");
+            std::filesystem::copy_file(snapshot, reusedPid);
+            FILETIME created{}, exited{}, kernel{}, user{};
+            require(GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user),
+                    "062 read current process creation time");
+            ULARGE_INTEGER earlier{};
+            earlier.LowPart = created.dwLowDateTime;
+            earlier.HighPart = created.dwHighDateTime;
+            earlier.QuadPart -= 10000000;
+            FILETIME oldTime{earlier.LowPart, earlier.HighPart};
+            auto oldFile = CreateFileW(reusedPid.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ, nullptr,
+                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            require(oldFile != INVALID_HANDLE_VALUE, "062 open simulated previous-session draft");
+            auto dated = SetFileTime(oldFile, nullptr, nullptr, &oldTime);
+            CloseHandle(oldFile);
+            require(dated, "062 date draft before the current process");
+            auto reusedDrafts = DraftRecovery::list();
+            require(reusedDrafts.size() == 1 && reusedDrafts[0].snapshot == reusedPid &&
+                        DraftRecovery::read(reusedPid).text == L"recover å😀",
+                    "062 a reused live process ID does not hide an older recovery draft");
+            oldFile = CreateFileW(reusedPid.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            require(oldFile != INVALID_HANDLE_VALUE, "062 reopen simulated draft timestamp");
+            dated = SetFileTime(oldFile, nullptr, nullptr, &created);
+            CloseHandle(oldFile);
+            require(dated && DraftRecovery::list().empty(),
+                    "062 drafts from the live process lifetime remain excluded");
+            std::filesystem::remove(reusedPid);
             std::filesystem::copy_file(snapshot, orphan);
             auto drafts = DraftRecovery::list();
             require(drafts.size() == 1 && drafts[0].text.empty() &&
@@ -330,6 +365,40 @@ int main(int argc, char **argv) {
                     "overlong recovery process IDs are not offered as orphaned drafts");
             std::filesystem::remove(malformed);
             state->clear(true);
+            auto damaged = snapshot.parent_path() / L"damaged.draft";
+            {
+                std::ofstream out(damaged, std::ios::binary);
+                out << "VMD-DRAFT-1\n0\nbroken \xff text";
+            }
+            bool rejectedEncoding = false;
+            try {
+                DraftRecovery::read(damaged);
+            } catch (const std::exception &) {
+                rejectedEncoding = true;
+            }
+            require(rejectedEncoding && std::filesystem::exists(damaged),
+                    "063 recovery rejects corrupt UTF-8 instead of silently replacing draft text");
+            for (const std::string bytes : {"\xc3", "\xed\xa0\x80", "\xc0\xaf"}) {
+                {
+                    std::ofstream out(damaged, std::ios::binary | std::ios::trunc);
+                    out << "VMD-DRAFT-1\n" << bytes.size() << '\n' << bytes << "valid body";
+                }
+                rejectedEncoding = false;
+                try {
+                    DraftRecovery::read(damaged);
+                } catch (const std::exception &) {
+                    rejectedEncoding = true;
+                }
+                require(rejectedEncoding && DraftRecovery::list().size() == 1,
+                        "063 corrupt path encoding cannot hide or alter a valid recovery entry");
+            }
+            {
+                std::ofstream out(damaged, std::ios::binary | std::ios::trunc);
+                out << "VMD-DRAFT-1\n0\n" << toUtf8(L"Valid å😀 \ufffd");
+            }
+            require(DraftRecovery::read(damaged).text == L"Valid å😀 \ufffd",
+                    "063 valid UTF-8 including an intentional replacement character remains recoverable");
+            std::filesystem::remove(damaged);
             state->write(L"stale", {});
             require(!std::filesystem::exists(snapshot),
                     "closed recovery writer cannot resurrect discarded draft");

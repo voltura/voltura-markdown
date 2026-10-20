@@ -1222,11 +1222,13 @@ void Editor::command(unsigned id) {
             }
             HMENU menu = CreatePopupMenu();
             std::vector<std::pair<std::wstring, std::wstring>> choices;
-            for (auto &b : rendered->blocks)
+            visitBlocks(rendered->blocks, [&](const Block &b) {
                 if (b.kind == Kind::Heading && b.anchor && choices.size() < 500) {
                     choices.emplace_back(rendered->text.substr(b.start, b.length), *b.anchor);
                     AppendMenuW(menu, MF_STRING, choices.size(), choices.back().first.c_str());
                 }
+                return choices.size() < 500;
+            });
             POINT point;
             GetCursorPos(&point);
             auto selected = trackMenu(menu, 0, point.x, point.y);
@@ -1368,6 +1370,12 @@ bool Editor::tab(bool backward) {
         text.resize((size_t)SendMessageW(input, EM_GETTEXTRANGE, 0, (LPARAM)&get));
         text = editText(text);
         auto edit = indentMarkdown(text, 0, text.size(), backward);
+        if (range.cpMin == range.cpMax) {
+            auto removed = text.size() - edit.replacement.size();
+            auto caret = (size_t)(range.cpMin - start);
+            edit.selection = caret > removed ? caret - removed : 0;
+            edit.selected = 0;
+        }
         edit.start += start;
         replace(edit);
         return true;
@@ -1471,7 +1479,8 @@ void Editor::outline() {
     }
     HMENU menu = CreatePopupMenu();
     for (size_t i = 0; i < std::min<size_t>(headings.size(), 500); ++i) {
-        auto label = std::wstring((headings[i].level - 1) * 2, L' ') + headings[i].title;
+        auto label = std::wstring((headings[i].level - 1) * 2, L' ') +
+                     (headings[i].title.empty() ? L"Untitled heading" : headings[i].title);
         AppendMenuW(menu, MF_STRING, i + 1, label.c_str());
     }
     POINT point;
@@ -1510,6 +1519,9 @@ bool Editor::smartEnter() {
     *(WORD *)text.data() = (WORD)(length + 1);
     auto n = SendMessageW(input, EM_GETLINE, line, (LPARAM)text.data());
     text.resize((size_t)n);
+    // Rich Edit includes its paragraph terminator, even on the final line.
+    if (text.ends_with(L'\r'))
+        text.pop_back();
     auto next = scanFenceLine(text, *state);
     if (next.marker || (state->marker && !state->quotes && !state->indent))
         return false;
@@ -3022,6 +3034,69 @@ void Editor::verify() {
     SendMessageW(input, EM_REDO, 0, 0);
     captureText();
     require(cachedText == retained, "highlight preserves redo history");
+    SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"Title\r\n=====\r\n\r\nAfter");
+    SendMessageW(input, EM_EMPTYUNDOBUFFER, 0, 0);
+    CHARRANGE headingCaret{2, 2};
+    SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&headingCaret);
+    insert(Insert::Heading, 0);
+    captureText();
+    require(cachedText == L"Title\n\nAfter", "058 native Normal text removes the Setext underline");
+    SendMessageW(input, EM_UNDO, 0, 0);
+    captureText();
+    require(cachedText == L"Title\n=====\n\nAfter", "058 heading conversion is one undo operation");
+    SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"# Title\r\n---");
+    SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&headingCaret);
+    insert(Insert::Heading, 0);
+    captureText();
+    require(cachedText == L"Title\n\n---",
+            "061 native Normal text separates a following rule from the converted paragraph");
+    SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"Before\r\n\r\n![](image.png)\r\nTitle\r\n===\r\n\r\n#");
+    captureText();
+    headings = sourceOutline(cachedText);
+    outlineRevision = revision;
+    require(headings.size() == 2, "059 native outline includes a text-free heading");
+    sourceAtHeading(0);
+    CHARRANGE outlineCaret{};
+    SendMessageW(input, EM_EXGETSEL, 0, (LPARAM)&outlineCaret);
+    require(outlineCaret.cpMin == 8 && outlineCaret.cpMax == 8,
+            "059 outline navigation targets the first line of an image-led heading");
+    sourceAtHeading(1);
+    SendMessageW(input, EM_EXGETSEL, 0, (LPARAM)&outlineCaret);
+    require((size_t)outlineCaret.cpMin == cachedText.find(L'#'),
+            "059 outline navigation targets the empty heading marker");
+    for (bool night : {false, true}) {
+        theme(night, 96);
+        auto outlineRows = sourceOutline(L"# Before\tAfter\n");
+        std::wstring expectedLabel = L"Before After";
+        MEASUREITEMSTRUCT actual{}, expected{};
+        actual.itemData = (ULONG_PTR)&outlineRows[0].title;
+        expected.itemData = (ULONG_PTR)&expectedLabel;
+        measureMenu(actual);
+        measureMenu(expected);
+        require(actual.itemWidth == expected.itemWidth && actual.itemHeight == expected.itemHeight,
+                "060 native outline sizing does not allocate a shortcut badge for heading tabs");
+    }
+    theme(false, 96);
+    SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"    alpha");
+    SetFocus(input);
+    CHARRANGE outdentCaret{6, 6};
+    SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&outdentCaret);
+    require(tab(true), "043 native Shift+Tab handles an unselected line");
+    SendMessageW(input, EM_EXGETSEL, 0, (LPARAM)&outdentCaret);
+    require(outdentCaret.cpMin == 2 && outdentCaret.cpMax == 2,
+            "043 Shift+Tab preserves a collapsed caret rather than selecting the line");
+    SendMessageW(input, EM_REPLACESEL, TRUE, (LPARAM)L"X");
+    captureText();
+    require(cachedText == L"alXpha", "043 typing after outdent retains the rest of the line");
+    for (auto line : {L"alpha", L"    alpha", L"\talpha"}) {
+        SendMessageW(input, WM_SETTEXT, 0, (LPARAM)line);
+        outdentCaret = {0, 0};
+        SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&outdentCaret);
+        require(tab(true), "043 Shift+Tab handles a caret before indentation");
+        SendMessageW(input, EM_EXGETSEL, 0, (LPARAM)&outdentCaret);
+        require(outdentCaret.cpMin == 0 && outdentCaret.cpMax == 0,
+                "043 outdent clamps the caret without creating a selection");
+    }
     SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"- item");
     captureText();
     CHARRANGE end{6, 6};
@@ -3032,12 +3107,41 @@ void Editor::verify() {
     SendMessageW(input, EM_UNDO, 0, 0);
     captureText();
     require(cachedText == L"- item", "smart Enter is one undo step");
+    SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"- ");
+    end = {2, 2};
+    SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&end);
+    require(smartEnter(), "045 empty list item Enter is handled");
+    captureText();
+    require(cachedText.empty(), "045 Enter on an empty list item exits the list");
+    SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"- \nFollowing");
+    end = {2, 2};
+    SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&end);
+    require(smartEnter(), "045 empty list item before another paragraph is handled");
+    captureText();
+    require(cachedText == L"\nFollowing", "045 exiting a list preserves the following paragraph");
+    SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"> - ");
+    end = {4, 4};
+    SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&end);
+    require(smartEnter(), "045 empty quoted list item is handled");
+    captureText();
+    require(cachedText == L"> ", "045 exiting a quoted list retains the quote");
+    SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"* * *");
+    end = {5, 5};
+    SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&end);
+    require(!smartEnter(), "044 thematic break Enter stays native");
+    SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"> * * *");
+    end = {7, 7};
+    SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&end);
+    require(smartEnter(), "044 quoted thematic break continues its quote");
+    captureText();
+    require(cachedText == L"> * * *\n> ", "044 thematic break does not create a list marker");
     SendMessageW(input, WM_SETTEXT, 0, (LPARAM)L"```\n- literal");
     captureText();
     end = {13, 13};
     SendMessageW(input, EM_EXSETSEL, 0, (LPARAM)&end);
     require(!smartEnter(), "smart Enter does not change fenced code");
-    for (auto source : {L"> ```\n> - literal", L"- ```\n  - literal", L"```text\n- ```\n- literal"}) {
+    for (auto source : {L"> ```\n> - literal", L"- ```\n  - literal", L"```text\n- ```\n- literal",
+                        L"-\t```\n\t- literal"}) {
         SendMessageW(input, WM_SETTEXT, 0, (LPARAM)source);
         captureText();
         CHARRANGE at{(LONG)cachedText.size(), (LONG)cachedText.size()};

@@ -5535,6 +5535,9 @@ md_process_leaf_block(MD_CTX* ctx, MD_BLOCK* block)
     switch(block->type) {
         case MD_BLOCK_H:
             det.header.level = block->data;
+            det.header.source_begin = ((const MD_LINE*)(block + 1))[0].beg;
+            det.header.source_end = ((const MD_LINE*)(block + 1))[block->n_lines - 1].end;
+            det.header.is_setext = !!(block->flags & MD_BLOCK_SETEXT_HEADER);
             break;
 
         case MD_BLOCK_CODE:
