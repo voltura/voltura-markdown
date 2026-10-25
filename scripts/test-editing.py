@@ -225,6 +225,17 @@ def capture(name, target=None):
         u.ReleaseDC(target, dc)
 
 
+def filename_edit(picker):
+    return wait(
+        lambda: next(
+            (h for h in windows(process.pid, picker)
+             if class_name(h) == "Edit" and u.GetDlgCtrlID(h) in (1148, 1152, 1001)),
+            None,
+        ),
+        "native Save As filename field",
+    )
+
+
 def check_dialog_theme(target, dark):
     u.GetPropW.argtypes = [w.HWND, w.LPCWSTR]
     u.GetPropW.restype = w.HANDLE
@@ -614,13 +625,13 @@ for accept in (False, True):
             for action, title in pickers:
                 command(panel, action)
                 picker = dialog(title)
-                if title == "Open":
+                if title in ("Open", "Save As"):
                     wait(
                         lambda: any(
                             class_name(h) == "SHELLDLL_DefView"
                             for h in windows(process.pid, picker)
                         ),
-                        "Explorer-style Open dialog",
+                        "Explorer-style " + title + " dialog",
                     )
                     assert not u.GetPropW(picker, "VolturaDialogColors")
                 else:
@@ -636,7 +647,7 @@ for accept in (False, True):
                     command(picker, 2)
                 wait(lambda: not u.IsWindowVisible(picker), "cancel " + title)
         command(hwnd, 103)
-        print("PASS: Explorer-style Open and themed save/print pickers in both app themes")
+        print("PASS: Explorer-style Open/Save and themed print pickers in both app themes")
         command(hwnd, 103)
         time.sleep(0.15)
         capture("editor-light.png")
@@ -736,6 +747,28 @@ for accept in (False, True):
             )
 
         wait(live_painted, "live revision painted without moving editor focus")
+        # Content refreshes must not run the window-resize path or move its
+        # icons. Exercise repeated revisions in both themes and pane layouts.
+        for narrow in (False, True):
+            resize_window(720 if narrow else 1100, 780)
+            for dark_refresh in (True, False):
+                command(hwnd, 103)
+                time.sleep(0.2)
+                viewport = u.SendMessageW(hwnd, 0x802E, 3, 0)
+                icon_paints = u.SendMessageW(hwnd, 0x802E, 4, 0)
+                canvas_before = w.RECT()
+                u.GetWindowRect(canvas, c.byref(canvas_before))
+                for revision in range(3):
+                    live_source += "More live text.\n"
+                    set_text(edit, live_source)
+                    wait(live_painted, "stable live content refresh")
+                    assert u.SendMessageW(hwnd, 0x802E, 3, 0) == viewport, "typing must not resize the application"
+                    assert u.SendMessageW(hwnd, 0x802E, 4, 0) == icon_paints, "typing must not repaint unchanged header icons"
+                    canvas_after = w.RECT()
+                    u.GetWindowRect(canvas, c.byref(canvas_after))
+                    assert bytes(canvas_before) == bytes(canvas_after), "preview geometry must stay stable while typing"
+        resize_window(1100, 780)
+        print("PASS: repeated live revisions preserve preview geometry in both themes and layouts")
         source_rect, preview_rect = w.RECT(), w.RECT()
         u.GetWindowRect(edit, c.byref(source_rect))
         u.GetWindowRect(canvas, c.byref(preview_rect))
@@ -769,9 +802,9 @@ for accept in (False, True):
             check_dialog_theme(print_dialog, False)
             command(print_dialog, 1)
             pdf_dialog = dialog("Save As")
-            check_dialog_theme(pdf_dialog, False)
+            assert not u.GetPropW(pdf_dialog, "VolturaDialogColors")
             pdf_path = folder / "themed-print.pdf"
-            set_text(u.GetDlgItem(pdf_dialog, 0x480), str(pdf_path))
+            set_text(filename_edit(pdf_dialog), str(pdf_path))
             command(pdf_dialog, 1)
             completed = dialog("Print / PDF")
             assert pdf_path.read_bytes().startswith(b"%PDF") and pdf_path.stat().st_size > 1000
@@ -780,17 +813,7 @@ for accept in (False, True):
         # Save As uses the native chooser and leaves the old file intact.
         command(hwnd, 163)
         save_dialog = dialog("Save As")
-        name_edit = wait(
-            lambda: next(
-                (
-                    h
-                    for h in windows(process.pid, save_dialog)
-                    if class_name(h) == "Edit" and u.GetDlgCtrlID(h) in (1148, 1152, 1001)
-                ),
-                None,
-            ),
-            "native Save As filename field",
-        )
+        name_edit = filename_edit(save_dialog)
         guarded_path = folder / "overwrite-guard.md"
         guarded_path.write_text("keep", encoding="utf-8")
         set_text(name_edit, str(guarded_path))
@@ -801,18 +824,21 @@ for accept in (False, True):
                     h
                     for h in windows(process.pid)
                     if class_name(h) == "#32770"
-                    and u.IsWindowVisible(u.GetDlgItem(h, 6))
-                    and u.IsWindowVisible(u.GetDlgItem(h, 7))
+                    and text(h) == "Confirm Save As"
+                    and any(class_name(child) == "Button" and text(child) == "&No"
+                            for child in windows(process.pid, h))
                 ),
                 None,
             ),
             "native overwrite confirmation",
         )
-        check_dialog_theme(overwrite, False)
+        assert not u.GetPropW(overwrite, "VolturaDialogColors")
         capture("overwrite-light.png", overwrite)
-        command(overwrite, 7)
+        no_button = next(h for h in windows(process.pid, overwrite)
+                         if class_name(h) == "Button" and text(h) == "&No")
+        u.PostMessageW(no_button, 0x00F5, 0, 0)
         save_dialog = dialog("Save As")
-        name_edit = u.GetDlgItem(save_dialog, 0x480)
+        name_edit = filename_edit(save_dialog)
         assert guarded_path.read_text(encoding="utf-8") == "keep"
         second_path = folder / "saved-as.md"
         set_text(name_edit, str(second_path))

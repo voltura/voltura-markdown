@@ -1060,7 +1060,7 @@ bool Editor::save(bool saveAs) {
         dialog.lpstrFilter = L"Markdown files\0*.md\0All files\0*.*\0";
         dialog.lpstrDefExt = L"md";
         dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        if (!themedSaveFile(&dialog))
+        if (!GetSaveFileNameW(&dialog))
             return false;
         savePath = path.data();
         overwrite = savePath != filePath;
@@ -2158,7 +2158,7 @@ void Editor::exportDocument(bool print) {
             chooser.lpstrFilter = L"PDF document\0*.pdf\0";
             chooser.lpstrDefExt = L"pdf";
             chooser.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (!themedSaveFile(&chooser)) {
+            if (!GetSaveFileNameW(&chooser)) {
                 DeleteDC(dialog.hDC);
                 return;
             }
@@ -2218,7 +2218,7 @@ void Editor::exportDocument(bool print) {
         dialog.lpstrFilter = L"HTML document\0*.html\0";
         dialog.lpstrDefExt = L"html";
         dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        if (!themedSaveFile(&dialog))
+        if (!GetSaveFileNameW(&dialog))
             return;
         if (!filePath.empty()) {
             std::error_code ec;

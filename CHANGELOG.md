@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.6 - 2026-10-25
+
+- Use Explorer-style Save As dialogs for saving documents and exporting HTML or PDF.
+- Refine confirmation dialogs with clearer buttons and light/dark styling.
+- Keep header icons and preview panes steady while typing in Live mode.
+
 ## 1.3.5 - 2026-10-20
 
 - Add a themed, draggable divider to resize side-by-side and stacked Live editor panes.

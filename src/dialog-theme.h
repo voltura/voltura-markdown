@@ -15,11 +15,11 @@ namespace vm {
 // Only dialog creation installs a thread-local hook; the reader's normal message path stays untouched.
 inline thread_local bool dialogDark = false;
 inline thread_local bool dialogMessageBox = false;
-inline thread_local bool savingFileDialog = false;
 struct DialogColors {
     bool dark;
     bool messageBox;
     HBRUSH background;
+    int primaryButton = 0;
 };
 inline LRESULT CALLBACK dialogThemeProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id,
                                         DWORD_PTR data) {
@@ -107,6 +107,48 @@ inline LRESULT CALLBACK dialogThemeProc(HWND dialog, UINT msg, WPARAM wp, LPARAM
                                            : (self->dark ? RGB(229, 233, 240) : RGB(32, 41, 56));
             SetTextColor(dc, foreground);
             SetBkMode(dc, TRANSPARENT);
+            if (self->messageBox && !choice && !group) {
+                // Retain native buttons and dialog navigation; only their surface changes.
+                int saved = SaveDC(dc);
+                int dpi = GetDpiForWindow(dialog);
+                bool primary = GetDlgCtrlID(button) == self->primaryButton;
+                bool hot = (draw->uItemState & CDIS_HOT) != 0;
+                bool pressed = (draw->uItemState & CDIS_SELECTED) != 0;
+                COLORREF footer = self->dark ? RGB(23, 28, 37) : RGB(241, 244, 249);
+                COLORREF fill = primary && enabled
+                    ? (pressed ? RGB(30, 86, 165) : hot ? RGB(51, 119, 215) : RGB(40, 104, 194))
+                    : (self->dark ? (pressed ? RGB(50, 61, 78) : hot ? RGB(44, 53, 69) : RGB(32, 39, 51))
+                                  : (pressed ? RGB(221, 228, 238) : hot ? RGB(235, 240, 247) : RGB(255, 255, 255)));
+                COLORREF border = primary && enabled ? fill
+                    : self->dark ? RGB(66, 77, 95) : RGB(203, 212, 225);
+                SelectObject(dc, GetStockObject(DC_BRUSH));
+                SetDCBrushColor(dc, footer);
+                FillRect(dc, &rect, (HBRUSH)GetStockObject(DC_BRUSH));
+                SelectObject(dc, GetStockObject(DC_PEN));
+                SetDCPenColor(dc, border);
+                SetDCBrushColor(dc, fill);
+                int radius = MulDiv(10, dpi, 96);
+                RoundRect(dc, rect.left, rect.top, rect.right - 1, rect.bottom - 1, radius, radius);
+                SelectObject(dc, (HFONT)SendMessageW(button, WM_GETFONT, 0, 0));
+                SetTextColor(dc, primary && enabled ? RGB(255, 255, 255) : foreground);
+                wchar_t label[128]{};
+                GetWindowTextW(button, label, 128);
+                UINT flags = DT_SINGLELINE | DT_VCENTER | DT_CENTER;
+                auto state = SendMessageW(button, WM_QUERYUISTATE, 0, 0);
+                if (state & UISF_HIDEACCEL) flags |= DT_HIDEPREFIX;
+                DrawTextW(dc, label, -1, &rect, flags);
+                if ((draw->uItemState & CDIS_FOCUS) && !(state & UISF_HIDEFOCUS)) {
+                    int inset = MulDiv(3, dpi, 96);
+                    InflateRect(&rect, -inset, -inset);
+                    SetDCPenColor(dc, primary ? RGB(255, 255, 255)
+                                           : self->dark ? RGB(122, 177, 255) : RGB(40, 104, 194));
+                    SelectObject(dc, GetStockObject(NULL_BRUSH));
+                    RoundRect(dc, rect.left, rect.top, rect.right - 1, rect.bottom - 1,
+                              radius / 2, radius / 2);
+                }
+                RestoreDC(dc, saved);
+                return CDRF_SKIPDEFAULT;
+            }
             auto oldFont = SelectObject(dc, (HFONT)SendMessageW(button, WM_GETFONT, 0, 0));
             auto pen = CreatePen(PS_SOLID, 1, foreground);
             auto oldPen = SelectObject(dc, pen);
@@ -186,7 +228,13 @@ inline LRESULT CALLBACK dialogThemeProc(HWND dialog, UINT msg, WPARAM wp, LPARAM
             ExcludeClipRect(dc, rect.left, rect.top, rect.right, rect.bottom);
         }
         footer.top = (std::max)(0, top - MulDiv(10, GetDpiForWindow(dialog), 96));
-        FillRect(dc, &footer, self->background);
+        SelectObject(dc, GetStockObject(DC_BRUSH));
+        SetDCBrushColor(dc, self->dark ? RGB(23, 28, 37) : RGB(241, 244, 249));
+        FillRect(dc, &footer, (HBRUSH)GetStockObject(DC_BRUSH));
+        SelectObject(dc, GetStockObject(DC_PEN));
+        SetDCPenColor(dc, self->dark ? RGB(42, 50, 64) : RGB(222, 228, 237));
+        MoveToEx(dc, footer.left, footer.top, nullptr);
+        LineTo(dc, footer.right, footer.top);
         RestoreDC(dc, saved);
         if (msg == WM_PAINT)
             ReleaseDC(dialog, dc);
@@ -297,6 +345,10 @@ inline void themeDialog(HWND dialog, bool dark, bool messageBox = false) {
     }
     // Include validation and overwrite message boxes created internally by Windows.
     colors->messageBox = messageBox || (onlyMessageControls && hasStatic);
+    if (colors->messageBox && !colors->primaryButton) {
+        auto defaultButton = SendMessageW(dialog, DM_GETDEFID, 0, 0);
+        colors->primaryButton = HIWORD(defaultButton) == DC_HASDEFID ? LOWORD(defaultButton) : IDOK;
+    }
     if (colors->background)
         DeleteObject(colors->background);
     colors->background = CreateSolidBrush(dark ? RGB(16, 19, 25) : RGB(250, 251, 253));
@@ -365,66 +417,6 @@ class DialogThemeScope {
 inline int themedMessageBox(HWND owner, LPCWSTR text, LPCWSTR title, UINT flags) {
     DialogThemeScope theme(true);
     return MessageBoxW(owner, text, title, flags);
-}
-// Supplying a hook without OFN_EXPLORER selects Windows' hookable common-dialog
-// layout. Its native folder navigation and validation remain intact, and every
-// control can use the app palette rather than the shell's cached system palette.
-inline UINT_PTR CALLBACK fileDialogHook(HWND dialog, UINT message, WPARAM, LPARAM) {
-    if (message == WM_INITDIALOG)
-        SetDlgItemTextW(dialog, IDOK, savingFileDialog ? L"&Save" : L"&Open");
-    return 0;
-}
-inline BOOL themedFileDialog(OPENFILENAMEW *dialog, bool saving) {
-    bool previousSaving = savingFileDialog;
-    savingFileDialog = saving;
-    auto previousHook = dialog->lpfnHook;
-    DWORD previousFlags = dialog->Flags;
-    auto previousDirectory = dialog->lpstrInitialDir;
-    std::wstring initialDirectory;
-    dialog->lpfnHook = fileDialogHook;
-    dialog->Flags =
-        (dialog->Flags & ~(OFN_EXPLORER | OFN_OVERWRITEPROMPT)) | OFN_ENABLEHOOK | OFN_HIDEREADONLY;
-    DialogThemeScope theme;
-    BOOL result;
-    for (;;) {
-        if (!previousDirectory) {
-            dialog->lpstrInitialDir = nullptr;
-            std::wstring filename(dialog->lpstrFile);
-            auto separator = filename.find_last_of(L"\\/");
-            if (separator != filename.npos) {
-                initialDirectory = filename.substr(0, separator + 1);
-                DWORD attributes = GetFileAttributesW(initialDirectory.c_str());
-                if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                    dialog->lpstrInitialDir = initialDirectory.c_str();
-                    // Start in the document's folder with its name selected, as the
-                    // Explorer-style chooser did, rather than showing a clipped full path.
-                    auto name = filename.substr(separator + 1);
-                    std::copy(name.begin(), name.end(), dialog->lpstrFile);
-                    dialog->lpstrFile[name.size()] = 0;
-                }
-            }
-        }
-        result = saving ? GetSaveFileNameW(dialog) : GetOpenFileNameW(dialog);
-        if (!result || !saving || !(previousFlags & OFN_OVERWRITEPROMPT) ||
-            GetFileAttributesW(dialog->lpstrFile) == INVALID_FILE_ATTRIBUTES)
-            break;
-        // Windows' replacement prompt is shell-hosted even for a hookable file
-        // dialog. Keep its protection, using the same themed confirmation as the editor.
-        std::wstring question(dialog->lpstrFile);
-        question += L" already exists.\n\nReplace it?";
-        if (themedMessageBox(dialog->hwndOwner, question.c_str(), L"Confirm Save As",
-                             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES)
-            break;
-    }
-    constexpr DWORD changedFlags = OFN_EXPLORER | OFN_ENABLEHOOK | OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT;
-    dialog->Flags = (dialog->Flags & ~changedFlags) | (previousFlags & changedFlags);
-    dialog->lpfnHook = previousHook;
-    dialog->lpstrInitialDir = previousDirectory;
-    savingFileDialog = previousSaving;
-    return result;
-}
-inline BOOL themedSaveFile(OPENFILENAMEW *dialog) {
-    return themedFileDialog(dialog, true);
 }
 inline UINT_PTR CALLBACK nativeDialogHook(HWND, UINT, WPARAM, LPARAM) {
     return 0;

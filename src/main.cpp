@@ -4278,7 +4278,7 @@ In the **three-dot menu**:
     }
     void drawButton(const DRAWITEMSTRUCT &item) {
 #ifdef VMD_TESTING
-        if (!verifyFile.empty() && item.CtlID >= 100 && item.CtlID < 106)
+        if (item.CtlID >= 100 && item.CtlID < 106)
             ++buttonPaints[item.CtlID - 100];
 #endif
         RECT r = item.rcItem;
@@ -5864,7 +5864,14 @@ In the **three-dot menu**:
                 updateFindControls();
                 if (GetWindowTextLengthW(search)) SetTimer(hwnd, 22, 180, nullptr);
             }
-            invalidateHeader();
+            if (searching)
+                invalidateHeader();
+            else if (showControls && chromeWidth > 600) {
+                // Only the document title/modified marker changes while typing.
+                RECT label{(LONG)(28 * scale()), (LONG)(26 * scale()),
+                           (LONG)((chromeWidth - 320) * scale()), (LONG)(54 * scale())};
+                InvalidateRect(hwnd, &label, FALSE);
+            }
             return 0;
         case EditorScroll:
             if (editor && editor->isLive() && !informationView) {
@@ -5882,6 +5889,11 @@ In the **three-dot menu**:
             case 1: return splitFramePaints;
             case 2: return source;
             case 3: return viewportUpdates;
+            case 4: {
+                uint64_t paints = 0;
+                for (auto count : buttonPaints) paints += count;
+                return (LRESULT)paints;
+            }
             }
             return 0;
         case WM_APP + 40:
@@ -5978,7 +5990,16 @@ In the **three-dot menu**:
                 VMD_TEST_ONLY(editorPreviewAwaitingPaint = true;)
                 rawBlocks.clear();
                 if (!searching) anchor = caret = 0;
-                message(WM_SIZE, SIZE_RESTORED, 0);
+                // A new revision normally changes content only. Running the
+                // resize path moves/repaints header icons and resets the layout
+                // before the final preview layout is ready.
+                editor->position((int)(headerBottom() * scale()));
+                auto bounds = editor->previewBounds((int)(headerBottom() * scale()));
+                RECT current{};
+                GetWindowRect(canvas, &current);
+                MapWindowPoints(nullptr, hwnd, (POINT *)&current, 2);
+                if (!IsWindowVisible(canvas) || !EqualRect(&current, &bounds))
+                    positions();
                 resetLayout(editor->isLive());
                 syncPreviewToSource();
                 invalidate();
