@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.7 - 2026-11-06
+
+- Copy highlighted reader text with a right-click or Ctrl+C and see a brief confirmation.
+
 ## 1.3.6 - 2026-10-25
 
 - Use Explorer-style Save As dialogs for saving documents and exporting HTML or PDF.

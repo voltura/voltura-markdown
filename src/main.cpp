@@ -219,6 +219,8 @@ struct App {
     float codeButtonHorizontal = -1;
     size_t pressedCode = SIZE_MAX, copiedCode = SIZE_MAX;
     ULONGLONG copiedCodeUntil = 0;
+    ULONGLONG copiedSelectionUntil = 0;
+    static constexpr auto copiedSelectionNotice = L"Selection copied to clipboard";
     unsigned viewportUpdates = 0;
 #ifdef VMD_TESTING
     unsigned canvasMoves = 0, canvasPaints = 0, splitFrameMoves = 0, splitFramePaints = 0;
@@ -3291,11 +3293,16 @@ struct App {
         if (id)
             command(id);
     }
-    void linkMenu(POINT point) {
+    void documentContextMenu(POINT point) {
         POINT client = point;
         if (!ScreenToClient(hwnd, &client))
             return;
-        auto destination = linkAt(client.x / scale() - canvasLeft, client.y / scale());
+        float x = client.x / scale() - canvasLeft, y = client.y / scale();
+        if (selectionAt(x, y)) {
+            copy();
+            return;
+        }
+        auto destination = linkAt(x, y);
         if (destination.empty())
             return;
         std::vector<MenuRow> rows{{1, L"Copy link"}};
@@ -4029,26 +4036,40 @@ In the **three-dot menu**:
             syncSourceToPreview();
     }
     void copy() {
-        if (!doc || anchor == caret)
+        if (!doc)
             return;
         size_t begin = std::min(anchor, caret),
                end = std::min<size_t>(std::max(anchor, caret), text().size());
-        auto s = text().substr(begin, end - begin);
-        if (OpenClipboard(hwnd)) {
-            EmptyClipboard();
-            auto memory = GlobalAlloc(GMEM_MOVEABLE, (s.size() + 1) * sizeof(wchar_t));
-            if (memory) {
-                auto p = GlobalLock(memory);
-                if (p) {
-                    memcpy(p, s.c_str(), (s.size() + 1) * sizeof(wchar_t));
-                    GlobalUnlock(memory);
-                    if (!SetClipboardData(CF_UNICODETEXT, memory))
-                        GlobalFree(memory);
-                } else
-                    GlobalFree(memory);
-            }
-            CloseClipboard();
+        if (begin >= end)
+            return;
+        if (copyText(hwnd, std::wstring_view(text()).substr(begin, end - begin))) {
+            notice = copiedSelectionNotice;
+            copiedSelectionUntil = GetTickCount64() + 2000;
+            SetTimer(hwnd, 24, 2000, nullptr);
+        } else {
+            notice = L"The clipboard is unavailable. Try again.";
         }
+        invalidate();
+    }
+    bool selectionAt(float x, float y) {
+        if (!doc || anchor == caret || searchMatch || blocks().empty() || dragging || scrollDrag ||
+            x < 0 || x >= width || y < top || y >= height - bottom)
+            return false;
+        auto [begin, end] = std::minmax(anchor, caret);
+        size_t i = heights.find(scroll + y - top);
+        float originX = documentLeft(), originY = top + (float)(heights.before(i) - scroll);
+        for (auto &p : layout(i).parts) {
+            if (!p.layout || p.start >= end || p.start + p.length <= begin)
+                continue;
+            BOOL trailing = FALSE, inside = FALSE;
+            DWRITE_HIT_TEST_METRICS m{};
+            if (SUCCEEDED(p.layout->HitTestPoint(x - originX - p.x, y - originY - p.y, &trailing,
+                                                  &inside, &m)) &&
+                inside && m.isText && p.start + m.textPosition < end &&
+                p.start + m.textPosition + m.length > begin)
+                return true;
+        }
+        return false;
     }
     uint32_t hit(float x, float y) {
         if (!doc || blocks().empty())
@@ -4889,6 +4910,99 @@ In the **three-dot menu**:
                     source = true;
                     check(linkAt(x, y).empty(), "source_view_does_not_preview_links");
                     source = false;
+                }
+                {
+                    auto savedAnchor = anchor, savedCaret = caret;
+                    auto savedRawBlocks = std::move(rawBlocks);
+                    auto readClipboard = [&] {
+                        std::wstring result;
+                        if (OpenClipboard(hwnd)) {
+                            if (auto data = GetClipboardData(CF_UNICODETEXT))
+                                if (auto value = (const wchar_t *)GlobalLock(data)) {
+                                    result = value;
+                                    GlobalUnlock(data);
+                                }
+                            CloseClipboard();
+                        }
+                        return result;
+                    };
+                    auto rightClick = [&](float x, float y) {
+                        POINT point{(LONG)((x + canvasLeft) * scale()), (LONG)(y * scale())};
+                        ClientToScreen(hwnd, &point);
+                        canvasProc(canvas, WM_CONTEXTMENU, (WPARAM)canvas, MAKELPARAM(point.x, point.y));
+                    };
+                    std::wstring input = L"[\u00e5 link](https://example.com) ";
+                    for (int i = 0; i < 150; ++i)
+                        input += L"wrapped text ";
+                    input += L"\n\nSecond paragraph.\n";
+                    doc = std::make_shared<Document>(parse(input));
+                    rawBlocks = sourceBlocks(doc->source);
+                    for (bool raw : {false, true}) {
+                        source = raw;
+                        resetLayout(false);
+                        scroll = 6;
+                        horizontal = 0;
+                        anchor = (uint32_t)text().size();
+                        caret = 0;
+                        auto expected = text();
+                        auto &part = layout(0).parts.front();
+                        FLOAT x = 0, y = 0;
+                        DWRITE_HIT_TEST_METRICS metrics{};
+                        part.layout->HitTestTextPosition(0, FALSE, &x, &y, &metrics);
+                        x += documentLeft() + part.x + metrics.width / 2;
+                        y += top + part.y + metrics.height / 2 - (float)scroll;
+
+                        BYTE keys[256]{};
+                        GetKeyboardState(keys);
+                        auto control = keys[VK_CONTROL];
+                        keys[VK_CONTROL] = 0x80;
+                        SetKeyboardState(keys);
+                        SendMessageW(hwnd, WM_KEYDOWN, 'C', 0);
+                        keys[VK_CONTROL] = control;
+                        SetKeyboardState(keys);
+                        check(readClipboard() == expected && notice == copiedSelectionNotice,
+                              raw ? "source_ctrl_c_copies_selection" : "reader_ctrl_c_copies_selection");
+
+                        check(copyText(hwnd, L"sentinel"), "selection_copy_sets_clipboard_sentinel");
+                        rightClick(2, y);
+                        check(readClipboard() == L"sentinel", "selection_right_click_ignores_margin");
+                        auto firstDeadline = GetTickCount64() + 1;
+                        copiedSelectionUntil = firstDeadline;
+                        rightClick(x, y);
+                        SendMessageW(hwnd, WM_TIMER, 24, 0);
+                        check(readClipboard() == expected && notice == copiedSelectionNotice &&
+                                  anchor == expected.size() && caret == 0 && copiedSelectionUntil > firstDeadline,
+                              raw ? "source_right_click_copies_selection" : "reader_right_click_copies_selected_link_text");
+
+                        copiedSelectionUntil = 0;
+                        SendMessageW(hwnd, WM_TIMER, 24, 0);
+                        check(notice.empty(), "selection_copy_notice_expires");
+
+                        // A second thread holds the clipboard while the reader tries to copy.
+                        auto locked = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                        auto release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                        bool clipboardLocked = false;
+                        std::thread holder([&] {
+                            clipboardLocked = OpenClipboard(nullptr) != FALSE;
+                            SetEvent(locked);
+                            WaitForSingleObject(release, INFINITE);
+                            if (clipboardLocked)
+                                CloseClipboard();
+                        });
+                        WaitForSingleObject(locked, INFINITE);
+                        rightClick(x, y);
+                        SetEvent(release);
+                        holder.join();
+                        CloseHandle(release);
+                        CloseHandle(locked);
+                        check(clipboardLocked && notice == L"The clipboard is unavailable. Try again." &&
+                                  readClipboard() == expected, "selection_copy_reports_clipboard_failure");
+                        notice.clear();
+                    }
+                    source = false;
+                    rawBlocks = std::move(savedRawBlocks);
+                    anchor = savedAnchor;
+                    caret = savedCaret;
                 }
                 dark = originalTheme;
                 doc = original;
@@ -6071,6 +6185,19 @@ In the **three-dot menu**:
             return 0;
         }
         case WM_TIMER:
+            if (wp == 24) {
+                auto now = GetTickCount64();
+                if (now < copiedSelectionUntil) {
+                    SetTimer(hwnd, 24, (UINT)(copiedSelectionUntil - now), nullptr);
+                } else {
+                    KillTimer(hwnd, 24);
+                    if (notice == copiedSelectionNotice) {
+                        notice.clear();
+                        invalidate();
+                    }
+                }
+                return 0;
+            }
             if (wp == 19) {
                 KillTimer(hwnd, 19);
                 copiedCode = SIZE_MAX;
@@ -6423,7 +6550,7 @@ In the **three-dot menu**:
         }
         case WM_CONTEXTMENU:
             if (GET_X_LPARAM(lp) != -1 || GET_Y_LPARAM(lp) != -1)
-                linkMenu({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+                documentContextMenu({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             return 0;
         case WM_LBUTTONUP:
             if (pressedCode != SIZE_MAX) {

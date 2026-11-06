@@ -14,6 +14,8 @@ The reader starts in a normal window without a document, and fullscreen when lau
 
 ## Controls
 
+Select text in the reader or raw-source view, then press **Ctrl+C** or right-click the highlighted text. **Selection copied to clipboard** confirms the copy.
+
 Code blocks have a copy icon in their upper-right corner. Hover to see **Copy code to clipboard**; click to copy the complete block, with indentation and line breaks preserved. **Copied!** confirms success.
 
 Fenced blocks with a language label use basic syntax coloring in both themes: PowerShell (`powershell`, `pwsh`, `ps1`), TypeScript/JavaScript (`typescript`, `ts`, `tsx`, `javascript`, `js`, `jsx`), C# (`csharp`, `cs`, `c#`), C/C++, Python, JSON/JSONC, SQL, and shell/Bash. Unlabeled and unknown languages remain plain text.
