@@ -94,8 +94,7 @@ class Editor {
     FINDREPLACEW findState{};
     std::array<wchar_t, 4096> findBuffer{}, replaceBuffer{};
     UINT findMessage = 0;
-    std::filesystem::file_time_type diskTime{};
-    uintmax_t diskSize = 0;
+    FileStamp diskStamp;
     void findAction(DWORD flags);
     void outline();
     void highlight();
@@ -133,7 +132,7 @@ class Editor {
     void position(int top);
     void theme(bool dark, unsigned dpi);
     bool key(WPARAM key);
-    bool tab(bool backward);
+    bool tab(bool backward, HWND noticeButton = nullptr);
     void command(unsigned id);
     void togglePreview();
     void focus();
@@ -159,6 +158,13 @@ class Editor {
     Leave leave();
     bool modified() const;
     bool busy() const;
+    FileStamp savedStamp() const {
+        return diskStamp;
+    }
+    bool canReload() const;
+    void setExternalChange(bool changed) {
+        externalChanged = changed;
+    }
     bool isPreview() const {
         return preview;
     }

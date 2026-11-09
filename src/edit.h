@@ -1,4 +1,5 @@
 #pragma once
+#include "file-stamp.h"
 #include "document.h"
 #include <optional>
 
@@ -36,6 +37,7 @@ struct FileBaseline {
 };
 FileBaseline readBaseline(const std::filesystem::path &path);
 struct SaveResult {
+    FileStamp stamp;
     enum Status { Saved, Conflict, NeedsUtf8, Failed } status = Failed;
     FileBaseline baseline;
     std::wstring error;

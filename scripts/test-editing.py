@@ -120,7 +120,7 @@ def wait(predicate, description):
 
 
 def dialog(title):
-    if title in ("Create Markdown file", "File changed", "Unsaved Markdown"):
+    if title in ("Create Markdown file", "File changed", "Unsaved Markdown", "Reload Markdown"):
         required = 6
     elif title in ("Find", "Replace", "Print", "Print / PDF"):
         required = 2
@@ -245,6 +245,175 @@ def check_dialog_theme(target, dark):
     night = w.BOOL()
     assert dwm.DwmGetWindowAttribute(target, 20, c.byref(night), c.sizeof(night)) == 0
     assert bool(night.value) == dark
+
+
+def check_external_reload():
+    global process, hwnd
+    path = folder / "external.md"
+    initial = "# Original\n\n" + ("A paragraph to preserve the reading position.\n\n" * 100)
+    path.write_text(initial, encoding="utf-8")
+    metrics = folder / "external.jsonl"
+    process = subprocess.Popen(
+        [
+            str(executable),
+            str(path),
+            "--no-preferences",
+            "--test-association",
+            "mismatch",
+            "--metrics",
+            str(metrics),
+        ]
+    )
+    hwnd = None
+
+    def visible(classname):
+        return next(
+            (h for h in windows(process.pid) if class_name(h) == classname and u.IsWindowVisible(h)),
+            None,
+        )
+
+    def change_notice():
+        return visible("VolturaMarkdownFileChange")
+
+    def association():
+        return visible("VolturaMarkdownAssociation")
+
+    def rendered_documents():
+        return metrics.read_text(encoding="utf-8").count('"first_content_ms"') if metrics.exists() else 0
+
+    def scroll():
+        return u.SendMessageW(hwnd, 0x802C, 7, 0) - 1
+
+    class GuiInfo(c.Structure):
+        _fields_ = (
+            [("size", w.DWORD), ("flags", w.DWORD)]
+            + [(name, w.HWND) for name in ("active", "focus", "capture", "menu", "move", "caret")]
+            + [("rect", w.RECT)]
+        )
+
+    def focus():
+        info = GuiInfo()
+        info.size = c.sizeof(info)
+        u.GetGUIThreadInfo.argtypes = [w.DWORD, c.POINTER(GuiInfo)]
+        assert u.GetGUIThreadInfo(u.GetWindowThreadProcessId(hwnd, None), c.byref(info))
+        return info.focus
+
+    def tab_to(target):
+        for _ in range(40):
+            if focus() == target:
+                return
+            u.PostMessageW(focus() or hwnd, 0x0100, 9, 0)
+            time.sleep(0.04)
+        raise AssertionError("Reload notice button is unreachable by Tab")
+
+    try:
+        hwnd = wait(lambda: visible("VolturaMarkdownWindow"), "reader with open file")
+        wait(association, "default-app notice before external edit")
+        u.PostMessageW(hwnd, 0x0100, 0x22, 0)  # Page Down
+        wait(lambda: scroll() > 100, "reading position away from the start")
+        time.sleep(0.5)
+        before_focus = focus()
+        path.write_text(initial.replace("Original", "Updated"), encoding="utf-8")
+        toast = wait(change_notice, "reader external edit")
+        assert text(toast) == "File was modified \u2014 reload?"
+        assert text(u.GetDlgItem(toast, 153)) == "Reload"
+        assert text(u.GetDlgItem(toast, 154)) == "Dismiss"
+        assert focus() == before_focus, "the notice must preserve focus"
+        assert not association(), "file notice should have priority"
+        capture("file-change-dark.png", toast)
+        command(hwnd, 103)
+        capture("file-change-light.png", toast)
+        tab_to(u.GetDlgItem(toast, 153))
+        tab_to(u.GetDlgItem(toast, 154))
+        u.PostMessageW(u.GetDlgItem(toast, 154), 0x0100, 13, 0)
+        wait(association, "default-app notice restored after Dismiss")
+        time.sleep(3.2)
+        assert not change_notice(), "the same disk version must stay dismissed"
+
+        replacement = path.with_suffix(".tmp")
+        updated = initial.replace("Original", "Replacement")
+        replacement.write_text(updated, encoding="utf-8")
+        replacement.replace(path)
+        toast = wait(change_notice, "external replacement after Dismiss")
+        before = u.SendMessageW(hwnd, 0x8028, 0, 0)
+        command(toast, 153)
+        wait(lambda: rendered_documents() == 2, "reader reload completed")
+        after = u.SendMessageW(hwnd, 0x8028, 0, 0)
+        assert abs(after - before) < 45, (after, before)
+        before = scroll()
+
+        path.unlink()
+        toast = wait(change_notice, "deleted open file")
+        command(toast, 153)
+        wait(lambda: change_notice() and rendered_documents() == 3, "failed reload finished")
+        assert abs(scroll() - before) < 5, ("failed reload must keep the view", scroll(), before)
+        path.write_text(updated, encoding="utf-8")
+        wait(change_notice, "restored file is available for retry")
+        command(toast, 153)
+        wait(lambda: rendered_documents() == 4 and not change_notice(), "retry finished")
+        command(hwnd, 161)
+        panel = wait(editor_window, "editor after reader reload")
+        edit = u.GetDlgItem(panel, 100)
+        wait(lambda: text(edit) == updated, "reader reload read the replacement")
+        time.sleep(0.2)
+        set_text(edit, updated + "\nUnsaved draft\n")
+        path.write_text("# Outside editor\n", encoding="utf-8")
+        toast = wait(change_notice, "editor external edit")
+        u.PostMessageW(edit, 0x0100, 0x75, 0)  # F6 reaches the toast from the source field.
+        reload_button = u.GetDlgItem(toast, 153)
+        wait(lambda: focus() == reload_button, "editor keyboard focus on Reload")
+        u.PostMessageW(reload_button, 0x0100, 13, 0)
+        command(dialog("Reload Markdown"), 7)
+        assert "Unsaved draft" in text(edit) and change_notice()
+        command(toast, 153)
+        command(dialog("Reload Markdown"), 6)
+        wait(lambda: text(edit) == "# Outside editor\n" and not change_notice(), "confirmed editor reload")
+
+        path.write_text("# Clean reload\n", encoding="utf-8")
+        command(wait(change_notice, "clean editor external edit"), 153)
+        wait(lambda: text(edit) == "# Clean reload\n" and not change_notice(), "clean editor reload")
+        set_text(edit, "# Saved here\n")
+        command(hwnd, 162)
+        wait(lambda: " *" not in text(hwnd), "editor saved")
+        assert path.read_text(encoding="utf-8") == "# Saved here\n"
+        time.sleep(3.2)
+        assert not change_notice(), "saving here must not show an external-change notice"
+
+        command(hwnd, 164)
+        wait(lambda: not editor_window(), "back to reading mode")
+        path.write_text("# Changed before opening another file\n", encoding="utf-8")
+        wait(change_notice, "notice on old file")
+        second = folder / "second.md"
+        second.write_text("# Second document\n", encoding="utf-8")
+        command(hwnd, 100)
+        open_dialog = wait(lambda: visible("#32770"), "Open dialog")
+        filename = wait(
+            lambda: next(
+                (
+                    h
+                    for h in windows(process.pid, open_dialog)
+                    if class_name(h) == "Edit" and u.GetDlgCtrlID(h) in (1148, 1152, 1001)
+                ),
+                None,
+            ),
+            "Open filename field",
+        )
+        set_text(filename, str(second))
+        command(open_dialog, 1)
+        wait(lambda: text(hwnd).startswith("second.md") and not change_notice(), "new file clears old notice")
+        path.write_text("# Another update to the old file\n", encoding="utf-8")
+        time.sleep(3.2)
+        assert not change_notice(), "old file changes must be ignored"
+        second.write_text("# New file changed\n", encoding="utf-8")
+        wait(change_notice, "new file is monitored")
+        print("PASS: reader and editor external file changes, dismissal, reload, retry and draft safety")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=10)
+
+
+check_external_reload()
 
 
 for accept in (False, True):

@@ -104,7 +104,7 @@ The three-dot menu provides:
 - **Open file directory** to show the document in Explorer.
 - **Edit file with…** to choose an installed editor through Windows.
 
-Edit mode checks for external file changes in the background. Insert → **Reload from disk** reloads explicitly and asks before discarding a modified draft. Saving still checks the exact disk contents for conflicts. Reading mode requires reopening the document. Menus, dialogs, and file/print pickers follow the app's light/dark theme.
+Voltura Markdown checks open files for changes in the background. Choose **Reload** to read the latest file or **Dismiss** to keep the current version until the file changes again. Press **F6** to focus the notice. The editor asks before discarding unsaved changes. You can also use Insert → **Reload from disk** while editing. Saving still checks the exact disk contents for conflicts. Menus, dialogs, and file/print pickers follow the app's light/dark theme.
 
 ## Install, update, and defaults
 

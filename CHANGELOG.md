@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.8 - 2026-11-09
+
+- Offer to reload open Markdown files that changed on disk in reading and editing modes.
+- Keep the current view when reload fails and confirm before discarding unsaved edits.
+
 ## 1.3.7 - 2026-11-06
 
 - Copy highlighted reader text with a right-click or Ctrl+C and see a brief confirmation.

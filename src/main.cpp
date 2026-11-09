@@ -119,6 +119,8 @@ struct LoadedDocument {
     uint64_t generation;
     std::shared_ptr<Document> document;
     std::wstring error;
+    FileStamp stamp;
+    std::optional<RestartView> reloadView;
     bool restoreUnchanged = false;
     bool offerCreate = false, missing = false;
 };
@@ -254,6 +256,7 @@ struct App {
         if (informationView)
             closeInformation();
         editor.reset();
+        presentFileChange();
         doc = std::move(editOriginal);
         source = false;
         anchor = caret = 0;
@@ -295,6 +298,7 @@ struct App {
         if (!create && (!doc || doc->plainSource))
             return;
         if (create) {
+            watchFile({});
             doc = std::make_shared<Document>(parse(L""));
             doc->path = std::move(createPath);
             source = false;
@@ -307,6 +311,7 @@ struct App {
         updateFindControls();
         editOriginal = doc;
         editor = std::make_unique<Editor>(hwnd, *doc, dark, (unsigned)dpi, create);
+        editor->setExternalChange(observedStamp != watchedStamp);
         visibility(true);
         KillTimer(hwnd, 2);
         positions();
@@ -342,7 +347,19 @@ struct App {
         bool registration = false, succeeded = false;
     };
     std::shared_ptr<AssociationResult> associationResult;
-    HWND associationPanel = nullptr;
+    HWND associationPanel = nullptr, changePanel = nullptr;
+    std::array<HWND, 2> changeButtons{};
+    struct FileProbe {
+        uint64_t epoch = 0;
+        FileStamp stamp;
+        std::atomic_bool done = false;
+    };
+    std::shared_ptr<FileProbe> fileProbe;
+    std::filesystem::path watchedPath;
+    FileStamp watchedStamp, observedStamp;
+    uint64_t watchEpoch = 0;
+    bool changePending = false, associationDeferred = false;
+    std::wstring changeError;
     std::array<HWND, 3> associationButtons{};
     std::wstring associationError;
 #ifdef VMD_TESTING
@@ -2257,31 +2274,43 @@ struct App {
     static constexpr auto associationTitle = L"Use this copy for .md files?";
     static constexpr auto associationText =
         L"Windows points to Voltura Markdown at another location. Choose this copy in Windows Default apps.";
-    int associationTextHeight(HDC dc, int panelWidth) {
+    static constexpr auto changeTitle = L"File was modified — reload?";
+    static constexpr auto changeText = L"This file changed outside Voltura Markdown.";
+    int noticeTextHeight(HDC dc, int panelWidth, const wchar_t *message) {
         RECT text{0, 0, panelWidth - (LONG)(32 * scale()), 0};
-        DrawTextW(dc, associationText, -1, &text, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        DrawTextW(dc, message, -1, &text, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
         return text.bottom;
     }
     void positionAssociation() {
-        if (!associationPanel)
+        positionNotice(associationPanel, false);
+        positionNotice(changePanel, true);
+    }
+    void positionNotice(HWND panel, bool change) {
+        if (!panel)
             return;
         auto s = scale();
         int panelWidth = (int)(std::min(540.f, chromeWidth - 40) * s);
-        auto dc = GetDC(associationPanel);
+        auto dc = GetDC(panel);
         auto old = SelectObject(dc, uiFont);
-        int textHeight = associationTextHeight(dc, panelWidth);
+        int textHeight = noticeTextHeight(dc, panelWidth, change ? changeText : associationText);
         SelectObject(dc, old);
-        ReleaseDC(associationPanel, dc);
-        int buttonY = (int)(54 * s) + textHeight + (associationError.empty() ? 0 : (int)(28 * s));
+        ReleaseDC(panel, dc);
+        auto &error = change ? changeError : associationError;
+        int buttonY = (int)(54 * s) + textHeight + (error.empty() ? 0 : (int)(28 * s));
         int panelHeight = buttonY + (int)(48 * s);
         POINT origin{(LONG)(20 * s), std::max((LONG)(top * s), (LONG)((height - 80) * s) - panelHeight)};
         ClientToScreen(hwnd, &origin);
-        SetWindowPos(associationPanel, nullptr, origin.x, origin.y, panelWidth, panelHeight,
+        SetWindowPos(panel, nullptr, origin.x, origin.y, panelWidth, panelHeight,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-        MoveWindow(associationButtons[0], (int)(16 * s), buttonY, (int)(170 * s), (int)(32 * s), TRUE);
-        MoveWindow(associationButtons[1], (int)(194 * s), buttonY, (int)(94 * s), (int)(32 * s), TRUE);
-        MoveWindow(associationButtons[2], (int)(296 * s), buttonY, (int)(86 * s), (int)(32 * s), TRUE);
-        InvalidateRect(associationPanel, nullptr, FALSE);
+        if (change) {
+            MoveWindow(changeButtons[0], (int)(16 * s), buttonY, (int)(90 * s), (int)(32 * s), TRUE);
+            MoveWindow(changeButtons[1], (int)(118 * s), buttonY, (int)(90 * s), (int)(32 * s), TRUE);
+        } else {
+            MoveWindow(associationButtons[0], (int)(16 * s), buttonY, (int)(170 * s), (int)(32 * s), TRUE);
+            MoveWindow(associationButtons[1], (int)(194 * s), buttonY, (int)(94 * s), (int)(32 * s), TRUE);
+            MoveWindow(associationButtons[2], (int)(296 * s), buttonY, (int)(86 * s), (int)(32 * s), TRUE);
+        }
+        InvalidateRect(panel, nullptr, FALSE);
     }
     static LRESULT CALLBACK associationProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
         auto app = (App *)GetWindowLongPtrW(window, GWLP_USERDATA);
@@ -2328,12 +2357,15 @@ struct App {
             SetTextColor(dc, app->dark ? RGB(229, 233, 240) : RGB(32, 41, 56));
             auto s = app->scale();
             RECT title{(LONG)(16 * s), (LONG)(14 * s), bounds.right - (LONG)(16 * s), (LONG)(38 * s)};
-            DrawTextW(dc, associationTitle, -1, &title, DT_SINGLELINE | DT_NOPREFIX);
+            bool change = window == app->changePanel;
+            auto body = change ? changeText : associationText;
+            auto &error = change ? app->changeError : app->associationError;
+            DrawTextW(dc, change ? changeTitle : associationTitle, -1, &title, DT_SINGLELINE | DT_NOPREFIX);
             RECT text{(LONG)(16 * s), (LONG)(44 * s), bounds.right - (LONG)(16 * s), bounds.bottom};
-            DrawTextW(dc, associationText, -1, &text, DT_WORDBREAK | DT_NOPREFIX);
-            if (!app->associationError.empty()) {
-                text.top += app->associationTextHeight(dc, bounds.right) + (LONG)(8 * s);
-                DrawTextW(dc, app->associationError.c_str(), -1, &text, DT_SINGLELINE | DT_NOPREFIX);
+            DrawTextW(dc, body, -1, &text, DT_WORDBREAK | DT_NOPREFIX);
+            if (!error.empty()) {
+                text.top += app->noticeTextHeight(dc, bounds.right, body) + (LONG)(8 * s);
+                DrawTextW(dc, error.c_str(), -1, &text, DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
             }
             SelectObject(dc, oldFont);
             BitBlt(screen, 0, 0, bounds.right, bounds.bottom, dc, 0, 0, SRCCOPY);
@@ -2347,39 +2379,139 @@ struct App {
             return app->message(msg, wp, lp);
         return DefWindowProcW(window, msg, wp, lp);
     }
-    void showAssociation() {
-        VMD_TEST_ONLY(auto previousFocus = GetFocus();)
+    HWND createNotice(const wchar_t *className, const wchar_t *title) {
         WNDCLASSEXW c{sizeof(c)};
         c.lpfnWndProc = associationProc;
         c.hInstance = GetModuleHandleW(nullptr);
         c.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        c.lpszClassName = L"VolturaMarkdownAssociation";
+        c.lpszClassName = className;
         RegisterClassExW(&c);
-        associationPanel =
-            CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, c.lpszClassName, associationTitle,
-                            WS_POPUP | WS_CLIPCHILDREN, 0, 0, 1, 1, hwnd, nullptr, c.hInstance, this);
+        return CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, className, title,
+                               WS_POPUP | WS_CLIPCHILDREN, 0, 0, 1, 1, hwnd, nullptr, c.hInstance, this);
+    }
+    HWND createNoticeButton(HWND panel, int id, const wchar_t *label) {
+        auto button = CreateWindowExW(0, L"BUTTON", label, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                      0, 0, 1, 1, panel, (HMENU)(INT_PTR)id, nullptr, nullptr);
+        SetWindowSubclass(button, childProc, 1, (DWORD_PTR)this);
+        return button;
+    }
+    void showAssociation() {
+        VMD_TEST_ONLY(auto previousFocus = GetFocus();)
+        associationPanel = createNotice(L"VolturaMarkdownAssociation", associationTitle);
         if (!associationPanel)
             return;
         const wchar_t *names[] = {L"Open Default apps", L"Copy path", L"Dismiss"};
         const int ids[] = {150, 152, 151};
-        for (size_t i = 0; i < associationButtons.size(); ++i) {
-            associationButtons[i] =
-                CreateWindowExW(0, L"BUTTON", names[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0,
-                                0, 1, 1, associationPanel, (HMENU)(INT_PTR)ids[i], nullptr, nullptr);
-            SetWindowSubclass(associationButtons[i], childProc, 1, (DWORD_PTR)this);
-        }
-        positionAssociation();
-        ShowWindow(associationPanel, SW_SHOWNOACTIVATE);
+        for (size_t i = 0; i < associationButtons.size(); ++i)
+            associationButtons[i] = createNoticeButton(associationPanel, ids[i], names[i]);
+        positionNotice(associationPanel, false);
+        associationDeferred = IsWindowVisible(changePanel);
+        if (!associationDeferred)
+            ShowWindow(associationPanel, SW_SHOWNOACTIVATE);
         VMD_TEST_ONLY(associationTrace(previousFocus == GetFocus() ? "notice_focus_preserved"
                                                                    : "notice_focus_changed");)
         VMD_TEST_ONLY(associationTrace("notice_shown");)
     }
     void dismissAssociation() {
+        associationDeferred = false;
         KillTimer(associationPanel, 1);
         if (associationPanel && IsChild(associationPanel, GetFocus()))
             SetFocus(hwnd);
         ShowWindow(associationPanel, SW_HIDE);
+        positionAssociation();
         VMD_TEST_ONLY(associationTrace("notice_dismissed");)
+    }
+    bool changeHasFocus() const {
+        return changePanel && IsChild(changePanel, GetFocus());
+    }
+    void presentFileChange() {
+        bool show =
+            changePending && !loading && !informationView && (!editor || editor->path() == watchedPath);
+        // Let the user finish a keyboard action on the default-app notice first.
+        if (show && associationPanel && IsChild(associationPanel, GetFocus()))
+            return;
+        if (!show) {
+            if (IsWindowVisible(changePanel)) {
+                if (changeHasFocus()) {
+                    SetFocus(hwnd);
+                    if (editor && !informationView)
+                        editor->focus();
+                }
+                ShowWindow(changePanel, SW_HIDE);
+            }
+            if (associationDeferred) {
+                associationDeferred = false;
+                ShowWindow(associationPanel, SW_SHOWNOACTIVATE);
+            }
+            return;
+        }
+        if (!changePanel) {
+            changePanel = createNotice(L"VolturaMarkdownFileChange", changeTitle);
+            if (!changePanel)
+                return;
+            changeButtons[0] = createNoticeButton(changePanel, 153, L"Reload");
+            changeButtons[1] = createNoticeButton(changePanel, 154, L"Dismiss");
+        }
+        if (!IsWindowVisible(changePanel)) {
+            if (IsWindowVisible(associationPanel)) {
+                associationDeferred = true;
+                ShowWindow(associationPanel, SW_HIDE);
+            }
+            positionNotice(changePanel, true);
+            ShowWindow(changePanel, SW_SHOWNOACTIVATE);
+        }
+    }
+    void watchFile(const std::filesystem::path &path, FileStamp stamp = {}) {
+        ++watchEpoch;
+        if (watchedPath != path)
+            fileProbe.reset();
+        watchedPath = path;
+        watchedStamp = observedStamp = stamp;
+        changePending = false;
+        changeError.clear();
+        presentFileChange();
+        if (path.empty())
+            KillTimer(hwnd, 25);
+        else
+            SetTimer(hwnd, 25, 1500, nullptr);
+    }
+    void pollFileChange() {
+        if (fileProbe && fileProbe->done.load(std::memory_order_acquire)) {
+            auto result = std::move(fileProbe);
+            if (!loading && result->epoch == watchEpoch && result->stamp != observedStamp) {
+                observedStamp = result->stamp;
+                changePending = observedStamp != watchedStamp;
+                changeError.clear();
+                if (editor)
+                    editor->setExternalChange(changePending);
+                positionAssociation();
+            }
+        }
+        presentFileChange();
+        if (loading || watchedPath.empty() || fileProbe)
+            return;
+        auto result = std::make_shared<FileProbe>();
+        result->epoch = watchEpoch;
+        std::thread([result, path = watchedPath] {
+            result->stamp = fileStamp(path);
+            result->done.store(true, std::memory_order_release);
+        }).detach();
+        fileProbe = std::move(result);
+    }
+    void reloadChangedFile() {
+        if (!IsWindowVisible(changePanel) || !IsWindowEnabled(hwnd) || loading || informationView ||
+            (editor && editor->path() != watchedPath))
+            return;
+        if (editor) {
+            editor->command(61);
+            return;
+        }
+        RestartView view;
+        view.block = heights.values.empty() ? 0 : heights.find(scroll);
+        view.within = heights.values.empty() ? 0 : scroll - heights.before((size_t)view.block);
+        view.horizontal = horizontal;
+        view.source = source;
+        open(watchedPath, false, view);
     }
     void zoomVisibility() {
         bool visible = showControls && zoomExpanded;
@@ -2447,6 +2579,8 @@ struct App {
             std::vector<HWND> controls{search};
             for (auto control : {findButtons[3], findButtons[0], findButtons[1], findButtons[2]})
                 if (IsWindowVisible(control) && IsWindowEnabled(control)) controls.push_back(control);
+            if (IsWindowVisible(changePanel))
+                controls.insert(controls.end(), changeButtons.begin(), changeButtons.end());
             auto found = std::find(controls.begin(), controls.end(), current);
             if (!current || found != controls.end()) {
                 if (!current) return reverse ? controls.back() : controls.front();
@@ -2456,7 +2590,7 @@ struct App {
         }
         auto first = GetNextDlgTabItem(hwnd, nullptr, FALSE);
         auto last = GetNextDlgTabItem(hwnd, nullptr, TRUE);
-        if (IsWindowVisible(associationPanel)) {
+        if (IsWindowVisible(associationPanel) || IsWindowVisible(changePanel)) {
             std::vector<HWND> controls;
             auto control = first;
             if (control)
@@ -2465,9 +2599,12 @@ struct App {
                         controls.push_back(control);
                     control = GetNextDlgTabItem(hwnd, control, FALSE);
                 } while (control && control != first);
-            for (auto button : associationButtons)
-                if (IsWindowEnabled(button))
-                    controls.push_back(button);
+            if (IsWindowVisible(associationPanel))
+                for (auto button : associationButtons)
+                    if (IsWindowEnabled(button))
+                        controls.push_back(button);
+            if (IsWindowVisible(changePanel))
+                controls.insert(controls.end(), changeButtons.begin(), changeButtons.end());
             if (IsWindowVisible(zoomPanel))
                 controls.insert(controls.end(), zoomButtons.begin(), zoomButtons.end());
             auto found = std::find(controls.begin(), controls.end(), current);
@@ -2671,6 +2808,11 @@ struct App {
         if (search)
             InvalidateRect(search, nullptr, FALSE);
         for (auto button : findButtons) InvalidateRect(button, nullptr, FALSE);
+        if (changePanel) {
+            InvalidateRect(changePanel, nullptr, FALSE);
+            for (auto button : changeButtons)
+                InvalidateRect(button, nullptr, FALSE);
+        }
         if (associationPanel) {
             InvalidateRect(associationPanel, nullptr, FALSE);
             for (auto button : associationButtons)
@@ -2840,8 +2982,9 @@ struct App {
             return 1;
         if (msg == WM_GETDLGCODE && w == a->search)
             return DLGC_WANTALLKEYS;
-        if (msg == WM_CHAR && w != a->search && !(a->associationPanel && IsChild(a->associationPanel, w)) &&
-            a->zoomCharacter(wp))
+        bool changeButton = a->changePanel && IsChild(a->changePanel, w);
+        if (msg == WM_CHAR && w != a->search && !changeButton &&
+            !(a->associationPanel && IsChild(a->associationPanel, w)) && a->zoomCharacter(wp))
             return 0;
         // TranslateMessage queues WM_CHAR before WM_KEYDOWN is dispatched. Enter
         // already navigates below; the single-line edit would beep on its character.
@@ -2849,6 +2992,12 @@ struct App {
             return 0;
         if (msg == WM_KEYDOWN) {
             bool ctrl = GetKeyState(VK_CONTROL) < 0;
+            if (changeButton) {
+                if (wp == VK_RETURN || wp == VK_ESCAPE) {
+                    a->command(wp == VK_RETURN ? GetDlgCtrlID(w) : 154);
+                    return 0;
+                }
+            }
             if (a->associationPanel && IsChild(a->associationPanel, w)) {
                 if (wp == VK_RETURN) {
                     a->command(GetDlgCtrlID(w));
@@ -2912,7 +3061,8 @@ struct App {
                 ++i;
         }
     }
-    void open(std::filesystem::path path, bool offerCreate = false) {
+    void open(std::filesystem::path path, bool offerCreate = false,
+              std::optional<RestartView> reloadView = {}) {
         if (!leaveEdit([this, path] { open(path); }))
             return;
         cancelSearch();
@@ -2923,6 +3073,8 @@ struct App {
         reap();
         ++generation;
         loading = true;
+        ++watchEpoch;
+        presentFileChange();
         SetTimer(hwnd, 5, 33, nullptr);
         notice.clear();
         invalidateHeader();
@@ -2939,11 +3091,13 @@ struct App {
         workers.reserve(workers.size() + 1);
         auto result = std::make_unique<LoadedDocument>();
         result->offerCreate = offerCreate;
+        result->reloadView = reloadView;
         auto restore = restartView;
         result->error = L"The document could not be loaded.";
         workers.push_back({std::thread([path, gen, destination, cancel, done, restore,
                                         result = std::move(result)]() mutable {
                                result->generation = gen;
+                               result->stamp = fileStamp(path);
                                try {
                                    result->document = std::make_shared<Document>(load(path, cancel.get()));
                                } catch (const std::exception &e) {
@@ -2993,6 +3147,9 @@ struct App {
         KillTimer(hwnd, 5);
         invalidateHeader();
         if (!r->document) {
+            if (r->reloadView)
+                changeError = L"Could not reload. Try again when the file is available.";
+            presentFileChange();
             if (r->offerCreate && r->missing) {
                 auto message = L"This file does not exist:\n\n" + pendingPath.wstring() +
                                L"\n\nCreate a new Markdown document here?";
@@ -3016,13 +3173,25 @@ struct App {
         VMD_TEST_ONLY(startupPhase("document_delivered");)
         images->cancelPending(true);
         doc = std::move(r->document);
-        source = false;
+        watchFile(doc->path, r->stamp);
+        source = r->reloadView && r->reloadView->source;
         rawBlocks.clear();
         anchor = caret = 0;
         searchMatch = false;
         notice.clear();
         SetWindowTextW(hwnd, (doc->path.filename().wstring() + L" — Voltura Markdown").c_str());
+        if (source)
+            rawBlocks = sourceBlocks(doc->source);
         resetLayout(false);
+        if (r->reloadView && !blocks().empty()) {
+            auto index = (size_t)std::min<uint64_t>(r->reloadView->block, blocks().size() - 1);
+            if (device()) {
+                auto &current = layout(index);
+                scroll = heights.before(index) + std::min(r->reloadView->within, (double)current.height);
+            }
+            horizontal = r->reloadView->horizontal;
+            bars();
+        }
         if (restartView) {
             auto view = *restartView;
             restartView.reset();
@@ -3045,7 +3214,7 @@ struct App {
         }
         invalidateHeader();
         if (searching)
-            find(false);
+            find(false, false, !r->reloadView);
 #ifdef VMD_TESTING
         if (scrollBenchmark) {
             paintTimes.clear();
@@ -3343,6 +3512,16 @@ struct App {
             return;
         }
         switch (id) {
+        case 153:
+            reloadChangedFile();
+            break;
+        case 154:
+            if (!IsWindowEnabled(hwnd))
+                break;
+            changePending = false;
+            changeError.clear();
+            presentFileChange();
+            break;
         case 150:
             if (associationResult || !IsWindowVisible(associationPanel))
                 break;
@@ -3533,7 +3712,7 @@ Read Markdown files, or choose Edit Markdown (Ctrl+E) to edit source. Ctrl+N cre
 - **Find/Replace (Ctrl+H), Outline (Ctrl+Shift+O):** replace source text or jump to a heading. Enter continues lists; Shift+Tab outdents selected lines.
 - **Insert tools:** edit existing tables, copy images into an assets folder, paste clipboard images, link to a heading, toggle source highlighting or synchronized scrolling, export HTML, and print/PDF. Save a new document before copying images. Ctrl+click a preview heading to jump to source.
 - **Recover draft:** restore a background crash checkpoint as an unsaved document. Checkpoints never overwrite the original file. Explicit save or discard clears obsolete checkpoints.
-- Files changed elsewhere require an explicit overwrite choice; Insert includes Reload from disk. Updates wait while modified drafts are open. Use Cancel pending action to stop a background image, replacement, or export operation.
+- When an open file changes elsewhere, choose Reload or Dismiss. Saving over external changes requires confirmation. Insert also includes Reload from disk. Updates wait while modified drafts are open. Use Cancel pending action to stop a background image, replacement, or export operation.
 
 Use the **back arrow** or <kbd>Escape</kbd> to return to your reading position.
 
@@ -3629,6 +3808,7 @@ In the **three-dot menu**:
         ShowWindow(search, SW_HIDE);
         updateFindControls();
         doc = std::move(information);
+        presentFileChange();
         positions();
         ShowWindow(canvas, SW_SHOWNA);
         source = false;
@@ -3647,6 +3827,7 @@ In the **three-dot menu**:
         if (!informationView)
             return;
         auto savedView = std::move(informationView);
+        presentFileChange();
         cancelSearch();
         searching = false;
         KillTimer(hwnd, 3);
@@ -3991,7 +4172,8 @@ In the **three-dot menu**:
                     << ",\"count_started\":" << (countStarted ? "true" : "false") << ",\"search_anchor\":" << anchor << "}\n";
             }
 #endif
-        } else jump(anchor, true);
+        } else if (revealFind)
+            jump(anchor, true);
         queueFindMarkers();
         refreshSearchStatus();
         invalidate();
@@ -4318,7 +4500,7 @@ In the **three-dot menu**:
             bg = dark ? RGB(46, 59, 78) : RGB(230, 237, 250);
         if (item.itemState & ODS_SELECTED)
             bg = dark ? RGB(63, 82, 112) : RGB(209, 223, 248);
-        bool associationButton = item.CtlID >= 150 && item.CtlID <= 152;
+        bool associationButton = item.CtlID >= 150 && item.CtlID <= 154;
         auto background = CreateSolidBrush((item.CtlID >= 202 && item.CtlID <= 205) ? (dark ? RGB(28, 34, 45) : RGB(255, 255, 255))
                                            : item.CtlID >= 140 && item.CtlID <= 142 ? RGB(255, 0, 255)
                                            : associationButton ? (dark ? RGB(28, 34, 45) : RGB(255, 255, 255))
@@ -4351,7 +4533,9 @@ In the **three-dot menu**:
         switch (item.CtlID) {
         case 150:
         case 151:
-        case 152: {
+        case 152:
+        case 153:
+        case 154: {
             wchar_t label[64]{};
             GetWindowTextW(item.hwndItem, label, 64);
             auto font = SelectObject(dc, uiFont);
@@ -5973,6 +6157,8 @@ In the **three-dot menu**:
             command(LOWORD(wp));
             return 0;
         case EditorChanged:
+            if (IsWindowVisible(changePanel) && editor && editor->path() != watchedPath)
+                presentFileChange();
             if (searching && editorSearch()) {
                 cancelSearch(); searchMatch = false;
                 updateFindControls();
@@ -6123,6 +6309,7 @@ In the **three-dot menu**:
             return 0;
         case EditorSaved:
             if (editor && !wp) {
+                watchFile(editor->path(), editor->savedStamp());
                 editOriginal = editor->previewDocument();
                 if (informationView) {
                     informationView->document = editOriginal;
@@ -6185,6 +6372,10 @@ In the **three-dot menu**:
             return 0;
         }
         case WM_TIMER:
+            if (wp == 25) {
+                pollFileChange();
+                return 0;
+            }
             if (wp == 24) {
                 auto now = GetTickCount64();
                 if (now < copiedSelectionUntil) {
@@ -6820,6 +7011,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (app.editor && app.editor->dialogMessage(message))
             continue;
+        if (message.message == WM_KEYDOWN && message.wParam == VK_F6 && IsWindowVisible(app.changePanel)) {
+            SetFocus(app.changeButtons[0]);
+            continue;
+        }
         if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && app.searching &&
             (GetFocus() == app.search ||
              std::find(app.findButtons.begin(), app.findButtons.end(), GetFocus()) != app.findButtons.end())) {
@@ -6827,7 +7022,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             continue;
         }
         if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && app.editor && !app.informationView) {
-            if (app.editor->tab(GetKeyState(VK_SHIFT) < 0))
+            bool backward = GetKeyState(VK_SHIFT) < 0;
+            HWND noticeButton =
+                IsWindowVisible(app.changePanel) ? app.changeButtons[backward ? 1 : 0] : nullptr;
+            if (app.changeHasFocus()) {
+                auto other = app.changeButtons[backward ? 0 : 1];
+                if (GetFocus() == noticeButton)
+                    SetFocus(other);
+                else
+                    app.editor->tab(backward);
+                continue;
+            }
+            if (app.editor->tab(backward, noticeButton))
                 continue;
         } else if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && GetFocus() != hwnd) {
             HWND next = app.nextTabControl(GetFocus(), GetKeyState(VK_SHIFT) < 0);

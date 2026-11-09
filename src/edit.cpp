@@ -506,6 +506,7 @@ SaveResult saveDraft(const std::filesystem::path &path, std::wstring_view text, 
         if (!same(readBaseline(path), expected))
             result.status = SaveResult::Conflict;
         else {
+            result.stamp = fileStamp(temporary);
             BOOL replaced = expected.exists
                                 ? ReplaceFileW(path.c_str(), temporary.c_str(), nullptr, 0, nullptr, nullptr)
                                 : MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH);

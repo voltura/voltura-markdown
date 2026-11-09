@@ -318,7 +318,7 @@ struct Editor::Job {
     std::wstring fenceSource;
 };
 struct Editor::Auxiliary {
-    enum Kind { Image, Export, Probe, Reload, Recover, Restore, ReplaceAll } kind;
+    enum Kind { Image, Export, Reload, Recover, Restore, ReplaceAll } kind;
     std::atomic_bool done = false, cancel = false;
     uint64_t revision = 0;
     std::filesystem::path path;
@@ -327,8 +327,7 @@ struct Editor::Auxiliary {
     std::shared_ptr<Document> document;
     bool changed = false, print = false;
     FileBaseline baseline;
-    std::filesystem::file_time_type time{};
-    uintmax_t size = 0;
+    FileStamp stamp;
     std::vector<DraftRecovery::Draft> drafts;
     std::mutex printerMutex;
     HDC printer = nullptr;
@@ -404,7 +403,6 @@ Editor::Editor(HWND parent, const Document &document, bool isDark, unsigned scal
         live = client.right >= MulDiv(1000, dpi, 96);
         SetWindowTextW(buttons[11], live ? L"Live: on" : L"Live");
         SetTimer(panel, 1, 40, nullptr);
-        SetTimer(panel, 4, 3000, nullptr);
         findMessage = RegisterWindowMessageW(FINDMSGSTRINGW);
         try {
             recovery = std::make_shared<DraftRecovery>();
@@ -425,7 +423,7 @@ Editor::Editor(HWND parent, const Document &document, bool isDark, unsigned scal
                 try {
                     result->baseline = readBaseline(path);
                     if (!result->baseline.exists || editText(decode(result->baseline.bytes)) != expected)
-                        result->error = L"The file changed since it was opened. Reopen it before editing.";
+                        result->error = L"The file changed since it was opened. Reload it before editing.";
                 } catch (const std::exception &e) {
                     result->error = fromUtf8(e.what());
                 }
@@ -866,9 +864,6 @@ void Editor::poll() {
             return;
         }
         baseline = std::move(result->baseline);
-        std::error_code ec;
-        diskTime = std::filesystem::last_write_time(filePath, ec);
-        diskSize = baseline.bytes.size();
         ready = true;
         SendMessageW(input, EM_SETREADONLY, FALSE, 0);
         check();
@@ -946,9 +941,7 @@ void Editor::poll() {
         filePath = savePath;
         recoveredBase.clear();
         externalChanged = false;
-        std::error_code ec;
-        diskTime = std::filesystem::last_write_time(filePath, ec);
-        diskSize = baseline.bytes.size();
+        diskStamp = result->saved.stamp;
         if (recovery) {
             auto old = recovery;
             retiredRecovery.push_back(old);
@@ -996,7 +989,7 @@ void Editor::poll() {
     }
 }
 void Editor::startSave(bool readExpected) {
-    if (auxiliary && (auxiliary->kind == Auxiliary::Reload || auxiliary->kind == Auxiliary::Probe)) {
+    if (auxiliary && auxiliary->kind == Auxiliary::Reload) {
         auxiliary->cancel = true;
         auxiliary.reset();
     }
@@ -1328,10 +1321,6 @@ void Editor::popup(bool overflow) {
 void Editor::command(unsigned id) {
     if (saving)
         return;
-    if (auxiliary && auxiliary->kind == Auxiliary::Probe && id >= 50) {
-        auxiliary->cancel = true;
-        auxiliary.reset();
-    }
     if (id >= 50 && id <= 63) {
         switch (id) {
         case 50:
@@ -1391,7 +1380,7 @@ void Editor::command(unsigned id) {
             exportDocument(true);
             break;
         case 61: {
-            if (auxiliary || filePath.empty() || !ready)
+            if (!canReload())
                 break;
             captureText();
             if (modified() &&
@@ -1405,6 +1394,7 @@ void Editor::command(unsigned id) {
             auxiliary = result;
             std::thread([result] {
                 try {
+                    result->stamp = fileStamp(result->path);
                     result->baseline = readBaseline(result->path);
                     if (!result->baseline.exists)
                         throw std::runtime_error("The file no longer exists.");
@@ -1414,8 +1404,6 @@ void Editor::command(unsigned id) {
                             "This file contains null characters and cannot be edited safely.");
                     result->document = std::make_shared<Document>(parse(std::move(source)));
                     result->document->path = result->path;
-                    std::error_code ec;
-                    result->time = std::filesystem::last_write_time(result->path, ec);
                 } catch (const std::exception &e) {
                     result->error = fromUtf8(e.what());
                 }
@@ -1561,7 +1549,10 @@ void Editor::setVisible(bool visible) {
     if (visible)
         title();
 }
-bool Editor::tab(bool backward) {
+bool Editor::canReload() const {
+    return ready && !saving && !auxiliary && !filePath.empty() && !needsFirstSave;
+}
+bool Editor::tab(bool backward, HWND noticeButton) {
     if (GetFocus() == input && GetKeyState(VK_CONTROL) >= 0) {
         if (!ready || saving || preview)
             return true;
@@ -1589,7 +1580,10 @@ bool Editor::tab(bool backward) {
         replace(edit);
         return true;
     }
-    auto next = GetNextDlgTabItem(panel, GetFocus(), backward);
+    auto focusWindow = GetFocus();
+    auto next = GetNextDlgTabItem(panel, IsChild(panel, focusWindow) ? focusWindow : nullptr, backward);
+    if (noticeButton && next == GetNextDlgTabItem(panel, nullptr, backward))
+        next = noticeButton;
     if (next)
         SetFocus(next);
     return true;
@@ -2262,10 +2256,6 @@ bool Editor::addImage(const std::filesystem::path &path) {
     if (ext != L".png" && ext != L".jpg" && ext != L".jpeg" && ext != L".gif" && ext != L".svg" &&
         ext != L".bmp" && ext != L".webp")
         return false;
-    if (auxiliary && auxiliary->kind == Auxiliary::Probe) {
-        auxiliary->cancel = true;
-        auxiliary.reset();
-    }
     if (auxiliary || !ready || saving) {
         themedMessageBox(owner, L"Another editor action is still running. Add the image when it finishes.",
                          L"Add image", MB_OK);
@@ -2295,10 +2285,6 @@ bool Editor::addImage(const std::filesystem::path &path) {
     return true;
 }
 bool Editor::pasteImage() {
-    if (auxiliary && auxiliary->kind == Auxiliary::Probe) {
-        auxiliary->cancel = true;
-        auxiliary.reset();
-    }
     if (!ready || saving)
         return false;
     UINT png = RegisterClipboardFormatW(L"PNG");
@@ -2476,17 +2462,6 @@ void Editor::toolsPoll() {
                              MB_OK);
         } else
             themedMessageBox(owner, L"HTML document exported.", L"Export HTML", MB_OK);
-    } else if (result->kind == Auxiliary::Probe) {
-        if (result->changed && !externalChanged) {
-            externalChanged = true;
-            SetWindowTextW(buttons[8], L"File changed");
-            if (GetForegroundWindow() == owner)
-                themedMessageBox(
-                    owner,
-                    L"The file changed outside Voltura Markdown. Use Insert → Reload from disk to "
-                    L"reload it. Saving will still check for conflicts.",
-                    L"File changed", MB_OK | MB_ICONINFORMATION);
-        }
     } else if (result->kind == Auxiliary::ReplaceAll) {
         if (result->revision != revision) {
             themedMessageBox(
@@ -2514,8 +2489,7 @@ void Editor::toolsPoll() {
         baseline = std::move(result->baseline);
         baselineText = cachedText = std::move(text);
         resetCapture();
-        diskTime = result->time;
-        diskSize = baseline.bytes.size();
+        diskStamp = result->stamp;
         textCurrent = true;
         externalChanged = false;
         needsFirstSave = false;
@@ -3363,25 +3337,6 @@ LRESULT Editor::message(UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == 5) {
             KillTimer(panel, 5);
             highlight();
-        }
-        if (wp == 4 && ready && !saving && !auxiliary && !filePath.empty() && baseline.exists &&
-            !needsFirstSave && !externalChanged) {
-            auto result = std::make_shared<Auxiliary>();
-            result->kind = Auxiliary::Probe;
-            result->path = filePath;
-            auxiliary = result;
-            auto time = diskTime;
-            auto size = diskSize;
-            std::thread([result, time, size] {
-                std::error_code ec;
-                auto stamp = std::filesystem::last_write_time(result->path, ec);
-                result->changed = !!ec || stamp != time;
-                if (!ec) {
-                    auto count = std::filesystem::file_size(result->path, ec);
-                    result->changed = result->changed || !!ec || count != size;
-                }
-                result->done.store(true, std::memory_order_release);
-            }).detach();
         }
         return 0;
     case WM_SIZE:
