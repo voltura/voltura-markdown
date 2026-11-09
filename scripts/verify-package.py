@@ -93,8 +93,8 @@ expected = {
     "ProductName": "Voltura Markdown",
     "FileDescription": "Voltura Markdown",
     "OriginalFilename": "vmd.exe",
-    "FileVersion": "1.3.8",
-    "ProductVersion": "1.3.8",
+    "FileVersion": "1.3.9",
+    "ProductVersion": "1.3.9",
 }
 for key, value in expected.items():
     pointer = c.c_void_p()

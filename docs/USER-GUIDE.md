@@ -30,6 +30,7 @@ Supported HTML includes tables with merged cells, captions, nested tables and im
 | Open | Ctrl+O / folder |
 | Find | Ctrl+F / magnifier |
 | Next / previous match | Enter or F3 / Shift+Enter or Shift+F3 |
+| Reload the current file in Reader mode | F5 |
 | Formatted / source | Ctrl+Shift+V / code |
 | Light / dark | Sun; three-dot menu → Use Windows theme |
 | Fullscreen | F11 / corners |

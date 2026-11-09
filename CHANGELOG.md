@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.9 - 2026-11-09
+
+- Press F5 in Reader mode to reload the current file from disk and keep your reading position where possible, even after dismissing the file-change notice.
+
 ## 1.3.8 - 2026-11-09
 
 - Offer to reload open Markdown files that changed on disk in reading and editing modes.

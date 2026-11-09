@@ -2506,6 +2506,11 @@ struct App {
             editor->command(61);
             return;
         }
+        reloadReaderFile();
+    }
+    void reloadReaderFile() {
+        if (editor || watchedPath.empty() || !IsWindowEnabled(hwnd) || loading || informationView)
+            return;
         RestartView view;
         view.block = heights.values.empty() ? 0 : heights.find(scroll);
         view.within = heights.values.empty() ? 0 : scroll - heights.before((size_t)view.block);
@@ -3013,6 +3018,7 @@ struct App {
                 return 0;
             }
             if (wp == VK_F1 || wp == VK_ESCAPE || wp == VK_F11 || wp == VK_F3 ||
+                (wp == VK_F5 && !a->editor) ||
                 (ctrl && (wp == 'O' || wp == 'F' || wp == 'H' || w != a->search))) {
                 a->key(wp);
                 return 0;
@@ -3712,7 +3718,7 @@ Read Markdown files, or choose Edit Markdown (Ctrl+E) to edit source. Ctrl+N cre
 - **Find/Replace (Ctrl+H), Outline (Ctrl+Shift+O):** replace source text or jump to a heading. Enter continues lists; Shift+Tab outdents selected lines.
 - **Insert tools:** edit existing tables, copy images into an assets folder, paste clipboard images, link to a heading, toggle source highlighting or synchronized scrolling, export HTML, and print/PDF. Save a new document before copying images. Ctrl+click a preview heading to jump to source.
 - **Recover draft:** restore a background crash checkpoint as an unsaved document. Checkpoints never overwrite the original file. Explicit save or discard clears obsolete checkpoints.
-- When an open file changes elsewhere, choose Reload or Dismiss. Saving over external changes requires confirmation. Insert also includes Reload from disk. Updates wait while modified drafts are open. Use Cancel pending action to stop a background image, replacement, or export operation.
+- When an open file changes elsewhere, choose Reload or Dismiss. In Reader mode, press F5 to reload the current file. Saving over external changes requires confirmation. Insert also includes Reload from disk. Updates wait while modified drafts are open. Use Cancel pending action to stop a background image, replacement, or export operation.
 
 Use the **back arrow** or <kbd>Escape</kbd> to return to your reading position.
 
@@ -4327,6 +4333,10 @@ In the **three-dot menu**:
         if (key == VK_ESCAPE && searching) { closeSearch(); return; }
         if (ctrl && key == 'F') { showSearch(); return; }
         if (key == VK_F3) { if (!searching) showSearch(); find(true, shift); return; }
+        if (key == VK_F5 && !editor && !ctrl && !shift) {
+            reloadReaderFile();
+            return;
+        }
         if (editor && !informationView && editor->key(key))
             return;
         if (key == VK_F1) {

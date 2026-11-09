@@ -330,6 +330,20 @@ def check_external_reload():
         time.sleep(3.2)
         assert not change_notice(), "the same disk version must stay dismissed"
 
+        before = scroll()
+        u.PostMessageW(focus() or hwnd, 0x0100, 0x74, 0)  # F5
+        wait(lambda: rendered_documents() == 2, "F5 reload after Dismiss")
+        assert abs(scroll() - before) < 45, ("F5 must preserve reader scroll", scroll(), before)
+        assert not change_notice()
+        command(hwnd, 161)
+        panel = wait(editor_window, "editor after F5 reload")
+        wait(
+            lambda: text(u.GetDlgItem(panel, 100)) == initial.replace("Original", "Updated"),
+            "F5 loaded the updated file",
+        )
+        command(hwnd, 164)
+        wait(lambda: not editor_window(), "reader after checking F5 content")
+
         replacement = path.with_suffix(".tmp")
         updated = initial.replace("Original", "Replacement")
         replacement.write_text(updated, encoding="utf-8")
@@ -337,7 +351,7 @@ def check_external_reload():
         toast = wait(change_notice, "external replacement after Dismiss")
         before = u.SendMessageW(hwnd, 0x8028, 0, 0)
         command(toast, 153)
-        wait(lambda: rendered_documents() == 2, "reader reload completed")
+        wait(lambda: rendered_documents() == 3, "reader reload completed")
         after = u.SendMessageW(hwnd, 0x8028, 0, 0)
         assert abs(after - before) < 45, (after, before)
         before = scroll()
@@ -345,12 +359,12 @@ def check_external_reload():
         path.unlink()
         toast = wait(change_notice, "deleted open file")
         command(toast, 153)
-        wait(lambda: change_notice() and rendered_documents() == 3, "failed reload finished")
+        wait(lambda: change_notice() and rendered_documents() == 4, "failed reload finished")
         assert abs(scroll() - before) < 5, ("failed reload must keep the view", scroll(), before)
         path.write_text(updated, encoding="utf-8")
         wait(change_notice, "restored file is available for retry")
         command(toast, 153)
-        wait(lambda: rendered_documents() == 4 and not change_notice(), "retry finished")
+        wait(lambda: rendered_documents() == 5 and not change_notice(), "retry finished")
         command(hwnd, 161)
         panel = wait(editor_window, "editor after reader reload")
         edit = u.GetDlgItem(panel, 100)
@@ -406,7 +420,7 @@ def check_external_reload():
         assert not change_notice(), "old file changes must be ignored"
         second.write_text("# New file changed\n", encoding="utf-8")
         wait(change_notice, "new file is monitored")
-        print("PASS: reader and editor external file changes, dismissal, reload, retry and draft safety")
+        print("PASS: reader and editor external file changes, F5 after dismissal, scroll, retry and draft safety")
     finally:
         if process.poll() is None:
             process.terminate()
